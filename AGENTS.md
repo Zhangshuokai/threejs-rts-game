@@ -5,7 +5,7 @@ Workspace for **AI-generated three.js scenes/animations** (施工场景 was the 
 
 - `threejs-施工场景动画-提示词规则.md` ← construction domain source of truth + copy-paste prompt templates.
 - `threejs-场景动画-提示词模板与编写技能.md` ← generalized 10-section prompt structure (`+模拟契约/验收接口`), the `R1–R10` rules for **real-time/emergent** scenes (crowd combat, crowds, traffic), WebGPU/WebGL r185 pitfalls, the verification recipe, and measured perf budgets. **Read this before writing a prompt for anything that is not a fixed procedure.**
-- `civil-war-battle.html` ← worked reference: 南北战争 group combat (three r185, ~470 instanced entities, emergent outcome, single file).
+- `civil-war-battle.html` ← worked reference: 南北战争 group combat (three r185, ~470 instanced entities, emergent outcome, instanced billboard VFX + bloom/grade post-processing, single file, `?fx=0` disables post-fx, `?pause=1` for deterministic stepping).
 
 The rules below are the ones agents most often get wrong; they generalize from that research to **any** three.js scene. Don't re-derive them.
 
@@ -34,12 +34,24 @@ The rules below are the ones agents most often get wrong; they generalize from t
 - **Morale: accumulate-and-decay, with dual rout thresholds** — permanent shock (e.g. from ranged fire) makes units break the moment melee starts. `morale = 1 + resolve − 1.65×lossRatio − shock`, `shock` capped and decaying, rout on `men<30% || morale<0.22`.
 - **Effects budget = radius × lifetime × opacity**, not count. Smoke ≤6 m / ≤2.5 s / ≤0.5 opacity; a paused sim freezes every effect at peak, so screenshots exaggerate long lifetimes.
 
+## Effects layer (verified in `civil-war-battle.html`)
+- **Never use `THREE.Sprite` for particle effects** — sprites do not batch (~1.1 draw calls each; 333 live smoke puffs = 705 calls total). Use one `InstancedMesh` of `PlaneGeometry(1,1)` per texture/blending group, billboarded each frame with `camera.quaternion * spinQuat`, `frustumCulled = false`, `instanceMatrix.setUsage(DynamicDrawUsage)`. 5 pools (flash/smoke/dust/boom/mote) = 5 draw calls total.
+- Per-instance fade: `instanceColor` scales rgb (`setColorAt`), which only works for additive pools. For **normal-blend** smoke/dust use premultiplied `CustomBlending` (`blendSrc: OneFactor`, `blendDst: OneMinusSrcAlphaFactor`) and set `instanceColor = vec3(a)`.
+- Hide a dead instance with a **scale-0 matrix** and re-write its matrix only once (track `drawn`), not by `visible = false`.
+- **Bloom needs HDR emissive, not a low threshold.** A daylight scene sits at linear ~0.7–1.3, so `threshold 0.82` blooms the whole frame into fog. Use `threshold ≈ 1.3` plus `instanceColor = a × 2.2–2.4` on additive pools so only muzzle flashes and shell bursts cross it. Additive pools are `toneMapped` by `OutputPass`, so >1 values still resolve to white rather than clipping.
+- Post-processing (`EffectComposer` + `RenderPass` + `UnrealBloomPass` + grade `ShaderPass` + `OutputPass`) is **WebGL-only**: the WebGPU build rejects `ShaderMaterial`/GLSL, so `await import(...)` the passes inside `try/catch` behind `MODE === 'webgl'` and fall back to `renderer.render`. Composer path costs ~10–20 % fps on the software rasterizer (`?fx=0` disables it).
+- Wispy smoke beats a radial gradient: build the puff as `ImageData` = value-noise fBm × a soft radial mask (`puffTex()`), or every puff reads as an identical bubble.
+- With `autoReset = false` on `renderer.info` and one `info.reset()` per frame, `info()` reports the **whole frame** including every composer pass and the shadow pass — the only numbers comparable across configurations.
+- **Prove PRNG separation, don't assume it.** All effect randomness (pool spin/rotation, spread, crater size, hoof dust) reads a second stream `vrnd = mulberry32(0x9D3C71)`; gameplay keeps `rnd`. Test: patch a visual constant into a copy of the file and step both to the same `t` with `?pause=1`; `state()` must be **byte-identical**. Doing this caught a real leak — raising pool capacity changed how often `emit()` found a free slot, which changed how many `rnd()` draws happened, which changed the battle. Splitting the streams changed the outcome once (union still wins, ~41.8 s); after that, effect retunes are free.
+
 ## Verification (no build/test/lint exists yet)
 - Playwright tooling is available — open the generated HTML and confirm it renders **and** animates.
 - Capture a **turntable** (front/right/rear/left); one viewpoint is not evidence.
 - Self-correction decision, one per pass: `continue | refine-spec | refine-code | request-input | stop`.
 - **Expose a debug API** in the artifact (`sim(seconds)`, `state()`, `sample(entity, part)`, `freecam(...)`, `info()`), then: step deterministically to a moment and screenshot; print a **phase timeline** (`t/phase/strength`); read **instance matrices** to prove poses animate; re-load twice and confirm `state()` is identical (determinism); record `info()` draw calls/triangles as a budget baseline.
-- Measured budget for ~470 instanced entities (software rasterizer, 1280×720): 356 draw calls / 3.6×10⁵ tris with no effects → 646 calls at 260 visible sprites, 80–95 fps. Sprites do **not** batch (~1.1 calls each); `info()` counts the shadow pass too, so geometry budget is ~2×.
+- `?pause=1` starts paused so `sim()` steps from `t=0` — without it the render loop advances the sim before you can pause, and two "re-loads" are not comparable.
+- Effects-debug surface worth keeping: `particles()` (per-pool alive), `pools(show)` (solo/mute pools by name), `blend(id, mode)`, `postfx('bloom'|'threshold'|'radius'|'grain'|'vignette', v)`, `fx()` / `fx(false)` for A/B. A silently square-looking billboard is almost always a blend/alpha problem; solo each pool instead of guessing.
+- Measured budget for ~470 instanced entities (software rasterizer, 1400×820, shadow pass included): 356–382 draw calls / 3.6×10⁵ tris, effects on. **Before**: 260 visible sprites = 646 calls; 333 sprites = 705 calls. **After** (instanced billboards): 320–551 live particles = 382 calls, `?fx=0` ≈ direct render. fps is noisy on this rasterizer (18–28 fps at that resolution for both paths, composer ≈ 10–20 % slower); trust draw calls/triangles, not single fps samples.
 
 ## Construction-domain layer (verified against `construction-sim`)
 - Sequence: `footing → 逐层(柱 → 主梁 → 次梁 → 楼板 → 墙板 → 校验) → 屋顶 → 完工报告`.
