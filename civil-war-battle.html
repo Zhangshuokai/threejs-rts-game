@@ -1278,6 +1278,65 @@ function breachFactor(x) {
   for (const c of BREACH_X) o = Math.max(o, clamp(1 - Math.abs(x - c) / BREACH_HALF, 0, 1));
   return o * o * (3 - 2 * o);
 }
+/* 断面：dz 朝敌为正，h 为高出天然地面的高度，k 为受光系数（壕内压暗） */
+const TRENCH_ROWS = [
+  { dz: -2.70, h: 0.04, k: 0.50 },   // 背墙后坡脚
+  { dz: -2.05, h: 0.74, k: 0.94 },   // 背墙顶 (parados)
+  { dz: -1.55, h: 0.12, k: 0.56 },   // 背墙内坡
+  { dz: -1.15, h: 0.04, k: 0.38 },   // 壕底后缘
+  { dz: 0.80, h: 0.04, k: 0.38 },    // 壕底前缘
+  { dz: 1.30, h: 0.52, k: 0.72 },    // 踏台 (fire step)
+  { dz: 1.95, h: 1.30, k: 1.00 },    // 胸墙顶 (parapet)：1.30 m 才挡到站立者肩部
+  { dz: 3.05, h: 0.04, k: 0.84 }     // 胸墙前坡脚
+];
+const TR_LAST = TRENCH_ROWS.length - 1;
+const trenchRowH = (h, j, open) => j === 5 ? h * (1 - 0.62 * open)
+  : j === 6 ? h * (1 - 0.80 * open) : h;
+const ABATIS_DZ = 3.55;        // 鹿砦带（胸墙前的拒马桩）
+
+/* 工事表面相对天然地面的高度场 —— 与建壕共用同一组断面数据，
+   所以士兵的 y 真正踩在网格上：过胸墙是"翻过去"，不是"穿过去"。 */
+function workH(x, z) {
+  let best = 0;
+  for (const key of ['union', 'confederate']) {
+    const f = trenchFace(key), wob = trenchWob(x);
+    const s = (z - (TRENCH_Z[key] + wob * f)) * f;
+    if (s < TRENCH_ROWS[0].dz || s > TRENCH_ROWS[TR_LAST].dz) continue;
+    const open = breachFactor(x);
+    for (let j = 0; j < TR_LAST; j++) {
+      const A = TRENCH_ROWS[j], B = TRENCH_ROWS[j + 1];
+      if (s > B.dz) continue;
+      const t = (s - A.dz) / (B.dz - A.dz);
+      const ya = terrainH(x, TRENCH_Z[key] + (A.dz + wob) * f) + trenchRowH(A.h, j, open);
+      const yb = terrainH(x, TRENCH_Z[key] + (B.dz + wob) * f) + trenchRowH(B.h, j + 1, open);
+      best = Math.max(best, lerp(ya, yb, t) - terrainH(x, z));
+      break;
+    }
+  }
+  return Math.max(0, best);
+}
+const groundY = (x, z) => terrainH(x, z) + workH(x, z);
+/* 鹿砦（拒马桩）带：对骑兵是致命的 */
+function abatisFactor(x, z) {
+  let m = 0;
+  for (const key of ['union', 'confederate']) {
+    const f = trenchFace(key), wob = trenchWob(x);
+    const s = (z - (TRENCH_Z[key] + wob * f)) * f;
+    m = Math.max(m, clamp(1 - Math.abs(s - ABATIS_DZ) / 0.9, 0, 1));
+  }
+  return m;
+}
+/* 通行代价（1 = 如履平地）：断面高差 —— 骑兵翻 1.3 m 胸墙几乎被挡停；
+   再叠加胸墙前鹿砦的阻滞。这个属性必须进移动积分，否则工事只是贴图。 */
+function workTraverse(kind, x, z) {
+  const h = workH(x, z);
+  let fac = kind === 'cav'
+    ? 1 - 0.92 * clamp((h - 0.10) / 0.90, 0, 1)
+    : 1 - 0.72 * clamp((h - 0.15) / 1.00, 0, 1);
+  const ab = abatisFactor(x, z);
+  fac *= kind === 'cav' ? 1 - 0.78 * ab : 1 - 0.35 * ab;
+  return clamp(fac, kind === 'cav' ? 0.05 : 0.25, 1);
+}
 
 const ROSTER = {
   union: {
@@ -1370,7 +1429,7 @@ function makeArmyUnits(army) {
         const ang = (k / 7) * TAU;
         s.x = gx + Math.cos(ang) * 2.7;
         s.z = c.z + Math.sin(ang) * 2.7;
-        s.y = terrainH(s.x, s.z);
+        s.y = groundY(s.x, s.z);
         s.yaw = c.yaw + Math.PI;
         s.state = 'work';
         s.crew = true;
@@ -1393,7 +1452,7 @@ function makeArmyUnits(army) {
     for (let k = 0; k < u.soldiers.length; k++) {
       const s = u.soldiers[k];
       u.slotWorld(u.soldierSlot[k], s);
-      s.y = terrainH(s.x, s.z);
+      s.y = groundY(s.x, s.z);
       s.yaw = u.yaw;
     }
   }
@@ -1448,20 +1507,7 @@ const sandbagMat = new THREE.MeshStandardMaterial({ color: 0x7a6a4a, roughness: 
 const stakeMat = new THREE.MeshStandardMaterial({ color: 0x574429, roughness: 1 });
 const logMat = new THREE.MeshStandardMaterial({ color: 0x6b543a, roughness: 0.95 });
 
-/* 断面：dz 朝敌为正，h 为高出天然地面的高度，k 为受光系数（壕内压暗） */
-const TRENCH_ROWS = [
-  { dz: -2.70, h: 0.04, k: 0.50 },   // 背墙后坡脚
-  { dz: -2.05, h: 0.74, k: 0.94 },   // 背墙顶 (parados)
-  { dz: -1.55, h: 0.12, k: 0.56 },   // 背墙内坡
-  { dz: -1.15, h: 0.04, k: 0.38 },   // 壕底后缘
-  { dz: 0.80, h: 0.04, k: 0.38 },    // 壕底前缘
-  { dz: 1.30, h: 0.52, k: 0.72 },    // 踏台 (fire step)
-  { dz: 1.95, h: 1.30, k: 1.00 },    // 胸墙顶 (parapet)：1.30 m 才挡到站立者肩部
-  { dz: 3.05, h: 0.04, k: 0.84 }     // 胸墙前坡脚
-];
-const trenchRowH = (h, j, open) => j === 5 ? h * (1 - 0.62 * open)
-  : j === 6 ? h * (1 - 0.80 * open) : h;
-
+/* TRENCH_ROWS / trenchRowH / workH / workTraverse 见 ROSTER 之前的声明 */
 function buildTrenchLine(key) {
   const f = key === 'union' ? 1 : -1;
   const tz = TRENCH_Z[key];
@@ -1919,9 +1965,12 @@ function unitUpdate(u, dt) {
   if (u.gone) return;
   if (u.men <= 0) { u.gone = true; u.banner.visible = false; return; }
   u.stateT += dt;
+  /* 工事的通行属性：断面高差 + 鹿砦。进移动积分，否则骑兵/步兵过壕"如履平地" */
+  const trav = workTraverse(u.kind, u.cx, u.cz);
+  u.traverse = trav;
 
   if (u.state === 'rout') {
-    u.spd = 5.7;
+    u.spd = 5.7 * trav;
     const dir = u.army.key === 'union' ? -1 : 1;
     u.yaw = dir < 0 ? Math.PI : 0;
     u.cz += dir * u.spd * dt;
@@ -1944,7 +1993,7 @@ function unitUpdate(u, dt) {
       if (B.t > 2.5) { u.state = 'advance'; orderAdvance(u); }
       break;
     case 'advance':
-      u.spd = 2.8;
+      u.spd = 2.8 * trav;
       if (tgt) u.yaw = Math.atan2(tgt.cx - u.cx, tgt.cz - u.cz);
       u.cz += toward * u.spd * dt;
       if (u.kind === 'cav') {
@@ -1970,7 +2019,7 @@ function unitUpdate(u, dt) {
       }
       break;
     case 'charge': {
-      u.spd = u.kind === 'cav' ? 7.6 : 5.5;
+      u.spd = (u.kind === 'cav' ? 7.6 : 5.5) * trav;
       if (tgt) u.yaw = Math.atan2(tgt.cx - u.cx, tgt.cz - u.cz);
       const tx = tgt ? tgt.cx : u.cx;
       const tz = tgt ? tgt.cz : u.cz + 12 * toward;
@@ -2117,7 +2166,7 @@ function soldierUpdate(s, dt) {
     s.spd = step / dt;
   } else s.spd = 0;
   if (s.spd > 0.25) s.yaw = Math.atan2(dx, dz);
-  s.y = terrainH(s.x, s.z);
+  s.y = groundY(s.x, s.z);
   if (u.state === 'charge' && s.spd > 3 && vrnd() < dt * 5) {
     dustPool.emit(s.x, s.y + 0.2, s.z, 0.6, 2.2 + vrnd() * 0.6, 1.1 + vrnd() * 0.4, 0.4, 0,
       0.4, (vrnd() - 0.5) * 0.8, (vrnd() - 0.5) * 0.8);
@@ -2842,6 +2891,15 @@ window.__battle = {
     };
   },
   cover: () => [U, C].map(a => a.units.filter(u => u.kind !== 'art').map(u => u.name + ':' + (u.cover || 0).toFixed(2))).flat(),
+  traverse() {
+    const out = [];
+    for (const a of [U, C]) for (const u of a.units) {
+      if (u.kind === 'art') continue;
+      out.push(u.name + ' h=' + workH(u.cx, u.cz).toFixed(2)
+        + ' trav=' + (u.traverse === undefined ? 1 : u.traverse).toFixed(2));
+    }
+    return out;
+  },
   counts: () => ({
     unionFoot: U.foot.length, unionMount: U.mount.length,
     confFoot: C.foot.length, confMount: C.mount.length,
