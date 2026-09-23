@@ -1,0 +1,1689 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>南北战争 · 全面战争风格会战</title>
+<style>
+  :root{
+    --union:#3f5f9c; --union2:#6f8fc9; --conf:#8d7f63; --conf2:#b8a684;
+    --gold:#d9b96a; --panel:rgba(20,18,15,.72); --line:rgba(217,185,106,.35);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;overflow:hidden;background:#0d0f12;
+    font-family:Georgia,"Times New Roman","Songti SC","SimSun",serif;color:#efe8da}
+  #stage{position:fixed;inset:0}
+  #stage canvas{display:block}
+  #hud{position:fixed;inset:0;pointer-events:none;user-select:none}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:6px;
+    backdrop-filter:blur(3px);box-shadow:0 4px 18px rgba(0,0,0,.45)}
+  #topbar{position:absolute;top:10px;left:50%;transform:translateX(-50%);
+    display:flex;gap:10px;align-items:stretch;width:min(1180px,96vw)}
+  .army{flex:1;padding:8px 12px;min-width:0}
+  .army .name{font-size:15px;letter-spacing:2px;font-weight:700;display:flex;justify-content:space-between;gap:8px}
+  .army.union .name{color:var(--union2)}
+  .army.conf .name{color:var(--conf2)}
+  .army .sub{font-size:11px;opacity:.72;letter-spacing:1px}
+  .bar{height:9px;margin:6px 0 4px;background:rgba(255,255,255,.12);border-radius:5px;overflow:hidden}
+  .bar i{display:block;height:100%;width:100%}
+  .union .bar i{background:linear-gradient(90deg,#2f4a7d,#7ea2e0)}
+  .conf .bar i{background:linear-gradient(90deg,#6d6047,#c9b58c)}
+  .morale{height:4px;background:rgba(255,255,255,.1);border-radius:3px;overflow:hidden;margin-top:4px}
+  .morale i{display:block;height:100%;background:#e0c070;width:100%}
+  #center{width:210px;text-align:center;padding:8px 10px}
+  #phase{font-size:16px;letter-spacing:3px;color:var(--gold);font-weight:700}
+  #clock{font-size:12px;opacity:.8;margin-top:3px;letter-spacing:1px}
+  #log{position:absolute;left:14px;bottom:96px;width:340px;max-height:238px;overflow:hidden;
+    display:flex;flex-direction:column;gap:5px}
+  #log div{font-size:12px;padding:5px 9px;line-height:1.45}
+  #help{position:absolute;right:14px;bottom:96px;padding:9px 12px;font-size:12px;line-height:1.75;text-align:right}
+  #help b{color:var(--gold)}
+  #views{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);
+    display:flex;gap:6px;pointer-events:auto;flex-wrap:wrap;justify-content:center}
+  #views button{font-family:inherit;font-size:12px;letter-spacing:1px;color:#efe8da;cursor:pointer;
+    background:var(--panel);border:1px solid var(--line);border-radius:5px;padding:6px 11px}
+  #views button:hover{border-color:var(--gold);color:var(--gold)}
+  #views button.on{background:rgba(217,185,106,.22);color:var(--gold);border-color:var(--gold)}
+  #result{position:absolute;left:50%;top:44%;transform:translate(-50%,-50%);text-align:center;
+    padding:26px 46px;display:none}
+  #result h1{margin:0;font-size:34px;letter-spacing:10px;color:var(--gold);font-weight:700}
+  #result p{margin:12px 0 0;font-size:13px;letter-spacing:2px;opacity:.85;line-height:1.8}
+  #loading{position:fixed;inset:0;display:grid;place-items:center;background:#0d0f12;z-index:9;
+    font-size:14px;letter-spacing:4px;color:#b9a06a}
+  #debug{position:absolute;left:10px;top:10px;font-size:11px;font-family:Consolas,monospace;
+    max-width:46vw;white-space:pre-wrap;display:none;padding:8px;z-index:20;color:#ffb0a0}
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="hud">
+  <div id="topbar">
+    <div class="panel army union">
+      <div class="name"><span>联邦军 · UNION</span><span id="u-units">—</span></div>
+      <div class="bar"><i id="u-bar"></i></div>
+      <div class="sub">兵力 <span id="u-men">—</span> · 士气 <span id="u-mor">—</span></div>
+      <div class="morale"><i id="u-mbar"></i></div>
+    </div>
+    <div class="panel" id="center">
+      <div id="phase">部署中</div>
+      <div id="clock">0.0 s</div>
+      <div class="sub" id="speed">速度 ×1</div>
+    </div>
+    <div class="panel army conf">
+      <div class="name"><span id="c-units">—</span><span>邦联军 · CONFEDERACY</span></div>
+      <div class="bar"><i id="c-bar"></i></div>
+      <div class="sub">兵力 <span id="c-men">—</span> · 士气 <span id="c-mor">—</span></div>
+      <div class="morale"><i id="c-mbar"></i></div>
+    </div>
+  </div>
+  <div id="log"></div>
+  <div class="panel" id="help">
+    <div><b>1-6</b> 切换机位 &nbsp; <b>空格</b> 暂停</div>
+    <div><b>[ ]</b> 战斗速度 &nbsp; <b>R</b> 重开</div>
+    <div><b>鼠标</b> 拖拽旋转 / 滚轮缩放</div>
+  </div>
+  <div id="views"></div>
+  <div class="panel" id="result"><h1></h1><p></p></div>
+  <div class="panel" id="debug"></div>
+</div>
+<div id="loading">正在展开战场…</div>
+
+<script>
+(function(){
+  var base = 'https://cdn.jsdelivr.net/npm/three@0.185.0/';
+  var forceWebGL = /[?&]webgl=1/.test(location.search);
+  window.__BOOT_ERR = null;
+  function start(mode){
+    window.__RENDERER_MODE = mode;
+    var imports = {};
+    imports['three'] = base + (mode === 'webgpu' ? 'build/three.webgpu.min.js' : 'build/three.module.js');
+    imports['three/addons/'] = base + 'examples/jsm/';
+    var im = document.createElement('script');
+    im.type = 'importmap';
+    im.textContent = JSON.stringify({ imports: imports });
+    document.head.appendChild(im);
+    var app = document.createElement('script');
+    app.type = 'module';
+    app.textContent = document.getElementById('app-src').textContent;
+    document.body.appendChild(app);
+  }
+  function boot(){
+    if (navigator.gpu && !forceWebGL) {
+      navigator.gpu.requestAdapter().then(function(a){ start(a ? 'webgpu' : 'webgl'); })
+        .catch(function(){ start('webgl'); });
+    } else {
+      start('webgl');
+    }
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot);
+  } else {
+    boot();
+  }
+})();
+</script>
+
+<script type="text/plain" id="app-src">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+
+const LOADING = document.getElementById('loading');
+function fatal(e) {
+  window.__BOOT_ERR = String(e && e.stack || e);
+  const d = document.getElementById('debug');
+  if (d) { d.style.display = 'block'; d.textContent = window.__BOOT_ERR; }
+  if (LOADING) LOADING.remove();
+}
+window.addEventListener('error', ev => fatal(ev.error || ev.message));
+window.addEventListener('unhandledrejection', ev => fatal(ev.reason));
+
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const smooth = t => { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); };
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+const rnd = mulberry32(0x51A7B3);
+const QUERY = location.search || '';
+const NOHUD = /[?&]nohud=1/.test(QUERY);
+const SPEEDS = [0.5, 1, 2, 4];
+
+const HUD = {
+  phase: document.getElementById('phase'), clock: document.getElementById('clock'),
+  speed: document.getElementById('speed'), log: document.getElementById('log'),
+  result: document.getElementById('result'), views: document.getElementById('views'),
+  u: {
+    units: document.getElementById('u-units'), bar: document.getElementById('u-bar'),
+    men: document.getElementById('u-men'), mor: document.getElementById('u-mor'), mbar: document.getElementById('u-mbar')
+  },
+  c: {
+    units: document.getElementById('c-units'), bar: document.getElementById('c-bar'),
+    men: document.getElementById('c-men'), mor: document.getElementById('c-mor'), mbar: document.getElementById('c-mbar')
+  }
+};
+if (NOHUD) document.getElementById('hud').style.display = 'none';
+
+const MODE = window.__RENDERER_MODE || 'webgl';
+const renderer = MODE === 'webgpu'
+  ? new THREE.WebGPURenderer({ antialias: true })
+  : new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+if (MODE === 'webgpu' && renderer.init) await renderer.init();
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.12;
+if (renderer.shadowMap) {
+  renderer.shadowMap.enabled = true;
+  try { renderer.shadowMap.type = THREE.PCFShadowMap; } catch (e) { }
+}
+renderer.domElement.style.touchAction = 'none';
+document.getElementById('stage').appendChild(renderer.domElement);
+if (LOADING) LOADING.remove();
+
+const scene = new THREE.Scene();
+const FOG_COLOR = 0xcdbfa2;
+scene.fog = new THREE.Fog(FOG_COLOR, 140, 780);
+
+const camera = new THREE.PerspectiveCamera(48, window.innerWidth / window.innerHeight, 0.5, 2400);
+camera.position.set(0, 86, 205);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.075;
+controls.minDistance = 12;
+controls.maxDistance = 520;
+controls.maxPolarAngle = Math.PI / 2.06;
+controls.target.set(0, 5, 0);
+
+const SUN_DIR = new THREE.Vector3(0.52, 0.72, 0.34).normalize();
+const sun = new THREE.DirectionalLight(0xfff1d6, 2.6);
+sun.position.copy(SUN_DIR).multiplyScalar(240);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left = -170; sun.shadow.camera.right = 170;
+sun.shadow.camera.top = 170; sun.shadow.camera.bottom = -170;
+sun.shadow.camera.near = 60; sun.shadow.camera.far = 560;
+sun.shadow.bias = -0.0008;
+sun.shadow.normalBias = 0.07;
+sun.shadow.camera.updateProjectionMatrix();
+scene.add(sun, sun.target);
+scene.add(new THREE.HemisphereLight(0xcfe0f2, 0x7d7448, 1.15));
+scene.add(new THREE.AmbientLight(0xfff2dd, 0.34));
+
+function canvasTexture(w, h, draw, repeat) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  draw(c.getContext('2d'), w, h);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  if (repeat) { t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(repeat, repeat); }
+  t.anisotropy = 4;
+  return t;
+}
+function radialTex(size, stops) {
+  return canvasTexture(size, size, (g, w, h) => {
+    const rg = g.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, w / 2);
+    for (const s of stops) rg.addColorStop(s[0], s[1]);
+    g.fillStyle = rg; g.fillRect(0, 0, w, h);
+  });
+}
+
+const skyTex = canvasTexture(1024, 512, (g, w, h) => {
+  const gr = g.createLinearGradient(0, 0, 0, h);
+  gr.addColorStop(0.00, '#1e4a8c');
+  gr.addColorStop(0.30, '#4d7fbe');
+  gr.addColorStop(0.50, '#8fb2d2');
+  gr.addColorStop(0.62, '#c3c8b8');
+  gr.addColorStop(0.72, '#ddcaa2');
+  gr.addColorStop(1.00, '#c0aa84');
+  g.fillStyle = gr; g.fillRect(0, 0, w, h);
+  const r = mulberry32(9);
+  for (let i = 0; i < 90; i++) {
+    const x = r() * w, y = 40 + r() * 250, rad = 70 + r() * 240, hh = 0.12 + r() * 0.3;
+    const rg = g.createRadialGradient(x, y, 0, x, y, rad);
+    rg.addColorStop(0, 'rgba(255,252,246,' + (0.3 + r() * 0.35).toFixed(2) + ')');
+    rg.addColorStop(1, 'rgba(255,252,246,0)');
+    g.save(); g.translate(x, y); g.scale(1, hh); g.translate(-x, -y);
+    g.fillStyle = rg; g.beginPath(); g.arc(x, y, rad, 0, TAU); g.fill(); g.restore();
+  }
+  const sg = g.createRadialGradient(760, 430, 0, 760, 430, 110);
+  sg.addColorStop(0, 'rgba(255,242,214,.55)');
+  sg.addColorStop(1, 'rgba(255,242,214,0)');
+  g.fillStyle = sg; g.beginPath(); g.arc(760, 430, 110, 0, TAU); g.fill();
+});
+const sky = new THREE.Mesh(
+  new THREE.SphereGeometry(1050, 32, 20),
+  new THREE.MeshBasicMaterial({ map: skyTex, side: THREE.BackSide, fog: false, depthWrite: false })
+);
+sky.renderOrder = -20;
+scene.add(sky);
+
+function terrainH(x, z) {
+  const n = Math.sin(x * 0.019 + 1.3) * Math.cos(z * 0.016 - 0.7)
+    + 0.55 * Math.sin((x + z) * 0.037 + 2.1)
+    + 0.32 * Math.cos((x - z) * 0.055 - 1.1)
+    + 0.20 * Math.sin(x * 0.088) * Math.sin(z * 0.079);
+  const dz = Math.max(Math.abs(z) - 94, 0), dx = Math.max(Math.abs(x) - 152, 0);
+  return n * 2.6 * smooth(Math.hypot(dx, dz) / 48);
+}
+
+const grassTex = canvasTexture(256, 256, (g, w, h) => {
+  g.fillStyle = '#8a9459'; g.fillRect(0, 0, w, h);
+  const r = mulberry32(21);
+  for (let i = 0; i < 9000; i++) {
+    const v = r();
+    g.fillStyle = v < 0.34 ? 'rgba(160,170,92,.5)' : v < 0.68 ? 'rgba(118,128,72,.5)' : 'rgba(186,172,110,.42)';
+    g.fillRect(r() * w, r() * h, 1 + r() * 2, 1 + r() * 2);
+  }
+  for (let i = 0; i < 300; i++) {
+    g.strokeStyle = 'rgba(150,140,84,.3)'; g.lineWidth = 1;
+    const x = r() * w, y = r() * h;
+    g.beginPath(); g.moveTo(x, y); g.lineTo(x + r() * 4 - 2, y - 3 - r() * 4); g.stroke();
+  }
+}, 52);
+
+const groundGeo = new THREE.PlaneGeometry(780, 780, 128, 128);
+groundGeo.rotateX(-Math.PI / 2);
+{
+  const pos = groundGeo.attributes.position;
+  const colors = new Float32Array(pos.count * 3);
+  const cA = new THREE.Color(0x76854a), cB = new THREE.Color(0xa79c62), cC = new THREE.Color(0xb6a473);
+  const tmp = new THREE.Color();
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i), z = pos.getZ(i);
+    const y = terrainH(x, z);
+    pos.setY(i, y);
+    tmp.copy(cA).lerp(cB, clamp((y + 2.6) / 5.4, 0, 1)).lerp(cC, rnd() * 0.3);
+    colors[i * 3] = tmp.r; colors[i * 3 + 1] = tmp.g; colors[i * 3 + 2] = tmp.b;
+  }
+  groundGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  groundGeo.computeVertexNormals();
+}
+const ground = new THREE.Mesh(groundGeo, new THREE.MeshStandardMaterial({
+  vertexColors: true, map: grassTex, roughness: 0.97, metalness: 0
+}));
+ground.receiveShadow = true;
+scene.add(ground);
+
+const dirtTex = canvasTexture(256, 256, (g, w, h) => {
+  g.fillStyle = '#7d6a4e'; g.fillRect(0, 0, w, h);
+  const r = mulberry32(31);
+  for (let i = 0; i < 6000; i++) {
+    g.fillStyle = r() < 0.5 ? 'rgba(104,86,60,.5)' : 'rgba(150,129,96,.45)';
+    g.fillRect(r() * w, r() * h, 1 + r() * 3, 1 + r() * 2);
+  }
+  for (const x of [w * 0.22, w * 0.78]) {
+    g.strokeStyle = 'rgba(96,80,58,.22)'; g.lineWidth = 10;
+    g.beginPath(); g.moveTo(x, 0); g.lineTo(x + 5, h); g.stroke();
+  }
+});
+dirtTex.wrapS = dirtTex.wrapT = THREE.RepeatWrapping;
+dirtTex.repeat.set(26, 1);
+const road = new THREE.Mesh(new THREE.PlaneGeometry(780, 7.5), new THREE.MeshStandardMaterial({ map: dirtTex, roughness: 1 }));
+road.rotation.x = -Math.PI / 2;
+road.position.set(0, 0.02, 15);
+road.receiveShadow = true;
+scene.add(road);
+
+const postGeo = new THREE.CylinderGeometry(0.09, 0.11, 1.45, 6);
+postGeo.translate(0, 0.72, 0);
+const railGeo = new THREE.BoxGeometry(2.35, 0.09, 0.07);
+const woodMat = new THREE.MeshStandardMaterial({ color: 0x8a7a5c, roughness: 0.95 });
+const postSpots = [];
+for (let x = -150; x <= 150; x += 2.4) { if (x > -14 && x < 16) continue; postSpots.push([x, -78]); }
+for (let x = -120; x <= 120; x += 2.4) { if (x > -6 && x < 6) continue; postSpots.push([x, 76]); }
+const postMesh = new THREE.InstancedMesh(postGeo, woodMat, postSpots.length);
+const railMesh = new THREE.InstancedMesh(railGeo, woodMat, postSpots.length * 3);
+postMesh.castShadow = railMesh.castShadow = true;
+postMesh.receiveShadow = railMesh.receiveShadow = true;
+{
+  const d = new THREE.Object3D();
+  postSpots.forEach((p, i) => {
+    d.position.set(p[0], terrainH(p[0], p[1]), p[1]);
+    d.rotation.set(0, 0, 0); d.scale.set(1, 1, 1); d.updateMatrix();
+    postMesh.setMatrixAt(i, d.matrix);
+  });
+  let k = 0;
+  postSpots.forEach(p => {
+    const y0 = terrainH(p[0], p[1]);
+    for (let j = 0; j < 3; j++) {
+      d.position.set(p[0] + 1.18, y0 + 0.42 + j * 0.42, p[1] + (j % 2 ? 0.05 : -0.05));
+      d.rotation.set(0, 0, j % 2 ? 0.012 : -0.012);
+      d.updateMatrix();
+      railMesh.setMatrixAt(k++, d.matrix);
+    }
+  });
+  postMesh.instanceMatrix.needsUpdate = railMesh.instanceMatrix.needsUpdate = true;
+}
+scene.add(postMesh, railMesh);
+
+const treeSpots = [];
+for (let i = 0; i < 170; i++) {
+  const a = rnd() * TAU, rad = 158 + rnd() * 185;
+  const x = Math.cos(a) * rad, z = Math.sin(a) * rad * 0.92;
+  if (Math.abs(z) < 94 && Math.abs(x) < 164) continue;
+  treeSpots.push([x, z, 0.75 + rnd() * 0.75]);
+}
+for (let i = 0; i < 30; i++) treeSpots.push([76 + rnd() * 92, 68 + rnd() * 92, 0.8 + rnd() * 0.6]);
+for (let i = 0; i < 26; i++) treeSpots.push([-172 + rnd() * 84, -70 - rnd() * 92, 0.75 + rnd() * 0.7]);
+const trunkGeo = new THREE.CylinderGeometry(0.26, 0.42, 5.2, 6);
+trunkGeo.translate(0, 2.6, 0);
+const canopyGeo = new THREE.IcosahedronGeometry(2.6, 0);
+const trunkMesh = new THREE.InstancedMesh(trunkGeo, new THREE.MeshStandardMaterial({ color: 0x50412c, roughness: 1 }), treeSpots.length);
+const canopyMesh = new THREE.InstancedMesh(canopyGeo, new THREE.MeshStandardMaterial({ color: 0x47562c, roughness: 0.95, flatShading: true }), treeSpots.length);
+trunkMesh.castShadow = canopyMesh.castShadow = true;
+canopyMesh.receiveShadow = true;
+{
+  const d = new THREE.Object3D();
+  const col = new THREE.Color();
+  treeSpots.forEach((t, i) => {
+    const y = terrainH(t[0], t[1]);
+    d.position.set(t[0], y, t[1]);
+    d.rotation.set(0, rnd() * TAU, 0);
+    d.scale.set(t[2], t[2], t[2]); d.updateMatrix();
+    trunkMesh.setMatrixAt(i, d.matrix);
+    d.position.set(t[0] + (rnd() - 0.5) * 0.6, y + 5.4 * t[2] + 1.2, t[1] + (rnd() - 0.5) * 0.6);
+    d.rotation.set(rnd() * 0.2, rnd() * TAU, rnd() * 0.2);
+    d.scale.set(t[2] * (0.85 + rnd() * 0.5), t[2] * (0.8 + rnd() * 0.6), t[2] * (0.85 + rnd() * 0.5));
+    d.updateMatrix();
+    canopyMesh.setMatrixAt(i, d.matrix);
+    col.setHex(0x47562c).offsetHSL((rnd() - 0.5) * 0.05, (rnd() - 0.5) * 0.12, (rnd() - 0.5) * 0.14);
+    canopyMesh.setColorAt(i, col);
+  });
+  trunkMesh.instanceMatrix.needsUpdate = canopyMesh.instanceMatrix.needsUpdate = true;
+  if (canopyMesh.instanceColor) canopyMesh.instanceColor.needsUpdate = true;
+}
+scene.add(trunkMesh, canopyMesh);
+
+{
+  const stone = new THREE.MeshStandardMaterial({ color: 0x8d8879, roughness: 0.98 });
+  const roofMat = new THREE.MeshStandardMaterial({ color: 0x51443a, roughness: 0.95 });
+  const farm = new THREE.Group();
+  const house = new THREE.Mesh(new THREE.BoxGeometry(13, 5, 9), stone);
+  house.position.y = 2.5; farm.add(house);
+  for (const s of [1, -1]) {
+    const r = new THREE.Mesh(new THREE.BoxGeometry(13.8, 0.4, 5.8), roofMat);
+    r.position.set(0, 5.4, s * 2.2); r.rotation.x = s * 0.58; farm.add(r);
+  }
+  const gable = new THREE.Mesh(new THREE.BoxGeometry(12.6, 2.4, 8.2), stone);
+  gable.position.y = 5.7; farm.add(gable);
+  const chimney = new THREE.Mesh(new THREE.BoxGeometry(1.3, 3, 1.3), stone);
+  chimney.position.set(-4.4, 6.6, 0); farm.add(chimney);
+  farm.traverse(o => { o.castShadow = true; o.receiveShadow = true; });
+  farm.position.set(104, terrainH(104, 96), 96);
+  farm.rotation.y = -0.5;
+  scene.add(farm);
+  const barn = new THREE.Mesh(new THREE.BoxGeometry(16, 7, 12), new THREE.MeshStandardMaterial({ color: 0x6b3f33, roughness: 0.95 }));
+  barn.position.set(133, terrainH(133, 112) + 3.5, 112);
+  barn.rotation.y = 0.35;
+  barn.castShadow = barn.receiveShadow = true;
+  scene.add(barn);
+}
+
+{
+  const wallSpots = [];
+  for (let x = -128; x <= -24; x += 2.7) wallSpots.push([x, 72]);
+  for (let x = 26; x <= 96; x += 2.7) wallSpots.push([x, 72]);
+  const wallGeo = new THREE.BoxGeometry(2.6, 1.1, 0.75);
+  const wallMesh = new THREE.InstancedMesh(wallGeo, new THREE.MeshStandardMaterial({ color: 0x86837a, roughness: 1 }), wallSpots.length);
+  wallMesh.castShadow = wallMesh.receiveShadow = true;
+  const d = new THREE.Object3D();
+  wallSpots.forEach((p, i) => {
+    d.position.set(p[0], terrainH(p[0], p[1]) + 0.5, p[1]);
+    d.rotation.set(0, (rnd() - 0.5) * 0.06, 0); d.updateMatrix();
+    wallMesh.setMatrixAt(i, d.matrix);
+  });
+  wallMesh.instanceMatrix.needsUpdate = true;
+  scene.add(wallMesh);
+}
+const SIDE = {
+  union: {
+    key: 'union', label: '联邦军', css: '#a8c4f0',
+    coat: 0x22314c, pants: 0x5d7291, hat: 0x18202f, pack: 0x2b2823,
+    skin: 0xd9ad8c, steel: 0x8e949d, hide: 0x4b3a2a, mane: 0x2b2118
+  },
+  confederate: {
+    key: 'conf', label: '邦联军', css: '#e0cfa8',
+    coat: 0x9a8b62, pants: 0xa79c80, hat: 0x6f6752, pack: 0x53452f,
+    skin: 0xd7a884, steel: 0x8e949d, hide: 0x5b4630, mane: 0x342718
+  }
+};
+const MATE = {};
+for (const k in SIDE) {
+  MATE[k] = {
+    coat: new THREE.MeshStandardMaterial({ color: SIDE[k].coat, roughness: 0.86, metalness: 0.03 }),
+    pants: new THREE.MeshStandardMaterial({ color: SIDE[k].pants, roughness: 0.9 }),
+    skin: new THREE.MeshStandardMaterial({ color: SIDE[k].skin, roughness: 0.78 }),
+    hat: new THREE.MeshStandardMaterial({ color: SIDE[k].hat, roughness: 0.9 }),
+    pack: new THREE.MeshStandardMaterial({ color: SIDE[k].pack, roughness: 0.95 }),
+    steel: new THREE.MeshStandardMaterial({ color: SIDE[k].steel, roughness: 0.42, metalness: 0.75 }),
+    hide: new THREE.MeshStandardMaterial({ color: SIDE[k].hide, roughness: 0.92 }),
+    mane: new THREE.MeshStandardMaterial({ color: SIDE[k].mane, roughness: 0.95 })
+  };
+}
+
+const box = (w, h, d) => new THREE.BoxGeometry(w, h, d);
+const cyl = (rt, rb, h, s) => new THREE.CylinderGeometry(rt, rb, h, s);
+const at = (g, x, y, z) => { g.translate(x, y, z); return g; };
+
+const FOOT_PARTS = [
+  { id: 'torso', anim: 'torso', mat: 'coat', pos: [0, 0.95, 0], geo: box(0.44, 0.66, 0.26) },
+  { id: 'pack', anim: 'torso', mat: 'pack', pos: [0, 1.04, -0.21], geo: box(0.30, 0.34, 0.15) },
+  { id: 'head', anim: 'head', mat: 'skin', pos: [0, 1.40, 0], geo: new THREE.SphereGeometry(0.115, 8, 6) },
+  {
+    id: 'kepi', anim: 'head', mat: 'hat', pos: [0, 1.525, 0],
+    geo: mergeGeometries([cyl(0.125, 0.135, 0.13, 8), at(cyl(0.168, 0.168, 0.022, 8), 0, -0.075, 0.035)])
+  },
+  { id: 'armL', anim: 'armL', mat: 'coat', pos: [-0.28, 1.22, 0], geo: at(box(0.115, 0.5, 0.13), 0, -0.25, 0) },
+  { id: 'armR', anim: 'armR', mat: 'coat', pos: [0.28, 1.22, 0], geo: at(box(0.115, 0.5, 0.13), 0, -0.25, 0) },
+  { id: 'legL', anim: 'legL', mat: 'pants', pos: [-0.10, 0.62, 0], geo: at(box(0.15, 0.62, 0.17), 0, -0.31, 0) },
+  { id: 'legR', anim: 'legR', mat: 'pants', pos: [0.10, 0.62, 0], geo: at(box(0.15, 0.62, 0.17), 0, -0.31, 0) },
+  {
+    id: 'musket', anim: 'musket', mat: 'steel', pos: [0.17, 1.02, 0.14],
+    geo: mergeGeometries([
+      box(0.052, 0.052, 1.06),
+      at(box(0.024, 0.024, 0.36), 0, 0, 0.70),
+      at(box(0.075, 0.14, 0.22), 0, -0.02, -0.44)
+    ])
+  }
+];
+const RIDE_LIFT = 1.08;
+const RIDER_PARTS = FOOT_PARTS
+  .filter(p => p.id !== 'musket')
+  .map(p => ({ id: p.id, anim: p.anim, mat: p.mat, geo: p.geo, pos: [p.pos[0], p.pos[1] + RIDE_LIFT, p.pos[2]] }))
+  .concat([{
+    id: 'saber', anim: 'saber', mat: 'steel', pos: [0.34, 1.42 + RIDE_LIFT, 0.06],
+    geo: mergeGeometries([box(0.036, 0.036, 0.86), at(box(0.085, 0.14, 0.09), 0, 0, -0.02)])
+  }]);
+
+const HORSE_PARTS = [
+  { id: 'hBody', anim: 'hBody', mat: 'hide', pos: [0, 1.06, 0], geo: box(0.62, 0.70, 1.72) },
+  {
+    id: 'hNeck', anim: 'hNeck', mat: 'hide', pos: [0, 1.16, 0.70],
+    geo: mergeGeometries([
+      at(box(0.36, 0.54, 0.5), 0, 0.16, 0.22),
+      at(box(0.24, 0.26, 0.62), 0, 0.38, 0.6),
+      at(box(0.1, 0.22, 0.1), 0, 0.6, 0.62)
+    ])
+  },
+  { id: 'hTail', anim: 'none', mat: 'mane', pos: [0, 1.34, -0.88], geo: at(cyl(0.055, 0.02, 0.58, 6), 0, -0.28, 0) },
+  { id: 'hLegFL', anim: 'hLegA', mat: 'hide', pos: [-0.23, 0.75, 0.58], geo: at(box(0.15, 0.74, 0.15), 0, -0.37, 0) },
+  { id: 'hLegFR', anim: 'hLegB', mat: 'hide', pos: [0.23, 0.75, 0.58], geo: at(box(0.15, 0.74, 0.15), 0, -0.37, 0) },
+  { id: 'hLegBL', anim: 'hLegB', mat: 'hide', pos: [-0.23, 0.75, -0.58], geo: at(box(0.15, 0.74, 0.15), 0, -0.37, 0) },
+  { id: 'hLegBR', anim: 'hLegA', mat: 'hide', pos: [0.23, 0.75, -0.58], geo: at(box(0.15, 0.74, 0.15), 0, -0.37, 0) }
+];
+
+const _pose = { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0 };
+function poseOf(anim, s) {
+  if (anim === 'none') return null;
+  const st = s.state, ph = s.phase, ride = s.mounted;
+  const k = clamp(s.spd / 6.5, 0, 1);
+  let w;
+  if (st === 'walk') w = s.animT * (5.2 + s.spd * 1.2) + ph;
+  else if (st === 'charge') w = s.animT * 13.0 + ph;
+  else if (st === 'melee') w = s.animT * 9.5 + ph;
+  else if (st === 'work') w = s.animT * 6.0 + ph;
+  else w = s.animT * 2.4 + ph;
+  const p = _pose, rec = s.recoil, swing = Math.sin(w);
+  p.px = p.py = p.pz = p.rx = p.ry = p.rz = 0;
+  const walk = st === 'walk', charge = st === 'charge', melee = st === 'melee';
+  const fire = st === 'fire', work = st === 'work', down = st === 'down' || st === 'dead' || st === 'gone';
+  switch (anim) {
+    case 'torso':
+      if (down) p.rx = 0;
+      else if (charge) { p.rx = 0.3; p.py = Math.abs(swing) * 0.045; }
+      else if (melee) { const th = Math.max(0, Math.sin(w)); p.rx = 0.13 + 0.14 * th; p.py = 0.02 * th; }
+      else if (fire) p.rx = 0.03 - 0.07 * rec;
+      else if (work) p.rx = 0.24 + 0.1 * Math.sin(w * 1.3);
+      else if (walk) { p.rx = 0.08; p.py = Math.abs(swing) * 0.028; }
+      else { p.rx = 0.02; p.ry = Math.sin(s.animT * 0.8 + ph) * 0.045; }
+      break;
+    case 'head':
+      if (down) p.rx = 0.25;
+      else if (charge) p.rx = -0.14;
+      else if (melee) p.rx = 0.04;
+      else if (fire) p.rx = -0.05;
+      else if (work) p.rx = 0.1;
+      else { p.rx = -0.03; p.ry = Math.sin(w * 0.5 + ph) * 0.08; }
+      break;
+    case 'armL':
+      if (down) { p.rx = 0.3; p.rz = 0.2; }
+      else if (charge) p.rx = -0.72 - 0.3 * swing;
+      else if (melee) p.rx = -0.45 - 0.3 * Math.abs(swing);
+      else if (fire) p.rx = -1.34;
+      else if (work) p.rx = -0.55 + 0.55 * Math.sin(w * 1.6);
+      else if (walk) p.rx = -swing * 0.45;
+      else p.rx = 0.04;
+      break;
+    case 'armR':
+      if (down) { p.rx = -0.2; p.rz = -0.2; }
+      else if (charge) p.rx = -0.6 - 0.28 * swing;
+      else if (melee) p.rx = -0.7 - 1.05 * Math.max(0, Math.sin(w));
+      else if (fire) p.rx = -1.24 + 0.22 * rec;
+      else if (work) p.rx = -0.5 + 0.5 * Math.sin(w * 1.6 + 0.6);
+      else if (walk) p.rx = swing * 0.3;
+      else p.rx = 0.04;
+      break;
+    case 'legL':
+    case 'legR': {
+      const sgn = anim === 'legL' ? 1 : -1;
+      if (ride) { p.rx = anim === 'legL' ? -1.28 : -1.1; p.rz = 0.16; }
+      else if (down) { p.rx = sgn > 0 ? 0.4 : -0.25; p.rz = sgn * 0.12; }
+      else if (charge) p.rx = sgn * swing * 0.92;
+      else if (melee) { p.rx = sgn * 0.26 + 0.14 * swing; p.rz = sgn * 0.16; }
+      else if (fire) { p.rx = sgn * 0.16; p.rz = sgn * 0.2; }
+      else if (walk) p.rx = sgn * swing * 0.52;
+      else p.rx = sgn * 0.04;
+      break;
+    }
+    case 'musket':
+      if (ride) { p.rx = -1.3; p.rz = 0.5; p.pz = -0.18; p.py = -0.06; }
+      else if (down) { p.rx = -0.5; p.pz = -0.2; p.py = -0.3; p.rz = 0.5; }
+      else if (charge) { p.rx = -0.24 + 0.06 * swing; p.pz = 0.3; p.py = 0.08; p.rz = -0.08; }
+      else if (melee) { const th = Math.max(0, Math.sin(w)); p.rx = -0.28; p.pz = 0.16 + 0.44 * th; p.py = 0.02; p.px = 0.02; p.rz = -0.1; }
+      else if (fire) { p.rx = 0.06 * rec; p.pz = 0.34 - 0.16 * rec; p.py = 0.24; p.px = -0.02; }
+      else if (walk) { p.rx = -1.14; p.rz = 0.24; p.py = 0.05; }
+      else { p.rx = -1.1; p.rz = 0.24; p.py = 0.04; }
+      break;
+    case 'saber':
+      if (down) { p.rx = -0.3; p.rz = 0.6; }
+      else if (charge) { p.rx = -1.6 + 0.22 * swing; p.rz = 0.34; }
+      else if (melee) { p.rx = -0.35 - 0.95 * Math.max(0, Math.sin(w)); p.rz = 0.18; }
+      else { p.rx = -1.4; p.rz = 0.3; }
+      break;
+    case 'hBody':
+      if (s.spd > 0.2) { p.py = Math.abs(Math.sin(w)) * 0.05 * k; p.rx = -0.03 * k; }
+      break;
+    case 'hNeck':
+      if (s.spd > 0.2) p.rx = -0.08 + 0.13 * Math.sin(w + 1) * k;
+      break;
+    case 'hLegA':
+      p.rx = s.spd > 0.2 ? Math.sin(w) * 0.6 * k : 0.02;
+      break;
+    case 'hLegB':
+      p.rx = s.spd > 0.2 ? -Math.sin(w) * 0.6 * k : -0.02;
+      break;
+  }
+  return p;
+}
+class TroopPool {
+  constructor(parts, count, mats) {
+    this.parts = [];
+    this.count = count;
+    this.hidden = new THREE.Matrix4().makeScale(0, 0, 0);
+    for (const def of parts) {
+      const mesh = new THREE.InstancedMesh(def.geo, mats[def.mat], count);
+      mesh.castShadow = true;
+      mesh.frustumCulled = false;
+      mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      scene.add(mesh);
+      const local = new THREE.Object3D();
+      local.position.set(def.pos[0], def.pos[1], def.pos[2]);
+      local.rotation.set(0, 0, 0);
+      local.scale.set(1, 1, 1);
+      local.updateMatrix();
+      for (let i = 0; i < count; i++) mesh.setMatrixAt(i, this.hidden);
+      mesh.instanceMatrix.needsUpdate = true;
+      this.parts.push({ def, mesh, base: local.matrix.clone(), local });
+    }
+  }
+  flush() { for (const P of this.parts) P.mesh.instanceMatrix.needsUpdate = true; }
+}
+
+const _dummy = new THREE.Object3D();
+const _root = new THREE.Matrix4();
+const _part = new THREE.Matrix4();
+function writeSoldier(pool, idx, s) {
+  _dummy.position.set(s.x, s.y, s.z);
+  _dummy.rotation.order = 'YXZ';
+  _dummy.rotation.set(s.tilt, s.yaw, s.roll);
+  _dummy.scale.set(1, 1, 1);
+  _dummy.updateMatrix();
+  _root.copy(_dummy.matrix);
+  for (const P of pool.parts) {
+    const pose = poseOf(P.def.anim, s);
+    if (pose) {
+      P.local.position.set(P.def.pos[0] + pose.px, P.def.pos[1] + pose.py, P.def.pos[2] + pose.pz);
+      P.local.rotation.set(pose.rx, pose.ry, pose.rz);
+      P.local.updateMatrix();
+      _part.multiplyMatrices(_root, P.local.matrix);
+    } else {
+      _part.multiplyMatrices(_root, P.base);
+    }
+    P.mesh.setMatrixAt(idx, _part);
+  }
+}
+function hideSoldier(pool, idx) {
+  for (const P of pool.parts) P.mesh.setMatrixAt(idx, pool.hidden);
+}
+
+function newSoldier(mounted) {
+  return {
+    x: 0, y: 0, z: 0, yaw: 0, tilt: 0, roll: 0, phase: rnd() * TAU,
+    state: 'idle', animT: rnd() * 3, spd: 0, fallT: 0, recoil: 0, atk: rnd() * 1.2,
+    mounted: !!mounted, unit: null, idx: -1, si: -1, alive: true, crew: false,
+    target: null, retg: 0
+  };
+}
+
+class Unit {
+  constructor(army, cfg) {
+    this.army = army;
+    this.kind = cfg.kind;
+    this.name = cfg.name;
+    this.title = cfg.title || cfg.name;
+    this.cx = cfg.x; this.cz = cfg.z;
+    this.yaw = cfg.yaw;
+    this.resolve = cfg.resolve !== undefined ? cfg.resolve : (rnd() - 0.5) * 0.08;
+    this.files = cfg.files; this.ranks = cfg.ranks;
+    this.sx = cfg.sx || 1.55; this.sz = cfg.sz || 1.75;
+    this.soldiers = cfg.soldiers;
+    this.slots = [];
+    this.slotSoldier = [];
+    this.soldierSlot = new Array(this.soldiers.length);
+    this.state = 'idle';
+    this.stateT = 0;
+    this.spd = 0;
+    this.target = null;
+    this.men = this.soldiers.length;
+    this.maxMen = this.men;
+    this.morale = 1;
+    this.shock = 0;
+    this.volleys = 0;
+    this.volleyT = 0;
+    this.impact = false;
+    this.meleeT = 0;
+    this.gone = false;
+    this.guns = null;
+    let k = 0;
+    for (let r = 0; r < cfg.ranks; r++) {
+      for (let f = 0; f < cfg.files; f++) {
+        this.slots.push([(f - (cfg.files - 1) / 2) * this.sx, (r - (cfg.ranks - 1) / 2) * this.sz]);
+        this.slotSoldier.push(k);
+        this.soldierSlot[k] = this.slots.length - 1;
+        const s = this.soldiers[k];
+        if (s) { s.unit = this; s.si = k; }
+        k++;
+      }
+    }
+    this.banner = makeBanner(this);
+  }
+  slotWorld(slotIdx, out) {
+    const sl = this.slots[slotIdx];
+    const sn = Math.sin(this.yaw), cs = Math.cos(this.yaw);
+    out.x = this.cx + sl[0] * cs + sl[1] * sn;
+    out.z = this.cz - sl[0] * sn + sl[1] * cs;
+    return out;
+  }
+  aliveSoldiers() {
+    const a = this._alive || (this._alive = []);
+    a.length = 0;
+    for (const s of this.soldiers) if (s.alive) a.push(s);
+    return a;
+  }
+  kill(s) {
+    if (!s.alive) return;
+    s.alive = false; s.state = 'down'; s.fallT = 0; s.spd = 0; s.target = null;
+    this.men--;
+    const slot = this.soldierSlot[s.si];
+    if (slot !== undefined && slot >= 0) {
+      let last = this.slots.length - 1;
+      while (last >= 0 && this.slotSoldier[last] === -1) last--;
+      if (last >= 0 && last !== slot) {
+        const mv = this.slotSoldier[last];
+        this.slotSoldier[slot] = mv;
+        this.soldierSlot[mv] = slot;
+        this.slotSoldier[last] = -1;
+      }
+    }
+  }
+  get onField() { return this.kind !== 'art' && !this.gone && this.men > 0 && this.state !== 'rout'; }
+}
+
+function makeBanner(unit) {
+  const cv = document.createElement('canvas');
+  cv.width = 200; cv.height = 84;
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: true }));
+  sp.scale.set(6.2, 2.6, 1);
+  sp.renderOrder = 5;
+  scene.add(sp);
+  unit.bannerCtx = cv.getContext('2d');
+  unit.bannerTex = tex;
+  return sp;
+}
+function drawBanner(unit) {
+  const g = unit.bannerCtx, W = 200, H = 84;
+  const isU = unit.army.key === 'union';
+  g.clearRect(0, 0, W, H);
+  g.fillStyle = 'rgba(16,14,11,.84)';
+  g.strokeStyle = isU ? '#6f8fc9' : '#c2ae86';
+  g.lineWidth = 3;
+  g.beginPath(); g.roundRect(3, 3, W - 6, H - 6, 8); g.fill(); g.stroke();
+  g.fillStyle = 'rgba(0,0,0,.4)';
+  g.beginPath(); g.roundRect(3, 3, W - 6, 26, 8); g.fill();
+  g.fillStyle = isU ? '#9cbcec' : '#dcc79c';
+  g.font = 'bold 19px Georgia,serif';
+  g.textBaseline = 'middle';
+  g.fillText(unit.title, 12, 17);
+  g.fillStyle = '#f2ead8';
+  g.font = 'bold 27px Georgia,serif';
+  g.fillText(unit.men + ' / ' + unit.maxMen, 12, 52);
+  const mw = 96, mx = W - mw - 12, my = 45;
+  g.fillStyle = 'rgba(255,255,255,.16)';
+  g.fillRect(mx, my, mw, 12);
+  g.fillStyle = unit.morale > 0.55 ? '#dfc36e' : unit.morale > 0.3 ? '#d99a4a' : '#c05a3c';
+  g.fillRect(mx, my, mw * clamp(unit.morale, 0, 1), 12);
+  g.strokeStyle = 'rgba(255,255,255,.35)'; g.lineWidth = 1;
+  g.strokeRect(mx, my, mw, 12);
+  g.fillStyle = 'rgba(240,232,214,.85)';
+  g.font = '13px Georgia,serif';
+  g.fillText(unit.kind === 'cav' ? '骑兵' : '线列步兵', mx, 31);
+  unit.bannerTex.needsUpdate = true;
+}
+
+const flashTex = radialTex(64, [[0, 'rgba(255,246,208,1)'], [0.3, 'rgba(255,196,90,.9)'], [1, 'rgba(255,120,20,0)']]);
+const smokeTex = radialTex(128, [[0, 'rgba(214,212,206,.88)'], [0.45, 'rgba(188,186,180,.5)'], [1, 'rgba(172,170,164,0)']]);
+const dustTex = radialTex(128, [[0, 'rgba(180,158,118,.85)'], [0.5, 'rgba(158,136,98,.45)'], [1, 'rgba(140,120,86,0)']]);
+const boomTex = radialTex(128, [[0, 'rgba(255,255,232,1)'], [0.25, 'rgba(255,206,110,.95)'], [0.6, 'rgba(210,120,40,.6)'], [1, 'rgba(90,60,30,0)']]);
+
+class SpritePool {
+  constructor(count, tex, blending) {
+    this.items = [];
+    for (let i = 0; i < count; i++) {
+      const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: tex, transparent: true, depthWrite: false, blending, opacity: 0
+      }));
+      sp.visible = false;
+      sp.renderOrder = 2;
+      scene.add(sp);
+      this.items.push({ sp, life: 0, ttl: 1, s0: 1, s1: 1, o0: 1, o1: 0, vx: 0, vy: 0, vz: 0, spin: 0 });
+    }
+  }
+  emit(x, y, z, s0, s1, ttl, o0, o1, vy, vx, vz) {
+    for (const it of this.items) {
+      if (it.life > 0) continue;
+      it.life = it.ttl = ttl; it.s0 = s0; it.s1 = s1; it.o0 = o0; it.o1 = o1;
+      it.vx = vx || 0; it.vy = vy || 0; it.vz = vz || 0;
+      it.spin = (rnd() - 0.5) * 0.6;
+      it.sp.position.set(x, y, z);
+      it.sp.material.rotation = rnd() * TAU;
+      it.sp.scale.set(s0, s0, 1);
+      it.sp.material.opacity = o0;
+      it.sp.visible = true;
+      return true;
+    }
+    return false;
+  }
+  update(dt) {
+    for (const it of this.items) {
+      if (it.life <= 0) continue;
+      it.life -= dt;
+      if (it.life <= 0) { it.sp.visible = false; continue; }
+      const t = 1 - it.life / it.ttl;
+      it.sp.position.x += it.vx * dt;
+      it.sp.position.y += it.vy * dt;
+      it.sp.position.z += it.vz * dt;
+      it.sp.material.rotation += it.spin * dt;
+      const s = lerp(it.s0, it.s1, t);
+      it.sp.scale.set(s, s, 1);
+      it.sp.material.opacity = lerp(it.o0, it.o1, t);
+    }
+  }
+}
+const flashPool = new SpritePool(110, flashTex, THREE.AdditiveBlending);
+const smokePool = new SpritePool(200, smokeTex, THREE.NormalBlending);
+const dustPool = new SpritePool(110, dustTex, THREE.NormalBlending);
+const boomPool = new SpritePool(36, boomTex, THREE.NormalBlending);
+
+const craterMat = new THREE.MeshStandardMaterial({
+  map: radialTex(128, [[0, 'rgba(38,30,22,.92)'], [0.5, 'rgba(58,46,32,.6)'], [1, 'rgba(70,58,42,0)']]),
+  transparent: true, depthWrite: false, roughness: 1
+});
+const craterGeo = new THREE.PlaneGeometry(1, 1);
+const craters = [];
+for (let i = 0; i < 44; i++) {
+  const m = new THREE.Mesh(craterGeo, craterMat);
+  m.rotation.x = -Math.PI / 2;
+  m.visible = false;
+  m.renderOrder = 1;
+  scene.add(m);
+  craters.push(m);
+}
+let craterIdx = 0;
+function addCrater(x, z, size) {
+  const m = craters[craterIdx++ % craters.length];
+  m.position.set(x, terrainH(x, z) + 0.04, z);
+  m.rotation.z = rnd() * TAU;
+  m.scale.set(size, size, 1);
+  m.visible = true;
+}
+
+function makeCannon(army) {
+  const g = new THREE.Group();
+  const steel = new THREE.MeshStandardMaterial({ color: 0x3b3f42, roughness: 0.42, metalness: 0.8 });
+  const wood = new THREE.MeshStandardMaterial({ color: army.key === 'union' ? 0x5a6a50 : 0x6a5a44, roughness: 0.9 });
+  const iron = new THREE.MeshStandardMaterial({ color: 0x4a4a4a, roughness: 0.6, metalness: 0.5 });
+  const barrel = new THREE.Group();
+  const tube = new THREE.Mesh(cyl(0.12, 0.165, 2.05, 16), steel);
+  tube.rotation.x = Math.PI / 2; tube.position.z = 0.6; barrel.add(tube);
+  const muzzle = new THREE.Mesh(cyl(0.185, 0.185, 0.14, 16), steel);
+  muzzle.rotation.x = Math.PI / 2; muzzle.position.z = 1.62; barrel.add(muzzle);
+  const breech = new THREE.Mesh(new THREE.SphereGeometry(0.19, 10, 8), steel);
+  breech.position.z = -0.42; barrel.add(breech);
+  barrel.position.set(0, 1.0, 0.1);
+  g.add(barrel);
+  const carriage = new THREE.Mesh(box(0.98, 0.3, 1.7), wood);
+  carriage.position.set(0, 0.78, 0.05); g.add(carriage);
+  const trail = new THREE.Mesh(box(0.3, 0.26, 2.1), wood);
+  trail.position.set(0, 0.62, -1.5); g.add(trail);
+  for (const s of [-1, 1]) {
+    const w = new THREE.Mesh(cyl(0.66, 0.66, 0.16, 16), wood);
+    w.rotation.set(0, 0, Math.PI / 2);
+    w.position.set(s * 0.62, 0.66, 0.2);
+    g.add(w);
+  }
+  const ammo = new THREE.Mesh(box(0.9, 0.55, 0.7), wood);
+  ammo.position.set(0, 1.05, -2.3); g.add(ammo);
+  const balls = new THREE.InstancedMesh(new THREE.SphereGeometry(0.11, 8, 6), iron, 12);
+  const d = new THREE.Object3D();
+  for (let i = 0; i < 12; i++) {
+    d.position.set(-0.75 + (i % 4) * 0.11, 0.11 + Math.floor(i / 4) * 0.22, -1.95 - (i % 2) * 0.14);
+    d.updateMatrix(); balls.setMatrixAt(i, d.matrix);
+  }
+  g.add(balls);
+  g.traverse(o => { o.castShadow = true; o.receiveShadow = true; });
+  return { group: g, barrel };
+}
+
+const shells = [];
+const shellGeo = new THREE.SphereGeometry(0.17, 8, 6);
+const shellMat = new THREE.MeshStandardMaterial({ color: 0x24242a, roughness: 0.5, metalness: 0.6 });
+for (let i = 0; i < 26; i++) {
+  const m = new THREE.Mesh(shellGeo, shellMat);
+  m.visible = false; m.castShadow = true;
+  scene.add(m);
+  shells.push({ mesh: m, active: false, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, trail: 0, side: 'union' });
+}
+let shellIdx = 0;
+function fireShell(gun) {
+  const target = gun.targetUnit;
+  if (!target) return;
+  const sh = shells[shellIdx++ % shells.length];
+  const sx = gun.x, sz = gun.z;
+  const tx = target.cx + (rnd() - 0.5) * 14, tz = target.cz + (rnd() - 0.5) * 12;
+  const dx = tx - sx, dz = tz - sz;
+  const flat = Math.max(1, Math.hypot(dx, dz));
+  const dist = Math.max(26, flat);
+  const ang = 0.31;
+  const v = Math.sqrt(dist * 9.8 / Math.sin(2 * ang));
+  const ux = dx / flat, uz = dz / flat;
+  sh.x = sx + ux * 2.3; sh.y = 1.7; sh.z = sz + uz * 2.3;
+  sh.vx = ux * v * Math.cos(ang); sh.vz = uz * v * Math.cos(ang); sh.vy = v * Math.sin(ang);
+  sh.active = true; sh.trail = 0; sh.mesh.visible = true; sh.side = gun.army.key;
+  sh.mesh.position.set(sh.x, sh.y, sh.z);
+  gun.recoil = 1;
+  for (const s of gun.crew) { s.state = 'fire'; s.recoil = 1; }
+  flashPool.emit(sh.x + ux * 1.4, sh.y + 0.25, sh.z + uz * 1.4, 4.2, 0.6, 0.11, 1, 0, 0, ux * 3, uz * 3);
+  for (let i = 0; i < 5; i++) {
+    smokePool.emit(
+      sh.x + ux * (1.4 + i * 1.5) + (rnd() - 0.5) * 1.4, 2.1 + rnd() * 1.2,
+      sh.z + uz * (1.4 + i * 1.5) + (rnd() - 0.5) * 1.4,
+      2.6 + i * 0.9, 6.4 + i * 2.2, 2.4 + rnd() * 0.8, 0.44, 0, 0.5 + rnd() * 0.4, ux * 1.6, uz * 1.6
+    );
+  }
+  dustPool.emit(sh.x, 0.5, sh.z, 2, 7, 1.6, 0.5, 0, 0.4, ux * 2, uz * 2);
+}
+const SHELL_KILL_RADIUS = 6.4;
+function projectilesUpdate(dt) {
+  for (const sh of shells) {
+    if (!sh.active) continue;
+    sh.vy -= 9.8 * dt;
+    sh.x += sh.vx * dt; sh.y += sh.vy * dt; sh.z += sh.vz * dt;
+    sh.mesh.position.set(sh.x, sh.y, sh.z);
+    sh.mesh.rotation.x += dt * 7; sh.mesh.rotation.z += dt * 5;
+    sh.trail -= dt;
+    if (sh.trail <= 0) {
+      sh.trail = 0.05;
+      smokePool.emit(sh.x, sh.y, sh.z, 0.55, 1.9, 0.85, 0.26, 0, 0.3, sh.vx * 0.03, sh.vz * 0.03);
+    }
+    const gY = terrainH(sh.x, sh.z);
+    if (sh.y <= gY + 0.15) {
+      sh.active = false; sh.mesh.visible = false;
+      boomPool.emit(sh.x, gY + 1.2, sh.z, 2.4, 8, 0.4, 1, 0, 1.6, 0, 0);
+      for (let i = 0; i < 4; i++) {
+        smokePool.emit(sh.x + (rnd() - 0.5) * 2.6, gY + 0.7 + rnd() * 2.0, sh.z + (rnd() - 0.5) * 2.6,
+          2.0, 5.6, 1.8 + rnd() * 0.9, 0.46, 0, 0.8 + rnd(), (rnd() - 0.5) * 2, (rnd() - 0.5) * 2);
+      }
+      for (let i = 0; i < 4; i++) {
+        dustPool.emit(sh.x + (rnd() - 0.5) * 4.4, gY + 0.6 + rnd() * 1.6, sh.z + (rnd() - 0.5) * 4.4,
+          2.0, 6.2, 1.8, 0.5, 0, 1.1, (rnd() - 0.5) * 4, (rnd() - 0.5) * 4);
+      }
+      addCrater(sh.x, sh.z, 5 + rnd() * 3.5);
+      const foe = sh.side === 'union' ? C : U;
+      let hits = 0;
+      for (const u of foe.units) {
+        if (u.kind === 'art' || u.men <= 0 || u.gone) continue;
+        for (const s of u.aliveSoldiers()) {
+          if (hits > 7) break;
+          if (Math.hypot(s.x - sh.x, s.z - sh.z) < SHELL_KILL_RADIUS && rnd() < 0.85) { u.kill(s); hits++; }
+        }
+      }
+      if (hits > 0) blog('炮弹落入 ' + (foe === U ? '联邦军' : '邦联军') + ' 队列 — ' + hits + ' 人倒下', '#d9a05a');
+    }
+  }
+}
+
+const ROSTER = {
+  union: {
+    infantry: [
+      { resolve: 0.06, name: '第 20 缅因团', title: '第20缅因', x: -60, z: -64, files: 14, ranks: 3, yaw: 0 },
+      { resolve: 0.06, name: '第 69 纽约团', title: '第69纽约', x: -20, z: -66, files: 14, ranks: 3, yaw: 0 },
+      { resolve: 0.06, name: '第 1 明尼苏达团', title: '第1明尼苏达', x: 21, z: -64, files: 14, ranks: 3, yaw: 0 },
+      { resolve: 0.06, name: '爱尔兰旅', title: '爱尔兰旅', x: 61, z: -66, files: 14, ranks: 3, yaw: 0 }
+    ],
+    cavalry: [
+      { resolve: 0.06, name: '第 6 骑兵团', title: '第6骑兵', x: -98, z: -58, files: 6, ranks: 2, yaw: 0, sx: 2.3, sz: 2.6 },
+      { resolve: 0.06, name: '第 1 骑兵团', title: '第1骑兵', x: 100, z: -58, files: 6, ranks: 2, yaw: 0, sx: 2.3, sz: 2.6 }
+    ],
+    artillery: [
+      { resolve: 0.06, name: '第 2 炮兵连', title: '第2炮兵连', x: -34, z: -98, guns: 3, yaw: 0 },
+      { resolve: 0.06, name: '第 5 炮兵连', title: '第5炮兵连', x: 38, z: -98, guns: 3, yaw: 0 }
+    ]
+  },
+  confederate: {
+    infantry: [
+      { resolve: -0.01, name: '第 1 弗吉尼亚团', title: '第1弗吉尼亚', x: 58, z: 64, files: 14, ranks: 3, yaw: Math.PI },
+      { resolve: -0.01, name: '第 4 阿拉巴马团', title: '第4阿拉巴马', x: 19, z: 66, files: 14, ranks: 3, yaw: Math.PI },
+      { resolve: -0.01, name: '第 2 密西西比团', title: '第2密西西比', x: -21, z: 64, files: 14, ranks: 3, yaw: Math.PI },
+      { resolve: -0.01, name: '石墙旅', title: '石墙旅', x: -61, z: 66, files: 14, ranks: 3, yaw: Math.PI }
+    ],
+    cavalry: [
+      { resolve: -0.01, name: '第 1 弗吉尼亚骑兵', title: '第1弗骑', x: 99, z: 58, files: 6, ranks: 2, yaw: Math.PI, sx: 2.3, sz: 2.6 },
+      { resolve: -0.01, name: '汉普顿军团', title: '汉普顿军团', x: -99, z: 58, files: 6, ranks: 2, yaw: Math.PI, sx: 2.3, sz: 2.6 }
+    ],
+    artillery: [
+      { resolve: -0.01, name: '华盛顿炮兵', title: '华盛顿炮兵', x: 30, z: 98, guns: 3, yaw: Math.PI },
+      { resolve: -0.01, name: '石墙炮兵', title: '石墙炮兵', x: -32, z: 98, guns: 3, yaw: Math.PI }
+    ]
+  }
+};
+
+function buildArmy(key) {
+  const roster = ROSTER[key];
+  const footCount = roster.infantry.reduce((a, u) => a + u.files * u.ranks, 0)
+    + roster.artillery.reduce((a, u) => a + u.guns * 7, 0);
+  const mountCount = roster.cavalry.reduce((a, u) => a + u.files * u.ranks, 0);
+  const army = {
+    key, side: SIDE[key],
+    footPool: new TroopPool(FOOT_PARTS, footCount, MATE[key]),
+    mountPool: new TroopPool(HORSE_PARTS, mountCount, MATE[key]),
+    riderPool: new TroopPool(RIDER_PARTS, mountCount, MATE[key]),
+    foot: [], mount: [], units: [], guns: [], footCursor: 0, mountCursor: 0
+  };
+  for (let i = 0; i < footCount; i++) army.foot.push(newSoldier(false));
+  for (let i = 0; i < mountCount; i++) army.mount.push(newSoldier(true));
+  return army;
+}
+
+function makeArmyUnits(army) {
+  const roster = ROSTER[army.key];
+  const mk = (kind, cfg) => {
+    const total = cfg.files * cfg.ranks;
+    const soldiers = [];
+    if (kind === 'inf') {
+      for (let i = 0; i < total; i++) {
+        const s = army.foot[army.footCursor];
+        s.idx = army.footCursor++;
+        soldiers.push(s);
+      }
+    } else {
+      for (let i = 0; i < total; i++) {
+        const s = army.mount[army.mountCursor];
+        s.idx = army.mountCursor++;
+        soldiers.push(s);
+      }
+    }
+    const u = new Unit(army, Object.assign({ kind, soldiers }, cfg));
+    army.units.push(u);
+    return u;
+  };
+  for (const c of roster.infantry) mk('inf', c);
+  for (const c of roster.cavalry) mk('cav', c);
+  for (const c of roster.artillery) {
+    const guns = [];
+    for (let i = 0; i < c.guns; i++) {
+      const gx = c.x + (i - (c.guns - 1) / 2) * 16;
+      const cannon = makeCannon(army);
+      cannon.group.position.set(gx, terrainH(gx, c.z), c.z);
+      cannon.group.rotation.y = c.yaw;
+      scene.add(cannon.group);
+      const crew = [];
+      for (let k = 0; k < 7; k++) {
+        const s = army.foot[army.footCursor];
+        s.idx = army.footCursor++;
+        const ang = (k / 7) * TAU;
+        s.x = gx + Math.cos(ang) * 2.7;
+        s.z = c.z + Math.sin(ang) * 2.7;
+        s.y = terrainH(s.x, s.z);
+        s.yaw = c.yaw + Math.PI;
+        s.state = 'work';
+        s.crew = true;
+        crew.push(s);
+      }
+      guns.push({ army, group: cannon.group, barrel: cannon.barrel, crew, x: gx, z: c.z, recoil: 0, reload: 3 + rnd() * 5, targetUnit: null });
+      army.guns.push(guns[guns.length - 1]);
+    }
+    const u = new Unit(army, Object.assign({ kind: 'art', soldiers: [] }, c, { files: 1, ranks: 1, sx: 1, sz: 1 }));
+    u.men = 1; u.maxMen = 1;
+    u.slots = []; u.slotSoldier = []; u.soldierSlot = [];
+    u.guns = guns;
+    u.banner.scale.set(0, 0, 0);
+    army.units.push(u);
+  }
+  for (const u of army.units) {
+    if (u.kind === 'art') continue;
+    for (let k = 0; k < u.soldiers.length; k++) {
+      const s = u.soldiers[k];
+      u.slotWorld(u.soldierSlot[k], s);
+      s.y = terrainH(s.x, s.z);
+      s.yaw = u.yaw;
+    }
+  }
+}
+
+const U = buildArmy('union');
+const C = buildArmy('confederate');
+makeArmyUnits(U);
+makeArmyUnits(C);
+
+const B = {
+  t: 0, phase: 'DEPLOY', speed: 1, paused: false, over: false, winner: null,
+  meleeStarted: -1, cavCommitted: false, entries: []
+};
+function blog(text, color) {
+  const d = document.createElement('div');
+  d.className = 'panel';
+  d.textContent = text;
+  if (color) d.style.color = color;
+  HUD.log.prepend(d);
+  while (HUD.log.children.length > 7) HUD.log.lastChild.remove();
+  B.entries.push({ t: +B.t.toFixed(1), text });
+}
+const enemyOf = a => a === U ? C : U;
+const STEP = 1 / 60;
+const _v = { x: 0, z: 0 };
+
+function orderAdvance(u) {
+  const foe = enemyOf(u.army);
+  let best = null, bd = 1e9;
+  for (const e of foe.units) {
+    if (e.kind === 'art' || e.gone || e.men <= 0 || e.state === 'rout') continue;
+    const d = Math.abs(e.cx - u.cx) + Math.abs(e.cz - u.cz) * 0.3;
+    if (d < bd) { bd = d; best = e; }
+  }
+  u.target = best;
+}
+
+function unitUpdate(u, dt) {
+  if (u.kind === 'art') {
+    for (const gun of u.guns) {
+      const foe = enemyOf(u.army);
+      let best = null, bd = 1e9;
+      for (const e of foe.units) {
+        if (e.kind === 'art' || e.men <= 0 || e.gone || e.state === 'rout') continue;
+        const d = Math.hypot(e.cx - gun.x, e.cz - gun.z);
+        if (d < bd) { bd = d; best = e; }
+      }
+      gun.targetUnit = bd < 340 ? best : null;
+      gun.recoil = Math.max(0, gun.recoil - dt * 1.9);
+      gun.barrel.position.z = 0.1 - 0.42 * gun.recoil;
+      for (const s of gun.crew) s.recoil = Math.max(0, s.recoil - dt * 3.4);
+      if (gun.targetUnit && B.t > 3 && !B.over) {
+        gun.reload -= dt;
+        if (gun.reload <= 0) { gun.reload = 8.5 + rnd() * 2.5; fireShell(gun); }
+        const ty = Math.atan2(gun.targetUnit.cx - gun.x, gun.targetUnit.cz - gun.z);
+        gun.group.rotation.y = lerp(gun.group.rotation.y, ty, 1 - Math.exp(-dt * 0.8));
+        for (const s of gun.crew) {
+          s.yaw = gun.group.rotation.y + Math.PI;
+          if (s.state === 'fire' && s.recoil <= 0) s.state = 'work';
+        }
+      } else {
+        for (const s of gun.crew) if (s.state === 'fire' && s.recoil <= 0) s.state = 'work';
+      }
+    }
+    return;
+  }
+  if (u.gone) return;
+  if (u.men <= 0) { u.gone = true; u.banner.visible = false; return; }
+  u.stateT += dt;
+
+  if (u.state === 'rout') {
+    u.spd = 5.7;
+    const dir = u.army.key === 'union' ? -1 : 1;
+    u.yaw = dir < 0 ? Math.PI : 0;
+    u.cz += dir * u.spd * dt;
+    if (Math.abs(u.cz) > 168) {
+      u.gone = true;
+      u.banner.visible = false;
+      for (const s of u.soldiers) if (s.alive) s.state = 'gone';
+    }
+    return;
+  }
+
+  if (!u.target || u.target.men <= 0 || u.target.gone) orderAdvance(u);
+  const tgt = u.target;
+  const dist = tgt ? Math.hypot(tgt.cx - u.cx, tgt.cz - u.cz) : 9999;
+  const toward = u.army.key === 'union' ? 1 : -1;
+
+  switch (u.state) {
+    case 'idle':
+      u.spd = 0;
+      if (B.t > 2.5) { u.state = 'advance'; orderAdvance(u); }
+      break;
+    case 'advance':
+      u.spd = 2.8;
+      if (tgt) u.yaw = Math.atan2(tgt.cx - u.cx, tgt.cz - u.cz);
+      u.cz += toward * u.spd * dt;
+      if (u.kind === 'cav') {
+        if (dist < 96) u.state = 'hold';
+      } else if (dist < 84 || u.cz * toward > 6) {
+        u.state = 'fire'; u.volleys = 0; u.volleyT = 0.5;
+        blog(u.name + ' 停止前进，列队齐射', u.army.side.css);
+      }
+      break;
+    case 'hold':
+      u.spd = 0;
+      if (tgt) u.yaw = Math.atan2(tgt.cx - u.cx, tgt.cz - u.cz);
+      break;
+    case 'fire':
+      u.spd = 0;
+      if (tgt) u.yaw = Math.atan2(tgt.cx - u.cx, tgt.cz - u.cz);
+      u.volleyT -= dt;
+      if (u.volleyT <= 0) {
+        u.volleys++;
+        volley(u);
+        if (u.volleys >= 3) startCharge(u);
+        else u.volleyT = 1.7;
+      }
+      break;
+    case 'charge': {
+      u.spd = u.kind === 'cav' ? 7.6 : 5.5;
+      if (tgt) u.yaw = Math.atan2(tgt.cx - u.cx, tgt.cz - u.cz);
+      const tx = tgt ? tgt.cx : u.cx;
+      const tz = tgt ? tgt.cz : u.cz + 12 * toward;
+      const dx = tx - u.cx, dz = tz - u.cz, d = Math.hypot(dx, dz);
+      if (d > 0.4) { u.cx += dx / d * u.spd * dt; u.cz += dz / d * u.spd * dt; }
+      if (tgt && Math.hypot(tgt.cx - u.cx, tgt.cz - u.cz) < (u.kind === 'cav' ? 17 : 12)) {
+        if (u.kind === 'cav' && !u.impact) cavalryImpact(u, tgt);
+        u.state = 'melee';
+        u.meleeT = 0;
+        if (B.meleeStarted < 0) {
+          B.meleeStarted = B.t;
+          blog('战线全面接敌 — 白刃战爆发', '#e8b46a');
+        }
+      }
+      break;
+    }
+    case 'melee': {
+      u.meleeT += dt;
+      u.spd = 0.8;
+      if (tgt && tgt.men > 0 && !tgt.gone) {
+        const dx = tgt.cx - u.cx, dz = tgt.cz - u.cz, d = Math.hypot(dx, dz) || 1;
+        u.yaw = Math.atan2(dx, dz);
+        const push = d > (u.kind === 'cav' ? 9 : 5.5) ? 1.2 : 0.14;
+        u.cx += dx / d * push * dt;
+        u.cz += dz / d * push * dt;
+      } else {
+        orderAdvance(u);
+        if (u.target) { u.state = 'charge'; u.impact = false; }
+      }
+      break;
+    }
+  }
+
+  const dmg = 1 - u.men / u.maxMen;
+  u.shock = Math.max(0, u.shock - dt * 0.035);
+  u.morale = clamp(1 + u.resolve - dmg * 1.65 - u.shock, 0, 1);
+  if (u.state === 'melee' && u.meleeT > 3 && (u.men / u.maxMen < 0.3 || u.morale < 0.22)) {
+    u.state = 'rout';
+    blog(u.name + ' 阵型崩解，溃退！', '#e08a5a');
+  } else if (u.state !== 'melee' && u.men / u.maxMen < 0.22) {
+    u.state = 'rout';
+    blog(u.name + ' 伤亡过半，脱离战线！', '#e08a5a');
+  }
+}
+function startCharge(u) {
+  u.state = 'charge';
+  u.impact = false;
+  if (u.kind === 'inf') blog(u.name + ' 上刺刀 — 冲锋！', '#f0d79a');
+}
+
+function volley(u) {
+  const tgt = u.target;
+  if (!tgt || tgt.men <= 0) return;
+  const d = Math.hypot(tgt.cx - u.cx, tgt.cz - u.cz);
+  const eff = clamp(1 - d / 190, 0.25, 1);
+  let shots = 0;
+  for (let i = 0; i < u.soldiers.length; i++) {
+    const s = u.soldiers[i];
+    if (!s.alive) continue;
+    const fx = Math.sin(s.yaw), fz = Math.cos(s.yaw);
+    const mx = s.x + fx * 1.05, mz = s.z + fz * 1.05, my = s.y + 1.3;
+    flashPool.emit(mx, my, mz, 0.8, 0.18, 0.09, 1, 0, 0.2, fx * 1.4, fz * 1.4);
+    if (shots % 5 === 0) {
+      smokePool.emit(mx, my + 0.15, mz, 0.9, 3.8, 1.3 + rnd() * 0.5, 0.36, 0, 0.6, fx * 1.1, fz * 1.1);
+    }
+    s.recoil = 1;
+    shots++;
+  }
+  const kills = Math.max(0, Math.round((1 + rnd() * 2.4) * eff));
+  const pool = tgt.aliveSoldiers();
+  for (let i = 0; i < kills && pool.length; i++) {
+    tgt.kill(pool.splice(Math.floor(rnd() * pool.length), 1)[0]);
+  }
+  tgt.shock = clamp(tgt.shock + 0.008 * kills, 0, 0.2);
+  blog(u.name + ' 齐射 — 命中 ' + kills + ' 人（' + Math.round(d) + ' m）', u.army.side.css);
+}
+
+function cavalryImpact(cav, inf) {
+  if (!inf || inf.men <= 0) return;
+  const pool = inf.aliveSoldiers();
+  const kills = Math.min(pool.length, 5 + Math.floor(rnd() * 6));
+  for (let i = 0; i < kills; i++) inf.kill(pool.splice(Math.floor(rnd() * pool.length), 1)[0]);
+  inf.shock = clamp(inf.shock + 0.24, 0, 0.45);
+  cav.impact = true;
+  const sx = (cav.cx + inf.cx) * 0.5, sz = (cav.cz + inf.cz) * 0.5;
+  for (let i = 0; i < 12; i++) {
+    dustPool.emit(sx + (rnd() - 0.5) * 14, 0.4 + rnd() * 1.8, sz + (rnd() - 0.5) * 9, 2.4, 9, 1.9, 0.5, 0, 0.6, (rnd() - 0.5) * 3, (rnd() - 0.5) * 3);
+  }
+  blog(cav.name + ' 骑兵冲击 ' + inf.name + ' — 阵线动摇！', '#f0b070');
+}
+
+function soldierUpdate(s, dt) {
+  if (s.crew) { s.animT += dt; s.spd = 0; return; }
+  s.animT += dt;
+  if (s.state === 'gone') return;
+  if (!s.alive) {
+    s.fallT += dt;
+    s.tilt = 1.45 * smooth(s.fallT / 0.62);
+    s.spd = 0;
+    return;
+  }
+  const u = s.unit;
+  if (s.recoil > 0) s.recoil = Math.max(0, s.recoil - dt * 3.4);
+  let desX, desZ, cap;
+  if (u.state === 'melee') {
+    s.retg -= dt;
+    if (s.retg <= 0 || !s.target || !s.target.alive) {
+      s.retg = 0.4 + rnd() * 0.5;
+      const foe = enemyOf(u.army);
+      let best = null, bd = 1e9;
+      for (const eu of foe.units) {
+        if (eu.state !== 'melee' && eu.state !== 'charge' && eu.state !== 'hold') continue;
+        for (const e of eu.aliveSoldiers()) {
+          const d = (e.x - s.x) ** 2 + (e.z - s.z) ** 2;
+          if (d < bd) { bd = d; best = e; }
+        }
+      }
+      s.target = best;
+    }
+    if (s.target && s.target.alive) {
+      desX = s.target.x + Math.cos(s.phase) * 1.0;
+      desZ = s.target.z + Math.sin(s.phase) * 1.0;
+    } else { desX = s.x; desZ = s.z; }
+    cap = 2.8;
+    s.state = 'melee';
+  } else {
+    u.slotWorld(u.soldierSlot[s.si], _v);
+    desX = _v.x; desZ = _v.z;
+    cap = u.state === 'charge' ? 7.4 : u.state === 'rout' ? 6.4 : u.state === 'advance' ? 3.8 : 1.5;
+    s.state = u.state === 'charge' ? 'charge' : u.state === 'fire' ? 'fire' : (u.spd > 0.15 ? 'walk' : 'idle');
+  }
+  const dx = desX - s.x, dz = desZ - s.z;
+  const d = Math.hypot(dx, dz);
+  const stop = u.state === 'melee' ? 1.15 : 0.02;
+  if (d > stop) {
+    const step = Math.min(cap * dt, d);
+    s.x += dx / d * step;
+    s.z += dz / d * step;
+    s.spd = step / dt;
+  } else s.spd = 0;
+  if (s.spd > 0.25) s.yaw = Math.atan2(dx, dz);
+  s.y = terrainH(s.x, s.z);
+  if (u.state === 'charge' && s.spd > 3 && rnd() < dt * 5) {
+    dustPool.emit(s.x, s.y + 0.25, s.z, 0.9, 3.2, 0.9, 0.32, 0, 0.5, (rnd() - 0.5) * 0.8, (rnd() - 0.5) * 0.8);
+  }
+  if (u.state === 'melee') {
+    s.atk -= dt;
+    if (s.atk <= 0) {
+      s.atk = 0.95 + rnd() * 0.6;
+      const t = s.target;
+      if (t && t.alive && Math.hypot(t.x - s.x, t.z - s.z) < 1.8) {
+        if (rnd() < (s.mounted ? 0.12 : 0.06)) {
+          t.unit.kill(t);
+          s.target = null;
+          flashPool.emit(t.x, t.y + 1.1, t.z, 0.5, 0.1, 0.08, 0.8, 0, 0, 0, 0);
+        }
+      }
+    }
+  }
+}
+function directorUpdate(dt) {
+  B.t += dt;
+  if (B.over) return;
+  if (!B.cavCommitted && B.meleeStarted > 0 && B.t - B.meleeStarted > 6) {
+    B.cavCommitted = true;
+    for (const army of [U, C]) {
+      for (const u of army.units) {
+        if (u.kind !== 'cav' || u.gone || u.men <= 0) continue;
+        const foe = enemyOf(army);
+        let best = null, bd = 1e9;
+        for (const e of foe.units) {
+          if (e.kind === 'art' || e.men <= 0 || e.gone || e.state === 'rout') continue;
+          const d = Math.hypot(e.cx - u.cx, e.cz - u.cz) * (e.men / e.maxMen);
+          if (d < bd) { bd = d; best = e; }
+        }
+        if (best) { u.target = best; u.state = 'charge'; u.impact = false; }
+      }
+    }
+    blog('骑兵自侧翼投入战斗', '#f0b070');
+  }
+  const uAct = U.units.filter(u => u.onField).length;
+  const cAct = C.units.filter(u => u.onField).length;
+  if (uAct === 0 && cAct === 0) endBattle('draw');
+  else if (uAct === 0) endBattle('confederate');
+  else if (cAct === 0) endBattle('union');
+  else if (B.t > 400) {
+    const us = U.units.reduce((a, u) => a + u.men, 0), cs = C.units.reduce((a, u) => a + u.men, 0);
+    endBattle(us > cs * 1.12 ? 'union' : cs > us * 1.12 ? 'confederate' : 'draw');
+  }
+}
+
+function endBattle(winner) {
+  B.over = true; B.winner = winner;
+  const us = U.units.filter(u => u.kind !== 'art').reduce((a, u) => a + u.men, 0);
+  const cs = C.units.filter(u => u.kind !== 'art').reduce((a, u) => a + u.men, 0);
+  const u0 = U.units.filter(u => u.kind !== 'art').reduce((a, u) => a + u.maxMen, 0);
+  const c0 = C.units.filter(u => u.kind !== 'art').reduce((a, u) => a + u.maxMen, 0);
+  const title = winner === 'union' ? '联邦军胜利' : winner === 'confederate' ? '邦联军胜利' : '两败俱伤';
+  HUD.result.style.display = 'block';
+  HUD.result.querySelector('h1').textContent = title;
+  HUD.result.querySelector('p').innerHTML =
+    '联邦军 ' + us + ' / ' + u0 + ' 人 &nbsp;·&nbsp; 邦联军 ' + cs + ' / ' + c0 + ' 人<br>交战用时 ' + B.t.toFixed(1) + ' 秒';
+  blog('战斗结束 — ' + title, '#e8c470');
+}
+
+function simulate(dt) {
+  directorUpdate(dt);
+  for (const u of U.units) unitUpdate(u, dt);
+  for (const u of C.units) unitUpdate(u, dt);
+  for (const s of U.foot) soldierUpdate(s, dt);
+  for (const s of C.foot) soldierUpdate(s, dt);
+  for (const s of U.mount) soldierUpdate(s, dt);
+  for (const s of C.mount) soldierUpdate(s, dt);
+  projectilesUpdate(dt);
+  flashPool.update(dt); smokePool.update(dt); dustPool.update(dt); boomPool.update(dt);
+  let melee = 0;
+  for (const a of [U, C]) for (const u of a.units) if (u.state === 'melee') melee++;
+  if (melee > 0 && B.meleeStarted < 0) B.meleeStarted = B.t;
+  const firing = U.units.some(u => u.state === 'fire') || C.units.some(u => u.state === 'fire');
+  const charging = U.units.some(u => u.state === 'charge') || C.units.some(u => u.state === 'charge');
+  B.phase = B.over ? 'END'
+    : B.t < 2.5 ? 'DEPLOY'
+      : B.meleeStarted > 0 ? 'MELEE'
+        : charging ? 'CHARGE'
+          : firing ? 'FIRE' : 'ADVANCE';
+}
+
+function syncArmy(army) {
+  for (const s of army.foot) {
+    if (s.state === 'gone') hideSoldier(army.footPool, s.idx);
+    else writeSoldier(army.footPool, s.idx, s);
+  }
+  army.footPool.flush();
+  for (const s of army.mount) {
+    if (s.state === 'gone') { hideSoldier(army.mountPool, s.idx); hideSoldier(army.riderPool, s.idx); }
+    else { writeSoldier(army.mountPool, s.idx, s); writeSoldier(army.riderPool, s.idx, s); }
+  }
+  army.mountPool.flush();
+  army.riderPool.flush();
+  for (const u of army.units) {
+    if (u.kind === 'art') { u.cx = u.guns[0].x; u.cz = u.guns[0].z; continue; }
+    if (u.gone) { u.banner.visible = false; continue; }
+    u.banner.visible = u.men > 0;
+    const stagger = army.key === 'union' ? 0 : 3.1;
+    u.banner.position.set(u.cx, terrainH(u.cx, u.cz) + (u.kind === 'cav' ? 8.8 : 7.5) + stagger, u.cz);
+    u.banner.material.opacity = u.state === 'rout' ? 0.4 : 1;
+  }
+}
+
+let hudT = 0, bannerT = 0;
+function updateHUD(dt) {
+  hudT -= dt;
+  if (hudT > 0) return;
+  hudT = 0.22;
+  const men = a => a.units.filter(u => u.kind !== 'art').reduce((x, u) => x + u.men, 0);
+  const max = a => a.units.filter(u => u.kind !== 'art').reduce((x, u) => x + u.maxMen, 0);
+  for (const [a, h] of [[U, HUD.u], [C, HUD.c]]) {
+    const m = men(a), mx = Math.max(1, max(a));
+    const live = a.units.filter(u => u.kind !== 'art' && u.men > 0);
+    h.men.textContent = m;
+    h.units.textContent = a.units.filter(u => u.onField).length + ' 个建制';
+    h.bar.style.width = (100 * m / mx).toFixed(1) + '%';
+    const mor = live.length ? live.reduce((x, u) => x + u.morale, 0) / live.length : 0;
+    h.mor.textContent = Math.round(mor * 100) + '%';
+    h.mbar.style.width = (mor * 100).toFixed(0) + '%';
+  }
+  HUD.phase.textContent = { DEPLOY: '部署中', ADVANCE: '推进', FIRE: '火力准备', CHARGE: '冲锋', MELEE: '白刃战', END: '战斗结束' }[B.phase] || B.phase;
+  HUD.clock.textContent = B.t.toFixed(1) + ' s' + (B.paused ? ' · 暂停' : '');
+  HUD.speed.textContent = '速度 ×' + B.speed;
+}
+
+function bannersUpdate(dt) {
+  bannerT -= dt;
+  if (bannerT > 0) return;
+  bannerT = 0.45;
+  for (const army of [U, C]) for (const u of army.units) if (u.kind !== 'art' && !u.gone) drawBanner(u);
+}
+
+const VIEWS = [
+  { id: 'overview', label: '全景', pos: [0, 86, 205], tgt: [0, 5, 0], fov: 48 },
+  { id: 'union', label: '联邦军视角', pos: [0, 18, -132], tgt: [0, 8, 20], fov: 46 },
+  { id: 'conf', label: '邦联军视角', pos: [0, 18, 132], tgt: [0, 8, -20], fov: 46 },
+  { id: 'art', label: '炮兵阵地', pos: [-54, 12, -124], tgt: [-16, 3, -56], fov: 42 },
+  { id: 'melee', label: '跟拍战斗', follow: true, fov: 44 },
+  { id: 'orbit', label: '环绕观赏', auto: true, fov: 50 }
+];
+let view = VIEWS[0];
+let autoA = 0.6;
+function setView(v) {
+  view = v;
+  [...HUD.views.children].forEach(b => b.classList.toggle('on', b.dataset.id === v.id));
+  if (!v.follow && !v.auto) {
+    camera.fov = v.fov || 48;
+    camera.updateProjectionMatrix();
+    camera.position.set(v.pos[0], v.pos[1], v.pos[2]);
+    controls.target.set(v.tgt[0], v.tgt[1], v.tgt[2]);
+  }
+}
+VIEWS.forEach((v, i) => {
+  const b = document.createElement('button');
+  b.textContent = (i + 1) + ' ' + v.label;
+  b.dataset.id = v.id;
+  b.onclick = () => setView(v);
+  HUD.views.appendChild(b);
+});
+setView(VIEWS[0]);
+
+const _cam = new THREE.Vector3();
+const _tgt = new THREE.Vector3();
+function camUpdate(dt) {
+  if (view.follow) {
+    let best = null, bs = -1;
+    for (const army of [U, C]) {
+      for (const u of army.units) {
+        if (u.kind === 'art' || u.gone || u.men <= 0) continue;
+        const s = (u.state === 'melee' ? 3 : u.state === 'charge' ? 2 : 0.4) + (1 - u.men / u.maxMen);
+        if (s > bs) { bs = s; best = u; }
+      }
+    }
+    if (best) {
+      const foe = enemyOf(best.army);
+      let near = null, nd = 1e9;
+      for (const e of foe.units) {
+        if (e.kind !== 'inf' || e.men <= 0 || e.gone) continue;
+        const d = Math.abs(e.cx - best.cx);
+        if (d < nd) { nd = d; near = e; }
+      }
+      const fz = near ? (Math.sign(near.cz - best.cz) || 1) : 1;
+      _cam.set(best.cx + fz * 24, 13 + bs * 2.2, best.cz + fz * 28);
+      _tgt.set(best.cx, 3, best.cz + fz * 5);
+      camera.position.lerp(_cam, 1 - Math.exp(-dt * 1.6));
+      controls.target.lerp(_tgt, 1 - Math.exp(-dt * 2.0));
+      if (Math.abs(camera.fov - 44) > 0.02) {
+        camera.fov = lerp(camera.fov, 44, 1 - Math.exp(-dt * 2));
+        camera.updateProjectionMatrix();
+      }
+    }
+  } else if (view.auto) {
+    autoA += dt * 0.085;
+    const R = 200;
+    _cam.set(Math.sin(autoA) * R, 90, Math.cos(autoA) * R);
+    camera.position.lerp(_cam, 1 - Math.exp(-dt * 1.1));
+    controls.target.lerp(_tgt.set(0, 6, 0), 1 - Math.exp(-dt * 2));
+  }
+}
+
+const clock = new THREE.Timer();
+clock.connect(document);
+let acc = 0, frames = 0, fpsT = 0, fps = 0;
+
+function loop() {
+  clock.update();
+  const raw = clock.getDelta();
+  const dt = Math.min(raw, 0.1);
+  if (!B.paused) {
+    acc += dt * B.speed;
+    let n = 0;
+    while (acc >= STEP && n < 8) { simulate(STEP); acc -= STEP; n++; }
+    if (n >= 8) acc = 0;
+    camUpdate(dt);
+    updateHUD(dt);
+    bannersUpdate(dt);
+  }
+  syncArmy(U);
+  syncArmy(C);
+  frames++; fpsT += raw;
+  if (fpsT > 0.5) { fps = frames / fpsT; frames = 0; fpsT = 0; }
+  renderer.render(scene, camera);
+}
+renderer.setAnimationLoop(loop);
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space') { B.paused = !B.paused; e.preventDefault(); }
+  if (e.key >= '1' && e.key <= '6') setView(VIEWS[+e.key - 1]);
+  if (e.key === '[' || e.key === ']') {
+    let i = SPEEDS.indexOf(B.speed);
+    i = clamp(i + (e.key === ']' ? 1 : -1), 0, SPEEDS.length - 1);
+    B.speed = SPEEDS[i];
+  }
+  if (e.key === 'r' || e.key === 'R') location.reload();
+});
+
+function packArmy(a) {
+  return a.units.filter(u => u.kind !== 'art').map(u => ({
+    name: u.name, type: u.kind, men: u.men, max: u.maxMen, state: u.state,
+    morale: +u.morale.toFixed(3), x: +u.cx.toFixed(1), z: +u.cz.toFixed(1)
+  }));
+}
+window.__battle = {
+  sim(seconds, step) {
+    step = step || STEP;
+    const n = Math.max(0, Math.round(seconds / step));
+    for (let i = 0; i < n; i++) simulate(step);
+    syncArmy(U); syncArmy(C);
+    updateHUD(1); bannersUpdate(1);
+    return this.state();
+  },
+  state() {
+    return {
+      renderer: MODE, t: +B.t.toFixed(2), phase: B.phase, paused: B.paused, speed: B.speed,
+      over: B.over, winner: B.winner, fps: +fps.toFixed(1),
+      shellsInFlight: shells.filter(s => s.active).length,
+      union: packArmy(U), confederate: packArmy(C),
+      visibleSprites: flashPool.items.filter(i => i.life > 0).length
+        + smokePool.items.filter(i => i.life > 0).length
+        + dustPool.items.filter(i => i.life > 0).length
+        + boomPool.items.filter(i => i.life > 0).length,
+      log: B.entries.slice(-10).map(e => e.t + 's ' + e.text)
+    };
+  },
+  soldier(i, side, kind) {
+    const a = side === 'union' ? U : C;
+    const s = kind === 'cav' ? a.mount[i] : a.foot[i];
+    return {
+      x: +s.x.toFixed(3), y: +s.y.toFixed(3), z: +s.z.toFixed(3), yaw: +s.yaw.toFixed(3),
+      state: s.state, tilt: +s.tilt.toFixed(3), spd: +s.spd.toFixed(3),
+      alive: s.alive, animT: +s.animT.toFixed(3), mounted: s.mounted
+ 
+    };
+  },
+  partMatrix(idx, side, kind, partId) {
+    const a = side === 'union' ? U : C;
+    const pool = kind === 'cav' ? a.mountPool : a.footPool;
+    const P = pool.parts.find(p => p.def.id === partId);
+    if (!P) return null;
+    const m = new THREE.Matrix4();
+    P.mesh.getMatrixAt(idx, m);
+    const p = new THREE.Vector3(), q = new THREE.Quaternion(), s = new THREE.Vector3();
+    m.decompose(p, q, s);
+    const e = new THREE.Euler().setFromQuaternion(q, 'YXZ');
+    return {
+      id: partId, pos: [+p.x.toFixed(4), +p.y.toFixed(4), +p.z.toFixed(4)],
+      rot: [+e.x.toFixed(4), +e.y.toFixed(4), +e.z.toFixed(4)]
+    };
+  },
+  unit(name) {
+    for (const a of [U, C]) for (const u of a.units) if (u.name === name) {
+      return { state: u.state, men: u.men, morale: +u.morale.toFixed(3), x: +u.cx.toFixed(2), z: +u.cz.toFixed(2), target: u.target ? u.target.name : null };
+    }
+    return null;
+  },
+  camera: id => setView(VIEWS.find(v => v.id === id) || VIEWS[0]),
+  freecam(px, py, pz, tx, ty, tz, fov) {
+    view = { id: 'free', label: '自由', fov: fov || 45 };
+    [...HUD.views.children].forEach(b => b.classList.remove('on'));
+    camera.fov = fov || 45;
+    camera.updateProjectionMatrix();
+    camera.position.set(px, py, pz);
+    controls.target.set(tx, ty, tz);
+    controls.update();
+    return { pos: camera.position.toArray(), tgt: controls.target.toArray() };
+  },
+  pause: v => { B.paused = !!v; },
+  speed: v => { B.speed = v; },
+  fps: () => +fps.toFixed(1),
+  counts: () => ({
+    unionFoot: U.foot.length, unionMount: U.mount.length,
+    confFoot: C.foot.length, confMount: C.mount.length,
+    unionGuns: U.guns.length, confGuns: C.guns.length
+  })
+};
+window.__battleReady = true;
+</script>
+</body>
+</html>
