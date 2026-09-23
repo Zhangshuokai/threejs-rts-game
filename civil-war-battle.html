@@ -223,8 +223,8 @@ const FXQ = new URLSearchParams(location.search);
 const FX = {
   enabled: false,
   wanted: MODE === 'webgl' && FXQ.get('fx') !== '0',
-  bloomStrength: +(FXQ.get('bloom') || 0.45),
-  grain: FXQ.get('grain') === '0' ? 0 : 0.016
+  bloomStrength: +(FXQ.get('bloom') || 0.28),
+  grain: FXQ.get('grain') === '0' ? 0 : 0.01
 };
 let composer = null, bloomPass = null, gradePass = null, fxTime = 0;
 
@@ -232,9 +232,9 @@ const GradeShader = {
   uniforms: {
     tDiffuse: { value: null },
     uTime: { value: 0 },
-    uVignette: { value: 0.52 },
-    uGrain: { value: 0.016 },
-    uWarm: { value: 0.85 }
+    uVignette: { value: 0.42 },
+    uGrain: { value: 0.01 },
+    uWarm: { value: 0.5 }
   },
   vertexShader: [
     'varying vec2 vUv;',
@@ -252,8 +252,8 @@ const GradeShader = {
     '  vec4 c = texture2D(tDiffuse, vUv);',
     '  c.rgb = mix(c.rgb, c.rgb * vec3(1.045, 1.005, 0.945), uWarm);',
     '  float l = dot(c.rgb, vec3(0.2126, 0.7152, 0.0722));',
-    '  c.rgb = mix(vec3(l), c.rgb, 1.07);',
-    '  c.rgb = max((c.rgb - 0.5) * 1.05 + 0.5, vec3(0.0));',
+    '  c.rgb = mix(vec3(l), c.rgb, 1.02);',
+    '  c.rgb = max((c.rgb - 0.5) * 1.03 + 0.5, vec3(0.0));',
     '  vec2 d = vUv - 0.5;',
     '  c.rgb *= clamp(1.0 - uVignette * dot(d, d) * 2.6, 0.0, 1.0);',
     '  float g = fxHash(vUv * vec2(1024.0, 768.0) + fract(uTime) * 91.7) - 0.5;',
@@ -864,28 +864,36 @@ function drawBanner(unit) {
   unit.bannerTex.needsUpdate = true;
 }
 
-function puffTex(size, seed, rgb, maxAlpha) {
+/* 程序化烟气贴图：域扭曲 fBm 湍流 + 柔和边缘(不触及 quad 边) + 顶亮底暗的自遮蔽亮度 */
+function puffTex(size, seed, rgb, maxAlpha, lit) {
   const r = mulberry32(seed);
-  const G = 12, g = new Float32Array((G + 1) * (G + 1));
+  const G = 24, g = new Float32Array(G * G);
   for (let i = 0; i < g.length; i++) g[i] = r();
   const fade = t => t * t * (3 - 2 * t);
+  const at = (x, y) => g[(y % G) * G + (x % G)];
   function noise(x, y) {
     const x0 = Math.floor(x), y0 = Math.floor(y);
     const fx = fade(x - x0), fy = fade(y - y0);
-    const a = g[(y0 % G) * (G + 1) + (x0 % G)], b = g[(y0 % G) * (G + 1) + ((x0 + 1) % G)];
-    const c = g[((y0 + 1) % G) * (G + 1) + (x0 % G)], d = g[((y0 + 1) % G) * (G + 1) + ((x0 + 1) % G)];
-    return lerp(lerp(a, b, fx), lerp(c, d, fx), fy);
+    return lerp(lerp(at(x0, y0), at(x0 + 1, y0), fx), lerp(at(x0, y0 + 1), at(x0 + 1, y0 + 1), fx), fy);
   }
+  const fbm = (x, y) => noise(x, y) * 0.5 + noise(x * 2.3 + 11.3, y * 2.3 + 5.1) * 0.3 + noise(x * 5.1 + 3.7, y * 5.1 + 9.4) * 0.2;
   return canvasTexture(size, size, (ctx, w, h) => {
     const img = ctx.createImageData(w, h), d = img.data;
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
-        const dist = Math.hypot(x / w - 0.5, y / h - 0.5) * 2;
-        const n = noise(x / w * G, y / h * G) * 0.62 + noise(x / w * G * 2.7, y / h * G * 2.7) * 0.38;
-        const edge = clamp((1.0 - dist) / (0.55 + n * 0.5), 0, 1);
-        const a = Math.min(Math.pow(edge, 1.5) * (0.5 + 0.85 * n), 1) * maxAlpha;
+        const u = x / w, v = y / h;
+        const wx = fbm(u * G * 0.6 + 21.7, v * G * 0.6 + 4.3) - 0.5;
+        const wy = fbm(u * G * 0.6 + 7.1, v * G * 0.6 + 31.9) - 0.5;
+        const n = clamp(fbm(u * G + wx * 7.0, v * G + wy * 7.0) * 1.18, 0, 1);
+        const dist = Math.hypot(u - 0.5, v - 0.5) * 2;
+        const core = clamp((1.06 - dist * (0.6 + 0.7 * n)) / 0.55, 0, 1);
+        const guard = clamp((1.0 - dist) / 0.16, 0, 1);
+        const a = clamp(Math.pow(core, 1.05) * (0.5 + 0.8 * n) - 0.2, 0, 1) * guard * maxAlpha;
+        const shade = (0.64 + 0.55 * lit) + (0.36 + 0.35 * lit) * (1 - v) + (n - 0.5) * 0.26;
         const i = (y * w + x) * 4;
-        d[i] = rgb[0]; d[i + 1] = rgb[1]; d[i + 2] = rgb[2];
+        d[i] = clamp(rgb[0] * shade, 0, 255);
+        d[i + 1] = clamp(rgb[1] * shade, 0, 255);
+        d[i + 2] = clamp(rgb[2] * shade, 0, 255);
         d[i + 3] = clamp(a + (r() - 0.5) / 255, 0, 1) * 255;
       }
     }
@@ -893,10 +901,17 @@ function puffTex(size, seed, rgb, maxAlpha) {
   });
 }
 
-const flashTex = radialTex(64, [[0, 'rgba(255,246,208,1)'], [0.3, 'rgba(255,196,90,.9)'], [1, 'rgba(255,120,20,0)']]);
-const smokeTex = puffTex(256, 0x5E11A3, [204, 201, 194], 0.6);
-const dustTex = puffTex(192, 0x2B7C05, [172, 152, 120], 0.45);
-const boomTex = radialTex(128, [[0, 'rgba(255,255,232,1)'], [0.25, 'rgba(255,206,110,.95)'], [0.6, 'rgba(210,120,40,.6)'], [1, 'rgba(90,60,30,0)']]);
+const flashTex = radialTex(64, [[0, 'rgba(255,252,238,1)'], [0.16, 'rgba(255,238,196,.92)'], [0.44, 'rgba(255,170,66,.48)'], [1, 'rgba(255,110,20,0)']]);
+/* WebGPU 构建不吃 onBeforeCompile(GLSL)，逐实例 alpha 调不了；instanceColor 只能缩放 rgb，
+   于是淡出时遮挡项仍是满 alpha，叠加会发黑。降 alpha 上限即可让该路径也读作淡烟。 */
+const FXA = MODE === 'webgl' ? 1 : 0.5;
+const smokeTex = puffTex(256, 0x5E11A3, [152, 149, 144], 0.72 * FXA, 0.2);
+const burstTex = puffTex(256, 0x71C4B8, [121, 114, 106], 0.78 * FXA, 0.18);
+const dustTex = puffTex(192, 0x2B7C05, [158, 138, 108], 0.64 * FXA, 0.16);
+const boomTex = radialTex(128, [
+  [0, 'rgba(255,250,235,1)'], [0.13, 'rgba(255,220,150,.9)'],
+  [0.36, 'rgba(170,122,74,.5)'], [0.68, 'rgba(74,62,52,.24)'], [1, 'rgba(40,34,30,0)']
+]);
 
 /* 粒子池：单个 InstancedMesh + 相机对齐 billboard，四池共 4 个 draw call */
 const PZ = new THREE.Vector3(0, 0, 1);
@@ -907,22 +922,46 @@ const _pq = new THREE.Quaternion();
 const _pz = new THREE.Quaternion();
 const _pc = new THREE.Color();
 
+const WIND = { x: 0.5, z: 0.14 };
+function windUpdate() {
+  WIND.x = 0.42 + 0.26 * Math.sin(B.t * 0.045);
+  WIND.z = 0.1 + 0.2 * Math.cos(B.t * 0.037);
+}
+
 class ParticlePool {
-  constructor(count, tex, blending, rng, premul, maxSize, hdr) {
+  constructor(opt) {
+    const count = opt.count;
     this.items = [];
-    this.rng = rng || rnd;
-    this.premul = !!premul;
-    this.maxSize = maxSize || Infinity;
-    this.hdr = hdr === undefined ? 1 : hdr;
+    this.rng = opt.rng || rnd;
+    this.premul = !!opt.premul;
+    this.maxSize = opt.maxSize || Infinity;
+    this.hdr = opt.hdr === undefined ? 1 : opt.hdr;
+    this.tint = opt.tint || [1, 1, 1];
+    this.tintVar = opt.tintVar === undefined ? 0.08 : opt.tintVar;
+    this.bright = opt.bright === undefined ? [0.86, 1.14] : opt.bright;
+    this.wind = opt.wind === undefined ? 0 : opt.wind;
+    this.buoy = opt.buoy || 0;
+    this.drag = opt.drag === undefined ? 0.5 : opt.drag;
+    this.groundFade = opt.groundFade || 0;
     this.geo = new THREE.PlaneGeometry(1, 1);
     this.mat = new THREE.MeshBasicMaterial({
-      map: tex, transparent: true, depthWrite: false,
-      blending: this.premul ? THREE.CustomBlending : blending,
+      map: opt.tex, transparent: true, depthWrite: false,
+      blending: this.premul ? THREE.CustomBlending : opt.blending,
       side: THREE.DoubleSide
     });
     if (this.premul) {
+      /* premultiplied alpha: 实例色只携带「不透明度 f」，片段里同时对 rgb 与 a 预乘，
+         否则叠加时 dst 会被 (1-a) 压向近黑，薄烟会变成脏黑影 */
+      this.mat.color.setRGB(this.tint[0], this.tint[1], this.tint[2]);
       this.mat.blendSrc = THREE.OneFactor;
       this.mat.blendDst = THREE.OneMinusSrcAlphaFactor;
+      this.mat.onBeforeCompile = sh => {
+        sh.vertexShader = 'varying float vFade;\n' + sh.vertexShader.replace(
+          '#include <color_vertex>', '#include <color_vertex>\n\tvFade = instanceColor.r;');
+        sh.fragmentShader = 'varying float vFade;\n' + sh.fragmentShader.replace(
+          '#include <color_fragment>', '#include <color_fragment>\n\tdiffuseColor *= vFade;');
+      };
+      this.mat.customProgramCacheKey = () => 'premulFade';
     }
     this.mesh = new THREE.InstancedMesh(this.geo, this.mat, count);
     this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
@@ -931,7 +970,8 @@ class ParticlePool {
     for (let i = 0; i < count; i++) {
       this.items.push({
         life: 0, ttl: 1, s0: 1, s1: 1, o0: 1, o1: 0, vx: 0, vy: 0, vz: 0,
-        spin: 0, rot: 0, x: 0, y: 0, z: 0, a: 0, drawn: false
+        spin: 0, rot: 0, x: 0, y: 0, z: 0, a: 0, drawn: false,
+        r: 1, g: 1, b: 1, v: 1, br: 1
       });
       this.mesh.setColorAt(i, _pc.setRGB(1, 1, 1));
       this.mesh.setMatrixAt(i, _pm.makeScale(0, 0, 0));
@@ -945,9 +985,14 @@ class ParticlePool {
       if (it.life > 0) continue;
       it.life = it.ttl = ttl; it.s0 = s0; it.s1 = s1; it.o0 = o0; it.o1 = o1;
       it.vx = vx || 0; it.vy = vy || 0; it.vz = vz || 0;
-      it.spin = (this.rng() - 0.5) * 0.6;
+      it.spin = (this.rng() - 0.5) * 0.5;
       it.rot = this.rng() * TAU;
-      it.v = 0.78 + this.rng() * 0.44;
+      it.v = 0.72 + this.rng() * 0.62;
+      const tv = this.tintVar;
+      it.r = this.tint[0] * (1 + (this.rng() - 0.5) * tv);
+      it.g = this.tint[1] * (1 + (this.rng() - 0.5) * tv);
+      it.b = this.tint[2] * (1 + (this.rng() - 0.5) * tv);
+      it.br = lerp(this.bright[0], this.bright[1], this.rng());
       it.x = x; it.y = y; it.z = z; it.a = o0;
       return true;
     }
@@ -955,10 +1000,15 @@ class ParticlePool {
   }
   alive() { let n = 0; for (const it of this.items) if (it.life > 0) n++; return n; }
   update(dt) {
+    const wx = WIND.x * this.wind, wz = WIND.z * this.wind;
+    const k = 1 - this.drag * dt;
     for (const it of this.items) {
       if (it.life <= 0) continue;
       it.life -= dt;
       if (it.life <= 0) continue;
+      it.vx = it.vx * k + wx * dt;
+      it.vz = it.vz * k + wz * dt;
+      it.vy = it.vy * k + this.buoy * dt;
       it.x += it.vx * dt; it.y += it.vy * dt; it.z += it.vz * dt;
       it.rot += it.spin * dt;
     }
@@ -976,8 +1026,17 @@ class ParticlePool {
         _pq.copy(q).multiply(_pz.setFromAxisAngle(PZ, it.rot));
         this.mesh.setMatrixAt(i, _pm.compose(_pp.set(it.x, it.y, it.z), _pq, _ps.set(s, s, 1)));
         if (color) {
-          const k = it.a * this.hdr;
-          _pc.setRGB(k, k, k);
+          let k = it.a;
+          if (this.groundFade) k *= clamp((it.y - terrainH(it.x, it.z)) / this.groundFade, 0, 1);
+          k *= it.br;
+          if (this.premul) {
+            /* 预乘池：通道只表示不透明度，颜色由贴图 × material.color 决定 */
+            const f = clamp(k, 0, 1);
+            _pc.setRGB(f, f, f);
+          } else {
+            k *= this.hdr * it.br;
+            _pc.setRGB(k * it.r, k * it.g, k * it.b);
+          }
           this.mesh.setColorAt(i, _pc);
         }
         it.drawn = true;
@@ -994,12 +1053,35 @@ class ParticlePool {
     }
   }
 }
-const flashPool = new ParticlePool(300, flashTex, THREE.AdditiveBlending, vrnd, false, 4, 2.4);
-const smokePool = new ParticlePool(300, smokeTex, THREE.NormalBlending, vrnd, true, 10, 1);
-const dustPool = new ParticlePool(220, dustTex, THREE.NormalBlending, vrnd, true, 7, 1);
-const boomPool = new ParticlePool(40, boomTex, THREE.AdditiveBlending, vrnd, false, 12, 2.2);
-const moteTex = radialTex(64, [[0, 'rgba(255,244,214,.85)'], [0.4, 'rgba(255,228,176,.32)'], [1, 'rgba(255,220,150,0)']]);
-const motePool = new ParticlePool(180, moteTex, THREE.AdditiveBlending, vrnd, false, 0.6, 0.45);
+const flashPool = new ParticlePool({
+  count: 320, tex: flashTex, blending: THREE.AdditiveBlending, rng: vrnd,
+  maxSize: 3.2, hdr: 2.2, tint: [1, 0.93, 0.78], tintVar: 0.14, bright: [0.9, 1.1], drag: 2.2
+});
+const smokePool = new ParticlePool({
+  count: 512, tex: smokeTex, blending: THREE.NormalBlending, rng: vrnd, premul: true,
+  maxSize: 6, tint: [1, 0.995, 0.98], tintVar: 0.07, bright: [0.8, 1.1],
+  wind: 1, buoy: 0.32, drag: 0.55, groundFade: 0.8
+});
+const burstPool = new ParticlePool({
+  count: 200, tex: burstTex, blending: THREE.NormalBlending, rng: vrnd, premul: true,
+  maxSize: 6, tint: [0.82, 0.79, 0.74], tintVar: 0.1, bright: [0.72, 1.02],
+  wind: 0.8, buoy: 0.5, drag: 0.6, groundFade: 0.7
+});
+const dustPool = new ParticlePool({
+  count: 240, tex: dustTex, blending: THREE.NormalBlending, rng: vrnd, premul: true,
+  maxSize: 5, tint: [1, 0.95, 0.86], tintVar: 0.12, bright: [0.8, 1.06],
+  wind: 0.55, buoy: 0.1, drag: 0.9, groundFade: 0.6
+});
+const boomPool = new ParticlePool({
+  count: 40, tex: boomTex, blending: THREE.AdditiveBlending, rng: vrnd,
+  maxSize: 7, hdr: 2.0, tint: [1, 0.92, 0.76], tintVar: 0.12, bright: [0.9, 1.1], drag: 1.6
+});
+const moteTex = radialTex(64, [[0, 'rgba(255,246,220,.85)'], [0.4, 'rgba(255,232,186,.3)'], [1, 'rgba(255,222,152,0)']]);
+const motePool = new ParticlePool({
+  count: 180, tex: moteTex, blending: THREE.AdditiveBlending, rng: vrnd,
+  maxSize: 0.55, hdr: 0.4, tint: [1, 0.96, 0.86], tintVar: 0.1, bright: [0.8, 1.08],
+  wind: 1, buoy: 0.04, drag: 0.25
+});
 let moteT = 0;
 function motesUpdate(dt) {
   moteT -= dt;
@@ -1084,7 +1166,7 @@ for (let i = 0; i < 26; i++) {
   const m = new THREE.Mesh(shellGeo, shellMat);
   m.visible = false; m.castShadow = true;
   scene.add(m);
-  shells.push({ mesh: m, active: false, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, trail: 0, side: 'union' });
+  shells.push({ mesh: m, active: false, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, dist: 0, side: 'union' });
 }
 let shellIdx = 0;
 function fireShell(gun) {
@@ -1101,19 +1183,25 @@ function fireShell(gun) {
   const ux = dx / flat, uz = dz / flat;
   sh.x = sx + ux * 2.3; sh.y = 1.7; sh.z = sz + uz * 2.3;
   sh.vx = ux * v * Math.cos(ang); sh.vz = uz * v * Math.cos(ang); sh.vy = v * Math.sin(ang);
-  sh.active = true; sh.trail = 0; sh.mesh.visible = true; sh.side = gun.army.key;
+  sh.active = true; sh.dist = 0.62; sh.mesh.visible = true; sh.side = gun.army.key;
   sh.mesh.position.set(sh.x, sh.y, sh.z);
   gun.recoil = 1;
   for (const s of gun.crew) { s.state = 'fire'; s.recoil = 1; }
-  flashPool.emit(sh.x + ux * 1.4, sh.y + 0.25, sh.z + uz * 1.4, 4.2, 0.6, 0.11, 1, 0, 0, ux * 3, uz * 3);
-  for (let i = 0; i < 5; i++) {
+  flashPool.emit(sh.x + ux * 1.3, sh.y + 0.22, sh.z + uz * 1.3, 3.0, 0.5, 0.08, 1, 0, 0, ux * 2.4, uz * 2.4);
+  for (let i = 0; i < 7; i++) {
     smokePool.emit(
-      sh.x + ux * (1.4 + i * 2.2) + (vrnd() - 0.5) * 2.6, 1.7 + vrnd() * 2.2,
-      sh.z + uz * (1.4 + i * 2.2) + (vrnd() - 0.5) * 2.6,
-      2.6 + i * 0.9, 6.4 + i * 2.2, 2.4 + vrnd() * 0.8, 0.4, 0, 0.5 + vrnd() * 0.4, ux * 1.6, uz * 1.6
+      sh.x + ux * (1.2 + i * 1.7) + (vrnd() - 0.5) * 3.2, 1.5 + vrnd() * 2.6,
+      sh.z + uz * (1.2 + i * 1.7) + (vrnd() - 0.5) * 3.2,
+      1.8 + i * 0.5, 5.4 + vrnd() * 0.6, 1.8 + vrnd() * 0.7, 0.8, 0,
+      0.35 + vrnd() * 0.5, ux * 1.5 + (vrnd() - 0.5) * 1.2, uz * 1.5 + (vrnd() - 0.5) * 1.2
     );
   }
-  dustPool.emit(sh.x, 0.5, sh.z, 1.6, 5, 1.4, 0.38, 0, 0.4, ux * 2, uz * 2);
+  for (let i = 0; i < 3; i++) {
+    dustPool.emit(
+      sh.x + (vrnd() - 0.5) * 3, 0.45 + vrnd() * 1.2, sh.z + (vrnd() - 0.5) * 3,
+      1.2, 3.6 + vrnd(), 1.2 + vrnd() * 0.5, 0.55, 0, 0.5 + vrnd() * 0.6, ux * 1.8, uz * 1.8
+    );
+  }
 }
 const SHELL_KILL_RADIUS = 6.4;
 function projectilesUpdate(dt) {
@@ -1123,22 +1211,26 @@ function projectilesUpdate(dt) {
     sh.x += sh.vx * dt; sh.y += sh.vy * dt; sh.z += sh.vz * dt;
     sh.mesh.position.set(sh.x, sh.y, sh.z);
     sh.mesh.rotation.x += dt * 7; sh.mesh.rotation.z += dt * 5;
-    sh.trail -= dt;
-    if (sh.trail <= 0) {
-      sh.trail = 0.05;
-      smokePool.emit(sh.x, sh.y, sh.z, 0.55, 1.9, 0.85, 0.26, 0, 0.3, sh.vx * 0.03, sh.vz * 0.03);
+    sh.dist -= Math.hypot(sh.vx, sh.vy, sh.vz) * dt;
+    if (sh.dist <= 0) {
+      sh.dist += 1.3;
+      smokePool.emit(
+        sh.x + (vrnd() - 0.5) * 0.3, sh.y + (vrnd() - 0.5) * 0.3, sh.z + (vrnd() - 0.5) * 0.3,
+        0.75, 2.7, 1.25, 0.34, 0, 0.16, sh.vx * 0.02, sh.vz * 0.02);
     }
     const gY = terrainH(sh.x, sh.z);
     if (sh.y <= gY + 0.15) {
       sh.active = false; sh.mesh.visible = false;
-      boomPool.emit(sh.x, gY + 1.2, sh.z, 2.4, 8, 0.4, 1, 0, 1.6, 0, 0);
-      for (let i = 0; i < 4; i++) {
-        smokePool.emit(sh.x + (vrnd() - 0.5) * 2.6, gY + 0.7 + vrnd() * 2.0, sh.z + (vrnd() - 0.5) * 2.6,
-          2.0, 5.6, 1.8 + vrnd() * 0.9, 0.46, 0, 0.8 + vrnd(), (vrnd() - 0.5) * 2, (vrnd() - 0.5) * 2);
+      boomPool.emit(sh.x, gY + 1.0, sh.z, 1.2, 3.4, 0.16, 1, 0, 0.6, 0, 0);
+      for (let i = 0; i < 6; i++) {
+        burstPool.emit(sh.x + (vrnd() - 0.5) * 2.4, gY + 0.5 + vrnd() * 2.6, sh.z + (vrnd() - 0.5) * 2.4,
+          1.4, 5.2 + vrnd() * 0.8, 1.6 + vrnd() * 0.8, 0.8, 0, 1.0 + vrnd() * 1.2,
+          (vrnd() - 0.5) * 2.4, (vrnd() - 0.5) * 2.4);
       }
-      for (let i = 0; i < 4; i++) {
-        dustPool.emit(sh.x + (vrnd() - 0.5) * 4.4, gY + 0.6 + vrnd() * 1.6, sh.z + (vrnd() - 0.5) * 4.4,
-          1.8, 5.0, 1.6, 0.4, 0, 1.1, (vrnd() - 0.5) * 4, (vrnd() - 0.5) * 4);
+      for (let i = 0; i < 5; i++) {
+        dustPool.emit(sh.x + (vrnd() - 0.5) * 3.2, gY + 0.4 + vrnd() * 3.2, sh.z + (vrnd() - 0.5) * 3.2,
+          1.2, 4.6, 1.5 + vrnd() * 0.6, 0.6, 0, 2.2 + vrnd() * 2.4,
+          (vrnd() - 0.5) * 3, (vrnd() - 0.5) * 3);
       }
       addCrater(sh.x, sh.z, 5 + vrnd() * 3.5);
       const foe = sh.side === 'union' ? C : U;
@@ -1451,9 +1543,10 @@ function volley(u) {
     if (!s.alive) continue;
     const fx = Math.sin(s.yaw), fz = Math.cos(s.yaw);
     const mx = s.x + fx * 1.05, mz = s.z + fz * 1.05, my = s.y + 1.3;
-    flashPool.emit(mx, my, mz, 0.8, 0.18, 0.09, 1, 0, 0.2, fx * 1.4, fz * 1.4);
-    if (shots % 5 === 0) {
-      smokePool.emit(mx, my + 0.15, mz, 0.9, 3.8, 1.3 + vrnd() * 0.5, 0.36, 0, 0.6, fx * 1.1, fz * 1.1);
+    flashPool.emit(mx, my, mz, 0.52, 0.15, 0.055, 1, 0, 0.15, fx * 0.7, fz * 0.7);
+    if (shots % 4 === 0) {
+      smokePool.emit(mx + fx * 0.5, my + 0.1, mz + fz * 0.5,
+        0.45, 2.2 + vrnd() * 0.6, 1.7 + vrnd() * 0.7, 0.62, 0, 0.45, fx * 0.6, fz * 0.6);
     }
     s.recoil = 1;
     shots++;
@@ -1475,9 +1568,13 @@ function cavalryImpact(cav, inf) {
   inf.shock = clamp(inf.shock + 0.24, 0, 0.45);
   cav.impact = true;
   const sx = (cav.cx + inf.cx) * 0.5, sz = (cav.cz + inf.cz) * 0.5;
-  for (let i = 0; i < 12; i++) {
-    dustPool.emit(sx + (vrnd() - 0.5) * 14, 0.4 + vrnd() * 1.8, sz + (vrnd() - 0.5) * 9, 1.8, 5.4, 1.6, 0.34, 0, 0.6, (vrnd() - 0.5) * 3, (vrnd() - 0.5) * 3);
+  for (let i = 0; i < 14; i++) {
+    dustPool.emit(sx + (vrnd() - 0.5) * 16, 0.35 + vrnd() * 2.2, sz + (vrnd() - 0.5) * 11,
+      1.2, 4.4 + vrnd() * 0.6, 1.5 + vrnd() * 0.6, 0.5, 0, 0.5 + vrnd() * 0.7,
+      (vrnd() - 0.5) * 3.4, (vrnd() - 0.5) * 3.4);
   }
+  burstPool.emit(sx + (vrnd() - 0.5) * 4, 1.0 + vrnd() * 1.6, sz + (vrnd() - 0.5) * 4,
+    1.6, 4.6, 1.4, 0.7, 0, 0.9, 0, 0);
   blog(cav.name + ' 骑兵冲击 ' + inf.name + ' — 阵线动摇！', '#f0b070');
 }
 
@@ -1533,7 +1630,8 @@ function soldierUpdate(s, dt) {
   if (s.spd > 0.25) s.yaw = Math.atan2(dx, dz);
   s.y = terrainH(s.x, s.z);
   if (u.state === 'charge' && s.spd > 3 && vrnd() < dt * 5) {
-    dustPool.emit(s.x, s.y + 0.25, s.z, 0.9, 3.0, 0.9, 0.22, 0, 0.5, (vrnd() - 0.5) * 0.8, (vrnd() - 0.5) * 0.8);
+    dustPool.emit(s.x, s.y + 0.2, s.z, 0.6, 2.2 + vrnd() * 0.6, 1.1 + vrnd() * 0.4, 0.4, 0,
+      0.4, (vrnd() - 0.5) * 0.8, (vrnd() - 0.5) * 0.8);
   }
   if (u.state === 'melee') {
     s.atk -= dt;
@@ -1596,6 +1694,7 @@ function endBattle(winner) {
 }
 
 function simulate(dt) {
+  windUpdate();
   directorUpdate(dt);
   for (const u of U.units) unitUpdate(u, dt);
   for (const u of C.units) unitUpdate(u, dt);
@@ -1604,7 +1703,8 @@ function simulate(dt) {
   for (const s of U.mount) soldierUpdate(s, dt);
   for (const s of C.mount) soldierUpdate(s, dt);
   projectilesUpdate(dt);
-  flashPool.update(dt); smokePool.update(dt); dustPool.update(dt); boomPool.update(dt); motePool.update(dt);
+  flashPool.update(dt); smokePool.update(dt); burstPool.update(dt);
+  dustPool.update(dt); boomPool.update(dt); motePool.update(dt);
   motesUpdate(dt);
   let melee = 0;
   for (const a of [U, C]) for (const u of a.units) if (u.state === 'melee') melee++;
@@ -1757,7 +1857,8 @@ function loop() {
   }
   syncArmy(U);
   syncArmy(C);
-  flashPool.sync(); smokePool.sync(); dustPool.sync(); boomPool.sync(); motePool.sync();
+  flashPool.sync(); smokePool.sync(); burstPool.sync();
+  dustPool.sync(); boomPool.sync(); motePool.sync();
   frames++; fpsT += raw;
   if (fpsT > 0.5) { fps = frames / fpsT; frames = 0; fpsT = 0; }
   if (renderer.info) renderer.info.reset();
@@ -1864,14 +1965,14 @@ window.__battle = {
   fps: () => +fps.toFixed(1),
   particles() {
     const p = {
-      flash: flashPool.alive(), smoke: smokePool.alive(),
+      flash: flashPool.alive(), smoke: smokePool.alive(), burst: burstPool.alive(),
       dust: dustPool.alive(), boom: boomPool.alive(), mote: motePool.alive()
     };
-    p.total = p.flash + p.smoke + p.dust + p.boom + p.mote;
+    p.total = p.flash + p.smoke + p.burst + p.dust + p.boom + p.mote;
     return p;
   },
   pools(show) {
-    const list = [['flash', flashPool], ['smoke', smokePool], ['dust', dustPool], ['boom', boomPool], ['mote', motePool]];
+    const list = [['flash', flashPool], ['smoke', smokePool], ['burst', burstPool], ['dust', dustPool], ['boom', boomPool], ['mote', motePool]];
     if (show) for (const p of list) p[1].mesh.visible = show.indexOf(p[0]) >= 0;
     return list.map(p => ({
       name: p[0], visible: p[1].mesh.visible, cap: p[1].mesh.count, alive: p[1].alive(),
@@ -1881,7 +1982,7 @@ window.__battle = {
     }));
   },
   blend(id, mode) {
-    const p = { flash: flashPool, smoke: smokePool, dust: dustPool, boom: boomPool, mote: motePool }[id];
+    const p = { flash: flashPool, smoke: smokePool, burst: burstPool, dust: dustPool, boom: boomPool, mote: motePool }[id];
     if (!p) return null;
     const m = p.mat;
     if (mode) {
@@ -1903,7 +2004,7 @@ window.__battle = {
       mode: MODE, composed: !!composer, enabled: FX.enabled,
       bloomStrength: bloomPass ? bloomPass.strength : 0,
       grain: gradePass ? +gradePass.uniforms.uGrain.value.toFixed(3) : 0,
-      drawCallsEstimate: 4 + 1
+      drawCallsEstimate: 6 + 1
     };
   },
   postfx(id, v) {
