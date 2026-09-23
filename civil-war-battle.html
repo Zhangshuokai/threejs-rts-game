@@ -1677,6 +1677,13 @@ window.__battle = {
   pause: v => { B.paused = !!v; },
   speed: v => { B.speed = v; },
   fps: () => +fps.toFixed(1),
+  info: () => renderer.info ? {
+    calls: renderer.info.render.calls,
+    triangles: renderer.info.render.triangles,
+    geometries: renderer.info.memory.geometries,
+    textures: renderer.info.memory.textures,
+    programs: renderer.info.programs ? renderer.info.programs.length : null
+  } : null,
   counts: () => ({
     unionFoot: U.foot.length, unionMount: U.mount.length,
     confFoot: C.foot.length, confMount: C.mount.length,
