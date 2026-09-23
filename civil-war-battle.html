@@ -1124,6 +1124,36 @@ function addCrater(x, z, size) {
   craterMesh.instanceMatrix.needsUpdate = true;
 }
 
+/* 统一的落地爆炸与爆炸伤亡：炮弹、航弹、坠机共用同一套参数与池 */
+function explodeGround(x, z, power) {
+  const gY = terrainH(x, z);
+  boomPool.emit(x, gY + 1.0 * power, z, 1.2 * power, 3.4 * power, 0.16, 1, 0, 0.6 * power, 0, 0);
+  const nb = Math.max(1, Math.round(6 * power));
+  for (let i = 0; i < nb; i++) {
+    burstPool.emit(x + (vrnd() - 0.5) * 2.4 * power, gY + 0.5 + vrnd() * 2.6 * power, z + (vrnd() - 0.5) * 2.4 * power,
+      1.4, 5.2 * power + vrnd() * 0.8, 1.6 + vrnd() * 0.8, 0.8, 0,
+      1.0 * power + vrnd() * 1.2 * power, (vrnd() - 0.5) * 2.4 * power, (vrnd() - 0.5) * 2.4 * power);
+  }
+  const nd = Math.max(1, Math.round(5 * power));
+  for (let i = 0; i < nd; i++) {
+    dustPool.emit(x + (vrnd() - 0.5) * 3.2 * power, gY + 0.4 + vrnd() * 3.2 * power, z + (vrnd() - 0.5) * 3.2 * power,
+      1.2, 4.6, 1.5 + vrnd() * 0.6, 0.6, 0, 2.2 + vrnd() * 2.4,
+      (vrnd() - 0.5) * 3 * power, (vrnd() - 0.5) * 3 * power);
+  }
+  addCrater(x, z, (5 + vrnd() * 3.5) * power);
+}
+function blastCasualties(foe, x, z, radius, cap, chance) {
+  let hits = 0;
+  for (const u of foe.units) {
+    if (u.kind === 'art' || u.men <= 0 || u.gone) continue;
+    for (const s of u.aliveSoldiers()) {
+      if (hits >= cap) break;
+      if (Math.hypot(s.x - x, s.z - z) < radius && rnd() < chance) { u.kill(s); hits++; }
+    }
+  }
+  return hits;
+}
+
 function makeCannon(army) {
   const g = new THREE.Group();
   const steel = new THREE.MeshStandardMaterial({ color: 0x3b3f42, roughness: 0.42, metalness: 0.8 });
@@ -1223,28 +1253,10 @@ function projectilesUpdate(dt) {
     const gY = terrainH(sh.x, sh.z);
     if (sh.y <= gY + 0.15) {
       sh.active = false; sh.mesh.visible = false;
-      boomPool.emit(sh.x, gY + 1.0, sh.z, 1.2, 3.4, 0.16, 1, 0, 0.6, 0, 0);
-      for (let i = 0; i < 6; i++) {
-        burstPool.emit(sh.x + (vrnd() - 0.5) * 2.4, gY + 0.5 + vrnd() * 2.6, sh.z + (vrnd() - 0.5) * 2.4,
-          1.4, 5.2 + vrnd() * 0.8, 1.6 + vrnd() * 0.8, 0.8, 0, 1.0 + vrnd() * 1.2,
-          (vrnd() - 0.5) * 2.4, (vrnd() - 0.5) * 2.4);
-      }
-      for (let i = 0; i < 5; i++) {
-        dustPool.emit(sh.x + (vrnd() - 0.5) * 3.2, gY + 0.4 + vrnd() * 3.2, sh.z + (vrnd() - 0.5) * 3.2,
-          1.2, 4.6, 1.5 + vrnd() * 0.6, 0.6, 0, 2.2 + vrnd() * 2.4,
-          (vrnd() - 0.5) * 3, (vrnd() - 0.5) * 3);
-      }
-      addCrater(sh.x, sh.z, 5 + vrnd() * 3.5);
+      explodeGround(sh.x, sh.z, 1);
       const foe = sh.side === 'union' ? C : U;
-      let hits = 0;
-      for (const u of foe.units) {
-        if (u.kind === 'art' || u.men <= 0 || u.gone) continue;
-        for (const s of u.aliveSoldiers()) {
-          if (hits > 7) break;
-          if (Math.hypot(s.x - sh.x, s.z - sh.z) < SHELL_KILL_RADIUS && rnd() < 0.85) { u.kill(s); hits++; }
-        }
-      }
-      if (hits > 0) blog('炮弹落入 ' + (foe === U ? '联邦军' : '邦联军') + ' 队列 — ' + hits + ' 人倒下', '#d9a05a');
+      const hits = blastCasualties(foe, sh.x, sh.z, SHELL_KILL_RADIUS, 8, 0.85);
+      if (hits > 0) blog('炮弹落入 ' + foe.side.label + ' 队列 — ' + hits + ' 人倒下', '#d9a05a');
     }
   }
 }
@@ -1672,7 +1684,7 @@ tracerMesh.instanceMatrix.needsUpdate = true;
 tracerMesh.instanceColor.needsUpdate = true;
 scene.add(tracerMesh);
 const tracers = [];
-for (let i = 0; i < TRACER_COUNT; i++) tracers.push({ on: false, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, ttl: 1, life: 0, hdr: 2.4 });
+for (let i = 0; i < TRACER_COUNT; i++) tracers.push({ on: false, drawn: false, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, ttl: 1, life: 0, hdr: 2.4 });
 let tracerIdx = 0;
 const _tq = new THREE.Quaternion();
 const _tv = new THREE.Vector3();
@@ -1696,11 +1708,12 @@ for (let i = 0; i < BOMB_COUNT; i++) bombMesh.setMatrixAt(i, _pm.makeScale(0, 0,
 bombMesh.instanceMatrix.needsUpdate = true;
 scene.add(bombMesh);
 const bombs = [];
-for (let i = 0; i < BOMB_COUNT; i++) bombs.push({ on: false, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, side: 'union' });
+for (let i = 0; i < BOMB_COUNT; i++) bombs.push({ on: false, drawn: false, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, side: 'union' });
 let bombIdx = 0;
 
 /* ---------- 航空兵系统 ---------- */
 const FIGHTERS_PER = 3, BOMBERS_PER = 2, AA_PER = 3;
+const BOMB_RUN = 380;          // 轰炸航线单程长度（需 >> 弹道横抛 ~270 m，留出对准余量）
 const fighterRig = new RigPool(FIGHTER_PARTS, FIGHTERS_PER * 2, airMat);
 const bomberRig = new RigPool(BOMBER_PARTS, BOMBERS_PER * 2, airMat);
 const aaRig = new RigPool(AA_PARTS, AA_PER * 2, airMat);
@@ -1717,7 +1730,6 @@ function lineZ(side) {
 }
 
 for (const side of ['union', 'confederate']) {
-  const sgn = side === 'union' ? -1 : 1;
   /* 直接生成在各自航线上（切向朝向），避免开局大回转冲出战场 */
   for (let i = 0; i < FIGHTERS_PER; i++) {
     const ang = (i / FIGHTERS_PER) * TAU + (side === 'union' ? 0 : 1.6);
@@ -1727,21 +1739,21 @@ for (const side of ['union', 'confederate']) {
       idx: (side === 'union' ? 0 : FIGHTERS_PER) + i,
       x: Math.cos(ang) * rad, y: alt, z: Math.sin(ang) * rad,
       yaw: Math.atan2(-Math.sin(ang), Math.cos(ang)), pitch: 0, roll: 0,
-      spd: 66, hp: 46, maxHp: 46, prop: 0, fireT: 0, burst: 0,
-      orbit: ang, rad, alt, state: 'patrol', smokeT: 0, dead: false, fallT: 0
+      spd: 66, hp: 46, maxHp: 46, prop: 0, fireT: 0,
+      orbit: ang, rad, alt, state: 'patrol', smokeT: 0, dead: false
     });
   }
   for (let i = 0; i < BOMBERS_PER; i++) {
-    const rad = 172, alt = 150 + i * 16;
-    const sgd = side === 'union' ? 1 : -1, cz = lineZ(side) - sgd * rad;
-    const ang = (i / BOMBERS_PER) * TAU + (side === 'union' ? 0 : 3.1);
+    const lane = (i - (BOMBERS_PER - 1) / 2) * 140, alt = 150 + i * 16;
+    const sgd = side === 'union' ? 1 : -1, tz0 = lineZ(side);
     AIR.craft.push({
       side, kind: 'bomber', rig: bomberRig,
       idx: (side === 'union' ? 0 : BOMBERS_PER) + i,
-      x: Math.cos(ang) * rad, y: alt, z: cz + Math.sin(ang) * rad,
-      yaw: Math.atan2(-Math.sin(ang) * sgd, Math.cos(ang) * sgd), pitch: 0, roll: 0,
-      spd: 50, hp: 92, maxHp: 92, prop: 0, fireT: 0, burst: 0,
-      orbit: ang, rad, alt, state: 'bomb', dropT: 0, stick: 0, smokeT: 0, dead: false, fallT: 0
+      x: lane, y: alt, z: tz0 - sgd * (BOMB_RUN - 20),
+      yaw: sgd > 0 ? 0 : Math.PI, pitch: 0, roll: 0,
+      spd: 50, hp: 92, maxHp: 92, prop: 0, fireT: 0,
+      orbit: i * 1.7, alt, lane, run: BOMB_RUN, lat: 190, leg: 0,
+      state: 'bomb', dropT: 0, stick: 0, smokeT: 0, dead: false
     });
   }
   for (let i = 0; i < AA_PER; i++) {
@@ -1749,7 +1761,7 @@ for (const side of ['union', 'confederate']) {
     AIR.guns.push({
       rig: aaRig, idx: (side === 'union' ? 0 : AA_PER) + i, side,
       x: gx, y: terrainH(gx, gz), z: gz, yaw: side === 'union' ? 0 : Math.PI, pitch: 0.5,
-      reload: 1.4 + i * 0.5, burst: 0
+      reload: 1.4 + i * 0.5
     });
   }
 }
@@ -2074,8 +2086,8 @@ function steerTo(a, tx, ty, tz, dt) {
   let want = Math.atan2(dx, dz) - a.yaw;
   while (want > Math.PI) want -= TAU;
   while (want < -Math.PI) want += TAU;
-  /* 转弯半径 = 速度/角速率：轰炸机 50/0.42 ≈ 119 m 才能跟上 172 m 的航线 */
-  const aR = a.kind === 'fighter' ? 0.62 : 0.42;
+  /* 转弯半径 = 速度/角速率：轰炸机 50/0.52 ≈ 96 m，才跟得上 175 m 的航线 */
+  const aR = a.kind === 'fighter' ? 0.62 : 0.52;
   const pR = a.kind === 'fighter' ? 0.75 : 0.30;
   const wantPitch = clamp(Math.atan2(dy, dh), -0.55, 0.55);
   a.yaw += clamp(want, -aR * dt, aR * dt);
@@ -2098,7 +2110,7 @@ function damageCraft(a, dmg, by) {
   if (a.dead || a.state === 'falling') return;
   a.hp -= dmg;
   if (a.hp <= 0) {
-    a.state = 'falling'; a.fallT = 0; a.stick = 0;
+    a.state = 'falling'; a.stick = 0;
     AIR.lost[a.side]++;
     blog((a.side === 'union' ? '联邦' : '邦联') + (a.kind === 'bomber' ? '轰炸机' : '战斗机') + '被' + by + '击落', '#f0a070');
   }
@@ -2130,10 +2142,11 @@ function fighterUpdate(a, dt) {
       const dev = 0.012 + bd / 9000, sp = 300;
       const ttl = clamp(bd / sp + 0.12, 0.2, 1.6);
       for (let k = 0; k < 3; k++) {
+        /* 曳光弹偏差是纯视觉的：必须走 vrnd，否则改一次弹幕数量就会挪动战局随机流 */
         emitTracer(ox, oy, oz,
-          (dx / dd + (rnd() - 0.5) * dev) * sp,
-          (dy / dd + (rnd() - 0.5) * dev) * sp,
-          (dz / dd + (rnd() - 0.5) * dev) * sp, ttl, 2.6);
+          (dx / dd + (vrnd() - 0.5) * dev) * sp,
+          (dy / dd + (vrnd() - 0.5) * dev) * sp,
+          (dz / dd + (vrnd() - 0.5) * dev) * sp, ttl, 2.6);
       }
       flashPool.emit(ox, oy, oz, 1.1, 0.16, 0.045, 1, 0, 0, 0, 0);
       if (rnd() < 0.16) damageCraft(tgt, 4 + rnd() * 6, '战斗机');
@@ -2153,13 +2166,37 @@ function dropBomb(a) {
   b.vz = Math.cos(a.yaw) * cp * a.spd * 0.98 + (rnd() - 0.5) * 1.4;
   AIR.dropped++;
 }
+function bombFallTime(y, vy0, gY) {
+  const h = Math.max(1, y - gY);
+  return (vy0 + Math.sqrt(vy0 * vy0 + 19.6 * h)) / 9.8;
+}
+/* 航弹会继承载机水平速度（约 49 m/s，落差 ~150 m 即 ~5.5 s），
+   所以必须按「预测落点」而不是按机位投弹，否则整串炸弹都落在敌线之外 */
+function bombLead(a) {
+  const cp = Math.cos(a.pitch);
+  const vx = Math.sin(a.yaw) * cp * a.spd * 0.98;
+  const vz = Math.cos(a.yaw) * cp * a.spd * 0.98;
+  const vy0 = Math.sin(a.pitch) * a.spd * 0.98;
+  let x = a.x, z = a.z, t = 0;
+  for (let k = 0; k < 2; k++) {
+    t = bombFallTime(a.y - 1.7, vy0, terrainH(x, z));
+    x = a.x + vx * t; z = a.z + vz * t;
+  }
+  return { x, z };
+}
 function bomberUpdate(a, dt) {
   const tz = lineZ(a.side);
+  /* 直线往返轰炸航线。投弹必须按「预测落点」，而落点比机位沿航向前移 ~270 m；
+     圆形航线在数学上不存在能把落点放回敌线的投弹点（最近也差 100 m 以上），
+     只有近似直线段才能满足。 */
   const sgn = a.side === 'union' ? 1 : -1;
-  const R = a.rad, cz = tz - sgn * R;
-  a.orbit += dt * (a.spd / R) * sgn;
-  const ta = a.orbit + 0.5 * sgn;
-  steerTo(a, Math.cos(ta) * R, a.alt + Math.sin(ta * 2.1) * 8, cz + Math.sin(ta) * R, dt);
+  const dir = a.leg ? -1 : 1;
+  const wx = a.lane + (a.leg ? sgn * a.lat : 0);
+  steerTo(a, wx, a.alt + Math.sin(a.orbit * 2.1) * 6, tz + dir * sgn * a.run, dt);
+  a.orbit += dt * 0.11;
+  if (!a.leg && sgn * (a.z - tz) > a.run - 40) a.leg = 1;
+  else if (a.leg && sgn * (a.z - tz) < -(a.run - 40)) a.leg = 0;
+  if (a.leg) { a.dropT = Math.min(a.dropT, 0); return; }   // 返航段不投弹
   if (a.stick > 0) {
     a.dropT -= dt;
     if (a.dropT <= 0) {
@@ -2169,7 +2206,10 @@ function bomberUpdate(a, dt) {
     }
   } else {
     a.dropT -= dt;
-    if (a.dropT <= 0 && Math.abs(a.z - tz) < 30) { a.stick = 4; a.dropT = 0; }
+    if (a.dropT <= 0) {
+      const lead = bombLead(a);
+      if (Math.abs(lead.z - tz) < 26 && Math.abs(lead.x) < HALF_TRENCH) { a.stick = 4; a.dropT = 0; }
+    }
   }
 }
 function airUpdate(dt) {
@@ -2177,7 +2217,6 @@ function airUpdate(dt) {
     if (a.dead) continue;
     a.fireT -= dt;
     if (a.state === 'falling') {
-      a.fallT += dt;
       a.spd = Math.max(14, a.spd - 16 * dt);
       a.pitch = Math.max(a.pitch - 2.4 * dt, -1.4);
       a.roll += dt * 1.4;
@@ -2196,7 +2235,7 @@ function airUpdate(dt) {
       if (a.y <= terrainH(a.x, a.z) + 0.7) {
         a.dead = true;
         a.rig.hide(a.idx);
-        groundBurst(a.x, a.z, a.kind === 'bomber' ? 1.8 : 1.25);
+        explodeGround(a.x, a.z, a.kind === 'bomber' ? 1.6 : 1.1);
         blog((a.side === 'union' ? '联邦' : '邦联') + (a.kind === 'bomber' ? '轰炸机' : '战斗机') + '坠毁', '#e08a60');
         for (let i = 0; i < 4; i++) {
           smokePool.emit(a.x + (vrnd() - 0.5) * 3, terrainH(a.x, a.z) + 1.4 + i * 1.6, a.z + (vrnd() - 0.5) * 3,
@@ -2220,14 +2259,14 @@ function airUpdate(dt) {
 
 /* ---------- 高射炮：提前量解算 + 定时引信 ---------- */
 const FLAK_R = 10;
-function flakBurst(x, y, z) {
+function flakBurst(x, y, z, side) {
   for (let i = 0; i < 5; i++) {
     burstPool.emit(x + (vrnd() - 0.5) * 3.6, y + (vrnd() - 0.5) * 3.2, z + (vrnd() - 0.5) * 3.6,
       1.3, 4.4 + vrnd(), 1.6 + vrnd() * 0.6, 0.9, 0, 0.12, (vrnd() - 0.5) * 1.2, (vrnd() - 0.5) * 1.2);
   }
   flashPool.emit(x, y, z, 2.4, 0.4, 0.06, 0.95, 0, 0, 0, 0);
   for (const a of AIR.craft) {
-    if (a.dead || a.state === 'falling') continue;
+    if (a.dead || a.state === 'falling' || a.side === side) continue;   // 高炮不打自己人
     const d = Math.hypot(a.x - x, a.y - y, a.z - z);
     if (d < FLAK_R && rnd() < 0.10) damageCraft(a, 12 + rnd() * 10, '高射炮');
   }
@@ -2267,7 +2306,7 @@ function aaUpdate(dt) {
       flashPool.emit(ox, oy, oz, 1.6, 0.3, 0.05, 1, 0, 0, 0, 0);
       smokePool.emit(ox + (vrnd() - 0.5), oy + 0.1, oz + (vrnd() - 0.5),
         0.5, 2.0, 1.1, 0.5, 0, 0.5, ux * 2, uz * 2);
-      AIR.flak.push({ x: px, y: py, z: pz, t: tf });
+      AIR.flak.push({ x: px, y: py, z: pz, t: tf, side: g.side });
     }
   }
 }
@@ -2275,32 +2314,10 @@ function aaUpdate(dt) {
 /* ---------- 航弹 / 曳光弹 / 引信 ---------- */
 const BOMB_R = 8.5;
 function bombImpact(b) {
-  groundBurst(b.x, b.z, 1.55);
+  explodeGround(b.x, b.z, 1.4);
   const foe = armyOf(foeSideOf(b.side));
-  let hits = 0;
-  for (const u of foe.units) {
-    if (u.kind === 'art' || u.men <= 0 || u.gone) continue;
-    for (const s of u.aliveSoldiers()) {
-      if (hits >= 3) break;
-      if (Math.hypot(s.x - b.x, s.z - b.z) < BOMB_R && rnd() < 0.75) { u.kill(s); hits++; }
-    }
-  }
+  const hits = blastCasualties(foe, b.x, b.z, BOMB_R, 3, 0.75);
   if (hits > 0) blog('航空炸弹命中 ' + foe.side.label + ' 队列 — ' + hits + ' 人倒下', '#e8a060');
-}
-function groundBurst(x, z, power) {
-  const gY = terrainH(x, z);
-  boomPool.emit(x, gY + 1.1, z, 1.2 * power, 4.6 * power, 0.17, 1, 0, 0.6, 0, 0);
-  for (let i = 0; i < 8; i++) {
-    burstPool.emit(x + (vrnd() - 0.5) * 3.6, gY + 0.5 + vrnd() * 3.6, z + (vrnd() - 0.5) * 3.6,
-      1.6, 6.6 * power, 1.8 + vrnd() * 0.9, 0.85, 0, 1.4 + vrnd() * 1.8,
-      (vrnd() - 0.5) * 3.2, (vrnd() - 0.5) * 3.2);
-  }
-  for (let i = 0; i < 7; i++) {
-    dustPool.emit(x + (vrnd() - 0.5) * 5, gY + 0.4 + vrnd() * 4.2, z + (vrnd() - 0.5) * 5,
-      1.4, 5.4 * power, 1.8 + vrnd() * 0.8, 0.6, 0, 2.6 + vrnd() * 2.6,
-      (vrnd() - 0.5) * 4, (vrnd() - 0.5) * 4);
-  }
-  addCrater(x, z, 5.5 + vrnd() * 4.5);
 }
 function airProjectiles(dt) {
   for (const t of tracers) {
@@ -2319,7 +2336,7 @@ function airProjectiles(dt) {
   for (let i = AIR.flak.length - 1; i >= 0; i--) {
     const f = AIR.flak[i];
     f.t -= dt;
-    if (f.t <= 0) { AIR.flak.splice(i, 1); flakBurst(f.x, f.y, f.z); }
+    if (f.t <= 0) { AIR.flak.splice(i, 1); flakBurst(f.x, f.y, f.z, f.side); }
   }
 }
 function airSync() {
@@ -2330,25 +2347,40 @@ function airSync() {
   for (const g of AIR.guns) g.rig.write(g.idx, g.x, g.y, g.z, 0, 0, 0, { yaw: g.yaw, pitch: g.pitch });
   fighterRig.flush(); bomberRig.flush(); aaRig.flush();
 
+  /* 只在有活动实例或该槽位需要清除时才写，并据此决定是否置 needsUpdate（空闲池零开销） */
+  let tTouched = false;
   for (let i = 0; i < TRACER_COUNT; i++) {
     const t = tracers[i];
-    if (!t.on) { tracerMesh.setMatrixAt(i, _pm.makeScale(0, 0, 0)); continue; }
-    const f = clamp(t.life / t.ttl, 0, 1), sp = Math.hypot(t.vx, t.vy, t.vz) || 1;
-    _tq.setFromUnitVectors(PZ, _tv.set(t.vx / sp, t.vy / sp, t.vz / sp));
-    tracerMesh.setMatrixAt(i, _pm.compose(_pp.set(t.x, t.y, t.z), _tq, _ps.set(1, 1, 0.7 + f * 0.6)));
-    _pc.setRGB(f * t.hdr, f * t.hdr * 0.8, f * t.hdr * 0.45);
-    tracerMesh.setColorAt(i, _pc);
+    if (t.on) {
+      const f = clamp(t.life / t.ttl, 0, 1), sp = Math.hypot(t.vx, t.vy, t.vz) || 1;
+      _tq.setFromUnitVectors(PZ, _tv.set(t.vx / sp, t.vy / sp, t.vz / sp));
+      tracerMesh.setMatrixAt(i, _pm.compose(_pp.set(t.x, t.y, t.z), _tq, _ps.set(1, 1, 0.7 + f * 0.6)));
+      _pc.setRGB(f * t.hdr, f * t.hdr * 0.8, f * t.hdr * 0.45);
+      tracerMesh.setColorAt(i, _pc);
+      t.drawn = true; tTouched = true;
+    } else if (t.drawn) {
+      tracerMesh.setMatrixAt(i, _pm.makeScale(0, 0, 0));
+      t.drawn = false; tTouched = true;
+    }
   }
-  tracerMesh.instanceMatrix.needsUpdate = true;
-  tracerMesh.instanceColor.needsUpdate = true;
+  if (tTouched) {
+    tracerMesh.instanceMatrix.needsUpdate = true;
+    tracerMesh.instanceColor.needsUpdate = true;
+  }
+  let bTouched = false;
   for (let i = 0; i < BOMB_COUNT; i++) {
     const b = bombs[i];
-    if (!b.on) { bombMesh.setMatrixAt(i, _pm.makeScale(0, 0, 0)); continue; }
-    const sp = Math.hypot(b.vx, b.vy, b.vz) || 1;
-    _tq.setFromUnitVectors(PZ, _tv.set(b.vx / sp, b.vy / sp, b.vz / sp));
-    bombMesh.setMatrixAt(i, _pm.compose(_pp.set(b.x, b.y, b.z), _tq, _ps.set(1, 1, 1)));
+    if (b.on) {
+      const sp = Math.hypot(b.vx, b.vy, b.vz) || 1;
+      _tq.setFromUnitVectors(PZ, _tv.set(b.vx / sp, b.vy / sp, b.vz / sp));
+      bombMesh.setMatrixAt(i, _pm.compose(_pp.set(b.x, b.y, b.z), _tq, _ps.set(1, 1, 1)));
+      b.drawn = true; bTouched = true;
+    } else if (b.drawn) {
+      bombMesh.setMatrixAt(i, _pm.makeScale(0, 0, 0));
+      b.drawn = false; bTouched = true;
+    }
   }
-  bombMesh.instanceMatrix.needsUpdate = true;
+  if (bTouched) bombMesh.instanceMatrix.needsUpdate = true;
 }
 
 function simulate(dt) {
