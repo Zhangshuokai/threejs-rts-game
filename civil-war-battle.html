@@ -1261,13 +1261,31 @@ function projectilesUpdate(dt) {
   }
 }
 
+/* ---- 战壕关键尺寸（先声明：布阵时要把步兵放进壕沟，不能靠手调 z ----） ---- */
+const TRENCH_Z = { union: -46, confederate: 46 };
+const HALF_TRENCH = 92;
+const TRENCH_DITCH_DZ = -0.175;   // 壕沟底中心相对工程中心线的朝敌偏移
+const trenchWob = x => Math.sin(x * 0.19) * 0.5 + Math.sin(x * 0.066 + 2.1) * 0.95;
+const trenchFace = key => key === 'union' ? 1 : -1;
+/* 壕沟底中心的世界 z：步兵应站在这里（工程中心线 + 蛇形 + 沟底偏移） */
+const trenchDitchZ = (key, x) => TRENCH_Z[key] + (trenchWob(x) + TRENCH_DITCH_DZ) * trenchFace(key);
+/* 出击口（散兵口）：开在各单位之间的空档上，胸墙/踏台/头木在这段压低成可跨越的缓坡。
+   刻意不开在单位正面——那是掩护最不该被削弱的位置，而且口子里没有胸墙就没有掩护。 */
+const BREACH_X = [-41, -1, 38, 80];
+const BREACH_HALF = 12;
+function breachFactor(x) {
+  let o = 0;
+  for (const c of BREACH_X) o = Math.max(o, clamp(1 - Math.abs(x - c) / BREACH_HALF, 0, 1));
+  return o * o * (3 - 2 * o);
+}
+
 const ROSTER = {
   union: {
     infantry: [
-      { resolve: 0.06, name: '第 20 缅因团', title: '第20缅因', x: -60, z: -64, files: 14, ranks: 3, yaw: 0 },
-      { resolve: 0.06, name: '第 69 纽约团', title: '第69纽约', x: -20, z: -66, files: 14, ranks: 3, yaw: 0 },
-      { resolve: 0.06, name: '第 1 明尼苏达团', title: '第1明尼苏达', x: 21, z: -64, files: 14, ranks: 3, yaw: 0 },
-      { resolve: 0.06, name: '爱尔兰旅', title: '爱尔兰旅', x: 61, z: -66, files: 14, ranks: 3, yaw: 0 }
+      { resolve: 0.06, name: '第 20 缅因团', title: '第20缅因', x: -60, z: -46, files: 14, ranks: 3, yaw: 0 },
+      { resolve: 0.06, name: '第 69 纽约团', title: '第69纽约', x: -20, z: -46, files: 14, ranks: 3, yaw: 0 },
+      { resolve: 0.06, name: '第 1 明尼苏达团', title: '第1明尼苏达', x: 21, z: -46, files: 14, ranks: 3, yaw: 0 },
+      { resolve: 0.06, name: '爱尔兰旅', title: '爱尔兰旅', x: 61, z: -46, files: 14, ranks: 3, yaw: 0 }
     ],
     cavalry: [
       { resolve: 0.06, name: '第 6 骑兵团', title: '第6骑兵', x: -98, z: -58, files: 6, ranks: 2, yaw: 0, sx: 2.3, sz: 2.6 },
@@ -1280,10 +1298,10 @@ const ROSTER = {
   },
   confederate: {
     infantry: [
-      { resolve: -0.01, name: '第 1 弗吉尼亚团', title: '第1弗吉尼亚', x: 58, z: 64, files: 14, ranks: 3, yaw: Math.PI },
-      { resolve: -0.01, name: '第 4 阿拉巴马团', title: '第4阿拉巴马', x: 19, z: 66, files: 14, ranks: 3, yaw: Math.PI },
-      { resolve: -0.01, name: '第 2 密西西比团', title: '第2密西西比', x: -21, z: 64, files: 14, ranks: 3, yaw: Math.PI },
-      { resolve: -0.01, name: '石墙旅', title: '石墙旅', x: -61, z: 66, files: 14, ranks: 3, yaw: Math.PI }
+      { resolve: -0.01, name: '第 1 弗吉尼亚团', title: '第1弗吉尼亚', x: 58, z: 46, files: 14, ranks: 3, yaw: Math.PI },
+      { resolve: -0.01, name: '第 4 阿拉巴马团', title: '第4阿拉巴马', x: 19, z: 46, files: 14, ranks: 3, yaw: Math.PI },
+      { resolve: -0.01, name: '第 2 密西西比团', title: '第2密西西比', x: -21, z: 46, files: 14, ranks: 3, yaw: Math.PI },
+      { resolve: -0.01, name: '石墙旅', title: '石墙旅', x: -61, z: 46, files: 14, ranks: 3, yaw: Math.PI }
     ],
     cavalry: [
       { resolve: -0.01, name: '第 1 弗吉尼亚骑兵', title: '第1弗骑', x: 99, z: 58, files: 6, ranks: 2, yaw: Math.PI, sx: 2.3, sz: 2.6 },
@@ -1370,6 +1388,8 @@ function makeArmyUnits(army) {
   }
   for (const u of army.units) {
     if (u.kind === 'art') continue;
+    /* 步兵开局站在己方壕沟底（工程中心线带蛇形），否则"战壕"里没人、掩护无从谈起 */
+    if (u.kind === 'inf') u.cz = trenchDitchZ(army.key, u.cx);
     for (let k = 0; k < u.soldiers.length; k++) {
       const s = u.soldiers[k];
       u.slotWorld(u.soldierSlot[k], s);
@@ -1401,38 +1421,62 @@ function blog(text, color) {
    全部走物理步进（simulate），随机数严格分流：
    影响战局的（选目标/命中/伤亡）用 rnd，纯视觉的（粒子抖动）用 vrnd。 */
 
-/* ---------- 战壕：土垒胸墙 + 壕沟(顶点色) + 沙袋 + 木桩 ---------- */
-const TRENCH_Z = { union: -46, confederate: 46 };
-const HALF_TRENCH = 92;
+/* ---------- 战壕（野战胸墙 / field breastwork） ----------
+   断面自内而外：背墙(parados) → 壕沟底 → 踏台(fire step) → 胸墙(parapet) → 前坡，
+   胸墙顶再压头木(headlog)。四条实测出来的逻辑，早期版本每一条都反了：
+   1) 胸墙高 ~1.18 m 只到人胸口，必须靠 0.48 m 的踏台才能越墙射击——
+      没有踏台的"胸墙"是一堵用不上的墙；
+   2) 壕沟底与天然地面齐平、由背墙与胸墙夹成，士兵站在两者之间；
+      早期版本把深色"壕沟"画在胸墙外侧 3 m 的地面上，人站在开阔地里吃掩护；
+   3) 背墙(parados)挡住落在阵线后方的炮弹破片；早期版本完全没有后墙；
+   4) 掩体只在壕沟/踏台范围内、且火力来自胸墙一侧时成立；
+      早期版本用对称距离 ±7 m 判定，胸墙外的开阔地和侧射都照吃掩护。
+   另外每 ~40 m 一道横墙(traverse)限制侧射，每个单位正面留一处出击口(散兵口)，
+   否则步兵推进时会直接穿过 1.18 m 的土墙。
+   本工程因地面网格 128 段(≈6.1 m/格)无法真正下挖 2.5 m，故按南北战争常见的
+   垒土胸墙建造（史料亦记"壕沟宽可坐立、朝敌一侧架木护头肩"）。 */
+/* TRENCH_Z / trenchWob / breachFactor 见 ROSTER 之前的声明 */
 const trenchTex = dirtTex.clone();
 trenchTex.needsUpdate = true;
 trenchTex.wrapS = trenchTex.wrapT = THREE.RepeatWrapping;
 trenchTex.repeat.set(1, 1);
-const trenchMat = new THREE.MeshStandardMaterial({ map: trenchTex, vertexColors: true, roughness: 1, metalness: 0 });
+const trenchMat = new THREE.MeshStandardMaterial({
+  map: trenchTex, vertexColors: true, roughness: 1, metalness: 0,
+  polygonOffset: true, polygonOffsetFactor: -1.5, polygonOffsetUnits: -1.5
+});
 const sandbagMat = new THREE.MeshStandardMaterial({ color: 0x7a6a4a, roughness: 1 });
 const stakeMat = new THREE.MeshStandardMaterial({ color: 0x574429, roughness: 1 });
-const trenchWob = x => Math.sin(x * 0.19) * 0.5 + Math.sin(x * 0.066 + 2.1) * 0.95;
+const logMat = new THREE.MeshStandardMaterial({ color: 0x6b543a, roughness: 0.95 });
+
+/* 断面：dz 朝敌为正，h 为高出天然地面的高度，k 为受光系数（壕内压暗） */
+const TRENCH_ROWS = [
+  { dz: -2.70, h: 0.04, k: 0.50 },   // 背墙后坡脚
+  { dz: -2.05, h: 0.74, k: 0.94 },   // 背墙顶 (parados)
+  { dz: -1.55, h: 0.12, k: 0.56 },   // 背墙内坡
+  { dz: -1.15, h: 0.04, k: 0.38 },   // 壕底后缘
+  { dz: 0.80, h: 0.04, k: 0.38 },    // 壕底前缘
+  { dz: 1.30, h: 0.52, k: 0.72 },    // 踏台 (fire step)
+  { dz: 1.95, h: 1.30, k: 1.00 },    // 胸墙顶 (parapet)：1.30 m 才挡到站立者肩部
+  { dz: 3.05, h: 0.04, k: 0.84 }     // 胸墙前坡脚
+];
+const trenchRowH = (h, j, open) => j === 5 ? h * (1 - 0.62 * open)
+  : j === 6 ? h * (1 - 0.80 * open) : h;
 
 function buildTrenchLine(key) {
   const f = key === 'union' ? 1 : -1;
   const tz = TRENCH_Z[key];
-  const N = 96, xa = -HALF_TRENCH, xb = HALF_TRENCH;
-  const rows = [
-    { dz: -3.1, h: 0.03, r: 0.30, g: 0.24, b: 0.16 },
-    { dz: -0.62, h: 0.05, r: 0.38, g: 0.31, b: 0.21 },
-    { dz: 0.12, h: 1.05, r: 0.82, g: 0.70, b: 0.50 },
-    { dz: 1.40, h: 0.06, r: 0.90, g: 0.78, b: 0.56 }
-  ];
-  const R = rows.length;
+  const N = 144, xa = -HALF_TRENCH, xb = HALF_TRENCH;
+  const R = TRENCH_ROWS.length;
   const pos = [], col = [], idx = [];
   const jit = mulberry32(key === 'union' ? 0x77A1 : 0x33C9);
   for (let i = 0; i <= N; i++) {
-    const x = lerp(xa, xb, i / N), wob = trenchWob(x);
-    for (const r of rows) {
-      const z = tz + r.dz * f + wob;
-      pos.push(x, terrainH(x, z) + r.h, z);
-      const k = 0.85 + jit() * 0.3;
-      col.push(r.r * k, r.g * k, r.b * k);
+    const x = lerp(xa, xb, i / N), wob = trenchWob(x), open = breachFactor(x);
+    for (let j = 0; j < R; j++) {
+      const r = TRENCH_ROWS[j];
+      const z = tz + (r.dz + wob) * f;
+      pos.push(x, terrainH(x, z) + trenchRowH(r.h, j, open), z);
+      const k = (0.85 + jit() * 0.3) * r.k;
+      col.push(0.62 * k, 0.52 * k, 0.36 * k);
     }
   }
   const flip = f < 0;
@@ -1444,7 +1488,7 @@ function buildTrenchLine(key) {
     }
   }
   const uv = [];
-  for (let i = 0; i <= N; i++) for (let j = 0; j < R; j++) uv.push(i / N * 34, j * 0.9);
+  for (let i = 0; i <= N; i++) for (let j = 0; j < R; j++) uv.push(i / N * 40, j * 0.75);
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
   g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
@@ -1457,45 +1501,105 @@ function buildTrenchLine(key) {
 
   const o = new THREE.Object3D();
   const R2 = mulberry32(key === 'union' ? 0x1144 : 0x7755);
+  const put = (mesh, i, x, dz, h, rot, sc) => {
+    const z = tz + (dz + trenchWob(x)) * f;
+    o.position.set(x, terrainH(x, z) + h, z);
+    o.rotation.set(rot[0], rot[1], rot[2]);
+    o.scale.set(sc[0], sc[1], sc[2]);
+    o.updateMatrix();
+    mesh.setMatrixAt(i, o.matrix);
+  };
+
+  /* 沙袋：胸墙顶(头木下方) + 背墙顶 */
   const bagGeo = new THREE.SphereGeometry(0.34, 8, 6);
   bagGeo.scale(1.15, 0.62, 0.78);
-  const BAGS = 84;
+  const BAGS = 132;
   const bags = new THREE.InstancedMesh(bagGeo, sandbagMat, BAGS);
   bags.castShadow = true; bags.receiveShadow = true; bags.frustumCulled = false;
   for (let i = 0; i < BAGS; i++) {
-    const x = lerp(xa, xb, (i + 0.5) / BAGS) + (R2() - 0.5) * 0.5;
-    const z = tz + 0.12 * f + trenchWob(x) + (R2() - 0.5) * 0.16;
-    o.position.set(x, terrainH(x, z) + 1.03 + R2() * 0.07, z);
-    o.rotation.set(0, (R2() - 0.5) * 0.6, (R2() - 0.5) * 0.22);
-    o.updateMatrix();
-    bags.setMatrixAt(i, o.matrix);
+    const onPara = i < 84;
+    const x = onPara
+      ? lerp(xa, xb, (i + 0.5) / 84) + (R2() - 0.5) * 0.5
+      : lerp(xa, xb, (i - 84 + 0.5) / (BAGS - 84)) + (R2() - 0.5) * 0.5;
+    const open = breachFactor(x);
+    if (onPara && open > 0.45) { put(bags, i, x, 1.62, 0.92, [0, 0, 0], [0, 0, 0]); continue; }
+    const dz = onPara ? 1.72 : -2.05;
+    const h = onPara ? 1.20 : 0.78;
+    put(bags, i, x, dz + (R2() - 0.5) * 0.18, h + R2() * 0.08,
+      [0, (R2() - 0.5) * 0.6, (R2() - 0.5) * 0.22], [1, 1, 1]);
   }
   bags.instanceMatrix.needsUpdate = true;
   scene.add(bags);
 
+  /* 头木 headlog：压在胸墙顶，与胸墙之间留出射孔 */
+  const LOG_SEG = 72, logGeo = cyl(0.13, 0.15, 2.6, 7);
+  logGeo.rotateZ(Math.PI / 2);
+  const logs = new THREE.InstancedMesh(logGeo, logMat, LOG_SEG);
+  logs.castShadow = true; logs.frustumCulled = false;
+  for (let i = 0; i < LOG_SEG; i++) {
+    const x = lerp(xa, xb, (i + 0.5) / LOG_SEG);
+    const open = breachFactor(x);
+    if (open > 0.45) { put(logs, i, x, 1.95, 1.30, [0, 0, 0], [0, 0, 0]); continue; }
+    /* 头木压在胸墙顶、下方留出射孔（史料：朝敌一侧架木护头肩） */
+    put(logs, i, x, 1.95, 1.36, [(R2() - 0.5) * 0.05, 0, 0], [1, 1, 1]);
+  }
+  logs.instanceMatrix.needsUpdate = true;
+  scene.add(logs);
+
+  /* 护壁木桩：贴在壕沟两侧内壁（不是散在走道上） */
   const stakeGeo = cyl(0.055, 0.075, 1.0, 6);
-  const STK = 46;
+  const STK = 96;
   const stakes = new THREE.InstancedMesh(stakeGeo, stakeMat, STK);
   stakes.castShadow = true; stakes.frustumCulled = false;
   for (let i = 0; i < STK; i++) {
+    const front = i % 2 === 0;
     const x = lerp(xa, xb, (i + 0.5) / STK) + (R2() - 0.5) * 0.5;
-    const z = tz - 0.78 * f + trenchWob(x) + (R2() - 0.5) * 0.2;
-    o.position.set(x, terrainH(x, z) + 0.44, z);
-    o.rotation.set((R2() - 0.5) * 0.22, R2() * TAU, f * 0.17);
-    o.updateMatrix();
-    stakes.setMatrixAt(i, o.matrix);
+    if (front) put(stakes, i, x, 0.95, 0.36, [(R2() - 0.5) * 0.1, 0, -f * 0.20], [1, 1, 1]);
+    else put(stakes, i, x, -1.35, 0.34, [(R2() - 0.5) * 0.1, 0, f * 0.20], [1, 1, 1]);
   }
   stakes.instanceMatrix.needsUpdate = true;
   scene.add(stakes);
+
+  /* 鹿砦 abatis：胸墙前斜插的拒马桩（障碍，不在壕内） */
+  const ABI = 54;
+  const abatis = new THREE.InstancedMesh(stakeGeo, stakeMat, ABI);
+  abatis.castShadow = true; abatis.frustumCulled = false;
+  for (let i = 0; i < ABI; i++) {
+    const x = lerp(xa, xb, (i + 0.5) / ABI) + (R2() - 0.5) * 0.8;
+    put(abatis, i, x, 3.55 + R2() * 0.5, 0.30, [(R2() - 0.5) * 0.2, R2() * TAU, f * (0.55 + R2() * 0.25)], [1, 1, 1]);
+  }
+  abatis.instanceMatrix.needsUpdate = true;
+  scene.add(abatis);
+
+  /* 横墙 traverse：与胸墙垂直，横跨壕沟，限制纵射 */
+  const TRV = 5, trvGeo = box(2.3, 1.15, 4.9);
+  const trvs = new THREE.InstancedMesh(trvGeo, sandbagMat, TRV);
+  trvs.castShadow = true; trvs.receiveShadow = true; trvs.frustumCulled = false;
+  const TRV_X = [-80, -60, -20, 20, 60];   // 避开出击口
+  for (let i = 0; i < TRV; i++) {
+    const x = TRV_X[i];
+    put(trvs, i, x, -0.10, 0.62, [0, (R2() - 0.5) * 0.06, 0], [1, 1, 1]);
+  }
+  trvs.instanceMatrix.needsUpdate = true;
+  scene.add(trvs);
 }
 buildTrenchLine('union');
 buildTrenchLine('confederate');
 
-/* 单位是否处于己方战壕内（取火线附近才有效） */
+/* 掩体只在胸墙内侧的壕沟/踏台上成立（对称距离会把胸墙外的开阔地也算进去） */
 function trenchCover(u) {
-  if (Math.abs(u.cz - TRENCH_Z[u.army.key]) > 7) return 0;
+  const key = u.army.key, f = trenchFace(key);
+  const s = (u.cz - (TRENCH_Z[key] + trenchWob(u.cx) * f)) * f;
+  if (s < -3.0 || s > 1.5) return 0;
   if (Math.abs(u.cx) > HALF_TRENCH) return 0;
-  return u.state === 'melee' || u.state === 'charge' ? 0.25 : 1;
+  /* 站在出击口里没有胸墙可依，掩护随之消失（与几何一致） */
+  const base = u.state === 'melee' || u.state === 'charge' ? 0.25 : 1;
+  return base * (1 - 0.85 * breachFactor(u.cx));
+}
+/* 方向性：只有来自胸墙一侧的火力才被掩体削弱（侧射/背射不吃掩护） */
+function coverAgainst(tgt, shooterZ) {
+  const f = tgt.army.key === 'union' ? 1 : -1;
+  return (shooterZ - tgt.cz) * f > 0 ? (tgt.cover || 0) : 0;
 }
 
 /* ---------- 通用刚体池：一个部件一个 InstancedMesh ---------- */
@@ -1936,7 +2040,7 @@ function volley(u) {
     s.recoil = 1;
     shots++;
   }
-  const kills = Math.max(0, Math.round((1 + rnd() * 2.4) * eff * (1 - 0.55 * (tgt.cover || 0))));
+  const kills = Math.max(0, Math.round((1 + rnd() * 2.4) * eff * (1 - 0.55 * coverAgainst(tgt, u.cz))));
   const pool = tgt.aliveSoldiers();
   for (let i = 0; i < kills && pool.length; i++) {
     tgt.kill(pool.splice(Math.floor(rnd() * pool.length), 1)[0]);
