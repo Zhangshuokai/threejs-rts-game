@@ -68,6 +68,7 @@
       <div id="phase">部署中</div>
       <div id="clock">0.0 s</div>
       <div class="sub" id="speed">速度 ×1</div>
+      <div class="sub" id="air">航空兵 —</div>
     </div>
     <div class="panel army conf">
       <div class="name"><span id="c-units">—</span><span>邦联军 · CONFEDERACY</span></div>
@@ -78,7 +79,7 @@
   </div>
   <div id="log"></div>
   <div class="panel" id="help">
-    <div><b>1-6</b> 切换机位 &nbsp; <b>空格</b> 暂停</div>
+    <div><b>1-7</b> 切换机位 &nbsp; <b>空格</b> 暂停</div>
     <div><b>[ ]</b> 战斗速度 &nbsp; <b>R</b> 重开</div>
     <div><b>鼠标</b> 拖拽旋转 / 滚轮缩放</div>
   </div>
@@ -159,6 +160,7 @@ const SPEEDS = [0.5, 1, 2, 4];
 const HUD = {
   phase: document.getElementById('phase'), clock: document.getElementById('clock'),
   speed: document.getElementById('speed'), log: document.getElementById('log'),
+  air: document.getElementById('air'),
   result: document.getElementById('result'), views: document.getElementById('views'),
   u: {
     units: document.getElementById('u-units'), bar: document.getElementById('u-bar'),
@@ -1058,12 +1060,12 @@ const flashPool = new ParticlePool({
   maxSize: 3.2, hdr: 2.2, tint: [1, 0.93, 0.78], tintVar: 0.14, bright: [0.9, 1.1], drag: 2.2
 });
 const smokePool = new ParticlePool({
-  count: 512, tex: smokeTex, blending: THREE.NormalBlending, rng: vrnd, premul: true,
+  count: 640, tex: smokeTex, blending: THREE.NormalBlending, rng: vrnd, premul: true,
   maxSize: 6, tint: [1, 0.995, 0.98], tintVar: 0.07, bright: [0.8, 1.1],
   wind: 1, buoy: 0.32, drag: 0.55, groundFade: 0.8
 });
 const burstPool = new ParticlePool({
-  count: 200, tex: burstTex, blending: THREE.NormalBlending, rng: vrnd, premul: true,
+  count: 340, tex: burstTex, blending: THREE.NormalBlending, rng: vrnd, premul: true,
   maxSize: 6, tint: [0.82, 0.79, 0.74], tintVar: 0.1, bright: [0.72, 1.02],
   wind: 0.8, buoy: 0.5, drag: 0.6, groundFade: 0.7
 });
@@ -1103,7 +1105,7 @@ const craterMat = new THREE.MeshStandardMaterial({
   transparent: true, depthWrite: false, roughness: 1
 });
 const craterGeo = new THREE.PlaneGeometry(1, 1);
-const CRATER_COUNT = 44;
+const CRATER_COUNT = 72;
 const craterMesh = new THREE.InstancedMesh(craterGeo, craterMat, CRATER_COUNT);
 craterMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
 craterMesh.frustumCulled = false;
@@ -1383,6 +1385,377 @@ function blog(text, color) {
   while (HUD.log.children.length > 7) HUD.log.lastChild.remove();
   B.entries.push({ t: +B.t.toFixed(1), text });
 }
+/* ==================== 战壕 · 高射炮 · 航空兵 ====================
+   全部走物理步进（simulate），随机数严格分流：
+   影响战局的（选目标/命中/伤亡）用 rnd，纯视觉的（粒子抖动）用 vrnd。 */
+
+/* ---------- 战壕：土垒胸墙 + 壕沟(顶点色) + 沙袋 + 木桩 ---------- */
+const TRENCH_Z = { union: -46, confederate: 46 };
+const HALF_TRENCH = 92;
+const trenchTex = dirtTex.clone();
+trenchTex.needsUpdate = true;
+trenchTex.wrapS = trenchTex.wrapT = THREE.RepeatWrapping;
+trenchTex.repeat.set(1, 1);
+const trenchMat = new THREE.MeshStandardMaterial({ map: trenchTex, vertexColors: true, roughness: 1, metalness: 0 });
+const sandbagMat = new THREE.MeshStandardMaterial({ color: 0x7a6a4a, roughness: 1 });
+const stakeMat = new THREE.MeshStandardMaterial({ color: 0x574429, roughness: 1 });
+const trenchWob = x => Math.sin(x * 0.19) * 0.5 + Math.sin(x * 0.066 + 2.1) * 0.95;
+
+function buildTrenchLine(key) {
+  const f = key === 'union' ? 1 : -1;
+  const tz = TRENCH_Z[key];
+  const N = 96, xa = -HALF_TRENCH, xb = HALF_TRENCH;
+  const rows = [
+    { dz: -3.1, h: 0.03, r: 0.30, g: 0.24, b: 0.16 },
+    { dz: -0.62, h: 0.05, r: 0.38, g: 0.31, b: 0.21 },
+    { dz: 0.12, h: 1.05, r: 0.82, g: 0.70, b: 0.50 },
+    { dz: 1.40, h: 0.06, r: 0.90, g: 0.78, b: 0.56 }
+  ];
+  const R = rows.length;
+  const pos = [], col = [], idx = [];
+  const jit = mulberry32(key === 'union' ? 0x77A1 : 0x33C9);
+  for (let i = 0; i <= N; i++) {
+    const x = lerp(xa, xb, i / N), wob = trenchWob(x);
+    for (const r of rows) {
+      const z = tz + r.dz * f + wob;
+      pos.push(x, terrainH(x, z) + r.h, z);
+      const k = 0.85 + jit() * 0.3;
+      col.push(r.r * k, r.g * k, r.b * k);
+    }
+  }
+  const flip = f < 0;
+  for (let i = 0; i < N; i++) {
+    for (let j = 0; j < R - 1; j++) {
+      const a = i * R + j, b = a + R, c = a + 1, d = b + 1;
+      if (flip) idx.push(a, b, c, c, b, d);
+      else idx.push(a, c, b, b, c, d);
+    }
+  }
+  const uv = [];
+  for (let i = 0; i <= N; i++) for (let j = 0; j < R; j++) uv.push(i / N * 34, j * 0.9);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  const berm = new THREE.Mesh(g, trenchMat);
+  berm.castShadow = true; berm.receiveShadow = true;
+  scene.add(berm);
+
+  const o = new THREE.Object3D();
+  const R2 = mulberry32(key === 'union' ? 0x1144 : 0x7755);
+  const bagGeo = new THREE.SphereGeometry(0.34, 8, 6);
+  bagGeo.scale(1.15, 0.62, 0.78);
+  const BAGS = 84;
+  const bags = new THREE.InstancedMesh(bagGeo, sandbagMat, BAGS);
+  bags.castShadow = true; bags.receiveShadow = true; bags.frustumCulled = false;
+  for (let i = 0; i < BAGS; i++) {
+    const x = lerp(xa, xb, (i + 0.5) / BAGS) + (R2() - 0.5) * 0.5;
+    const z = tz + 0.12 * f + trenchWob(x) + (R2() - 0.5) * 0.16;
+    o.position.set(x, terrainH(x, z) + 1.03 + R2() * 0.07, z);
+    o.rotation.set(0, (R2() - 0.5) * 0.6, (R2() - 0.5) * 0.22);
+    o.updateMatrix();
+    bags.setMatrixAt(i, o.matrix);
+  }
+  bags.instanceMatrix.needsUpdate = true;
+  scene.add(bags);
+
+  const stakeGeo = cyl(0.055, 0.075, 1.0, 6);
+  const STK = 46;
+  const stakes = new THREE.InstancedMesh(stakeGeo, stakeMat, STK);
+  stakes.castShadow = true; stakes.frustumCulled = false;
+  for (let i = 0; i < STK; i++) {
+    const x = lerp(xa, xb, (i + 0.5) / STK) + (R2() - 0.5) * 0.5;
+    const z = tz - 0.78 * f + trenchWob(x) + (R2() - 0.5) * 0.2;
+    o.position.set(x, terrainH(x, z) + 0.44, z);
+    o.rotation.set((R2() - 0.5) * 0.22, R2() * TAU, f * 0.17);
+    o.updateMatrix();
+    stakes.setMatrixAt(i, o.matrix);
+  }
+  stakes.instanceMatrix.needsUpdate = true;
+  scene.add(stakes);
+}
+buildTrenchLine('union');
+buildTrenchLine('confederate');
+
+/* 单位是否处于己方战壕内（取火线附近才有效） */
+function trenchCover(u) {
+  if (Math.abs(u.cz - TRENCH_Z[u.army.key]) > 7) return 0;
+  if (Math.abs(u.cx) > HALF_TRENCH) return 0;
+  return u.state === 'melee' || u.state === 'charge' ? 0.25 : 1;
+}
+
+/* ---------- 通用刚体池：一个部件一个 InstancedMesh ---------- */
+const _rigO = new THREE.Object3D();
+_rigO.rotation.order = 'YXZ';
+const _rigRoot = new THREE.Matrix4();
+const _rigPart = new THREE.Matrix4();
+class RigPool {
+  constructor(parts, count, mats) {
+    this.count = count;
+    this.hidden = new THREE.Matrix4().makeScale(0, 0, 0);
+    this.parts = [];
+    for (const def of parts) {
+      const mesh = new THREE.InstancedMesh(def.geo, mats[def.mat], count);
+      mesh.castShadow = true;
+      mesh.frustumCulled = false;
+      mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+      for (let i = 0; i < count; i++) {
+        mesh.setMatrixAt(i, this.hidden);
+        mesh.setColorAt(i, _pc.setRGB(1, 1, 1));
+      }
+      mesh.instanceMatrix.needsUpdate = true;
+      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+      scene.add(mesh);
+      const local = new THREE.Object3D();
+      local.rotation.order = 'YXZ';
+      local.position.set(def.pos[0], def.pos[1], def.pos[2]);
+      local.updateMatrix();
+      this.parts.push({ def, mesh, local });
+    }
+  }
+  paint(idx, cols) {
+    for (const P of this.parts) {
+      const c = P.def.paint && cols[P.def.paint] ? cols[P.def.paint] : [1, 1, 1];
+      P.mesh.setColorAt(idx, _pc.setRGB(c[0], c[1], c[2]));
+      P.mesh.instanceColor.needsUpdate = true;
+    }
+  }
+  write(idx, x, y, z, yaw, pitch, roll, dyn) {
+    _rigO.position.set(x, y, z);
+    _rigO.rotation.set(-pitch, yaw, roll);
+    _rigO.updateMatrix();
+    _rigRoot.copy(_rigO.matrix);
+    for (const P of this.parts) {
+      const d = P.def;
+      if (d.dyn === 'yaw') P.local.rotation.set(0, dyn.yaw, 0);
+      else if (d.dyn === 'barrel') P.local.rotation.set(-dyn.pitch, dyn.yaw, 0);
+      else if (d.dyn === 'prop') P.local.rotation.set(0, 0, dyn.prop);
+      if (d.dyn) P.local.updateMatrix();
+      _rigPart.multiplyMatrices(_rigRoot, P.local.matrix);
+      P.mesh.setMatrixAt(idx, _rigPart);
+    }
+  }
+  hide(idx) { for (const P of this.parts) P.mesh.setMatrixAt(idx, this.hidden); }
+  flush() { for (const P of this.parts) P.mesh.instanceMatrix.needsUpdate = true; }
+}
+
+/* ---------- 材质（各部件基色偏中性，阵营差别靠逐实例着色） ---------- */
+const airMat = {
+  skin: new THREE.MeshStandardMaterial({ color: 0xc2c7cd, roughness: 0.56, metalness: 0.16 }),
+  dark: new THREE.MeshStandardMaterial({ color: 0x4a4f55, roughness: 0.62, metalness: 0.35 }),
+  glass: new THREE.MeshStandardMaterial({ color: 0xa9c0d2, roughness: 0.16, metalness: 0.1, transparent: true, opacity: 0.5 }),
+  blade: new THREE.MeshStandardMaterial({ color: 0x2c2f33, roughness: 0.72 }),
+  blur: new THREE.MeshBasicMaterial({ color: 0xdfe6ee, transparent: true, opacity: 0.11, depthWrite: false, side: THREE.DoubleSide }),
+  gun: new THREE.MeshStandardMaterial({ color: 0x5c6166, roughness: 0.44, metalness: 0.68 })
+};
+const AIR_PAINT = {
+  union: { body: [0.70, 0.77, 0.92], mark: [0.18, 0.30, 0.70] },
+  confederate: { body: [0.95, 0.86, 0.66], mark: [0.66, 0.19, 0.14] }
+};
+const zc = g => g.rotateX(Math.PI / 2);
+
+const FIGHTER_PARTS = [
+  {
+    id: 'body', mat: 'skin', paint: 'body', pos: [0, 0, 0], geo: mergeGeometries([
+      at(zc(cyl(0.32, 0.46, 6.4, 12)), 0, 0, -0.2),
+      at(zc(cyl(0.30, 0.32, 0.5, 12)), 0, 0, 3.05),
+      at(box(0.66, 0.40, 2.0), 0, -0.34, 1.1)
+    ])
+  },
+  {
+    id: 'wing', mat: 'skin', paint: 'body', pos: [0, -0.02, 0.55], geo: mergeGeometries([
+      at(box(9.6, 0.17, 1.55), 0, 0, 0),
+      at(box(3.4, 0.13, 0.85), 0, 0.06, -3.3)
+    ])
+  },
+  {
+    id: 'fin', mat: 'skin', paint: 'body', pos: [0, 0.62, -3.35], geo: mergeGeometries([
+      at(box(0.14, 1.35, 0.95), 0, 0, 0),
+      at(box(0.12, 0.5, 0.5), 0, -0.9, 0.35)
+    ])
+  },
+  { id: 'canopy', mat: 'glass', pos: [0, 0.42, 0.5], geo: new THREE.SphereGeometry(0.44, 12, 8) },
+  { id: 'spinner', mat: 'dark', dyn: 'prop', pos: [0, 0, 3.5], geo: at(zc(cyl(0.06, 0.26, 0.55, 10)), 0, 0, 0.22) },
+  { id: 'blades', mat: 'blade', dyn: 'prop', pos: [0, 0, 3.62], geo: mergeGeometries([box(0.16, 3.0, 0.07), box(3.0, 0.16, 0.07)]) },
+  { id: 'blur', mat: 'blur', dyn: 'prop', pos: [0, 0, 3.66], geo: zc(cyl(1.5, 1.5, 0.02, 20)) },
+  {
+    id: 'mark', mat: 'skin', paint: 'mark', pos: [0, 0.08, 0.55], geo: mergeGeometries([
+      at(cyl(0.62, 0.62, 0.03, 12), -2.6, 0, 0),
+      at(cyl(0.62, 0.62, 0.03, 12), 2.6, 0, 0)
+    ])
+  }
+];
+
+const BOMBER_PARTS = [
+  {
+    id: 'body', mat: 'skin', paint: 'body', pos: [0, 0, 0], geo: mergeGeometries([
+      at(zc(cyl(0.78, 0.95, 12.5, 12)), 0, 0, 0),
+      at(new THREE.SphereGeometry(0.92, 12, 8), 0, 0.08, 6.4),
+      at(box(1.5, 0.85, 3.0), 0, -0.85, 0.9)
+    ])
+  },
+  {
+    id: 'wing', mat: 'skin', paint: 'body', pos: [0, -0.35, 0.6], geo: mergeGeometries([
+      at(box(23, 0.42, 3.3), 0, 0, 0),
+      at(box(8.4, 0.26, 1.7), 0, 0.12, -6.4)
+    ])
+  },
+  {
+    id: 'fins', mat: 'skin', paint: 'body', pos: [0, 1.05, -6.6], geo: mergeGeometries([
+      at(box(0.22, 2.0, 1.6), 0, 0, 0),
+      at(box(0.18, 0.8, 0.9), 0, -1.35, 0.5)
+    ])
+  },
+  { id: 'nacL', mat: 'dark', pos: [-4.7, -0.25, 0.8], geo: zc(cyl(0.56, 0.62, 2.8, 10)) },
+  { id: 'nacR', mat: 'dark', pos: [4.7, -0.25, 0.8], geo: zc(cyl(0.56, 0.62, 2.8, 10)) },
+  { id: 'propL', mat: 'blade', dyn: 'prop', pos: [-4.7, -0.25, 2.3], geo: mergeGeometries([box(0.2, 3.6, 0.08), box(3.6, 0.2, 0.08)]) },
+  { id: 'propR', mat: 'blade', dyn: 'prop', pos: [4.7, -0.25, 2.3], geo: mergeGeometries([box(0.2, 3.6, 0.08), box(3.6, 0.2, 0.08)]) },
+  { id: 'blurL', mat: 'blur', dyn: 'prop', pos: [-4.7, -0.25, 2.34], geo: zc(cyl(1.8, 1.8, 0.02, 20)) },
+  { id: 'blurR', mat: 'blur', dyn: 'prop', pos: [4.7, -0.25, 2.34], geo: zc(cyl(1.8, 1.8, 0.02, 20)) },
+  { id: 'glass', mat: 'glass', pos: [0, 0.6, 3.3], geo: new THREE.SphereGeometry(1.0, 12, 8) },
+  {
+    id: 'mark', mat: 'skin', paint: 'mark', pos: [0, -0.1, 0.6], geo: mergeGeometries([
+      at(cyl(0.85, 0.85, 0.03, 12), -6.2, 0, 0),
+      at(cyl(0.85, 0.85, 0.03, 12), 6.2, 0, 0)
+    ])
+  }
+];
+
+const AA_PARTS = [
+  {
+    id: 'base', mat: 'gun', pos: [0, 0.16, 0], geo: mergeGeometries([
+      cyl(1.25, 1.5, 0.32, 12),
+      at(box(2.7, 0.1, 1.0), 0, -0.05, 0)
+    ])
+  },
+  { id: 'pedestal', mat: 'gun', pos: [0, 0.85, 0], geo: cyl(0.52, 0.68, 1.35, 10) },
+  {
+    id: 'deck', mat: 'gun', dyn: 'yaw', pos: [0, 1.62, 0], geo: mergeGeometries([
+      at(box(1.7, 0.34, 1.7), 0, 0, 0),
+      at(box(2.2, 1.2, 0.12), 0, 0.6, -0.66),
+      at(box(0.5, 0.5, 0.5), 0.95, 0.05, -0.5)
+    ])
+  },
+  {
+    id: 'barrels', mat: 'gun', dyn: 'barrel', pos: [0, 1.72, 0.1], geo: mergeGeometries([
+      at(zc(cyl(0.10, 0.14, 3.6, 10)), -0.26, 0, 1.8),
+      at(zc(cyl(0.10, 0.14, 3.6, 10)), 0.26, 0, 1.8),
+      at(zc(cyl(0.20, 0.20, 0.26, 10)), -0.26, 0, 3.6),
+      at(zc(cyl(0.20, 0.20, 0.26, 10)), 0.26, 0, 3.6)
+    ])
+  },
+  {
+    id: 'seat', mat: 'dark', dyn: 'yaw', pos: [0, 2.1, -0.55], geo: mergeGeometries([
+      box(0.5, 0.14, 0.45),
+      at(box(0.5, 0.6, 0.14), 0, 0.3, -0.2)
+    ])
+  }
+];
+
+/* ---------- 曳光弹 / 航弹 ---------- */
+const TRACER_COUNT = 160;
+const tracerMesh = new THREE.InstancedMesh(
+  new THREE.BoxGeometry(0.14, 0.14, 2.6),
+  new THREE.MeshBasicMaterial({ color: 0xffcf8a, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false }),
+  TRACER_COUNT
+);
+tracerMesh.frustumCulled = false;
+tracerMesh.renderOrder = 2;
+tracerMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+for (let i = 0; i < TRACER_COUNT; i++) {
+  tracerMesh.setMatrixAt(i, _pm.makeScale(0, 0, 0));
+  tracerMesh.setColorAt(i, _pc.setRGB(0, 0, 0));
+}
+tracerMesh.instanceMatrix.needsUpdate = true;
+tracerMesh.instanceColor.needsUpdate = true;
+scene.add(tracerMesh);
+const tracers = [];
+for (let i = 0; i < TRACER_COUNT; i++) tracers.push({ on: false, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, ttl: 1, life: 0, hdr: 2.4 });
+let tracerIdx = 0;
+const _tq = new THREE.Quaternion();
+const _tv = new THREE.Vector3();
+
+function emitTracer(x, y, z, vx, vy, vz, ttl, hdr) {
+  const t = tracers[tracerIdx++ % TRACER_COUNT];
+  t.on = true; t.x = x; t.y = y; t.z = z; t.vx = vx; t.vy = vy; t.vz = vz;
+  t.ttl = t.life = ttl; t.hdr = hdr || 2.4;
+}
+
+const BOMB_COUNT = 40;
+const bombGeo = mergeGeometries([
+  at(new THREE.SphereGeometry(0.24, 8, 6).scale(1, 1, 2.6), 0, 0, 0),
+  at(box(0.32, 0.32, 0.4), 0, 0, -0.62)
+]);
+const bombMesh = new THREE.InstancedMesh(bombGeo, new THREE.MeshStandardMaterial({ color: 0x3a3d42, roughness: 0.6, metalness: 0.5 }), BOMB_COUNT);
+bombMesh.castShadow = true;
+bombMesh.frustumCulled = false;
+bombMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+for (let i = 0; i < BOMB_COUNT; i++) bombMesh.setMatrixAt(i, _pm.makeScale(0, 0, 0));
+bombMesh.instanceMatrix.needsUpdate = true;
+scene.add(bombMesh);
+const bombs = [];
+for (let i = 0; i < BOMB_COUNT; i++) bombs.push({ on: false, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, side: 'union' });
+let bombIdx = 0;
+
+/* ---------- 航空兵系统 ---------- */
+const FIGHTERS_PER = 3, BOMBERS_PER = 2, AA_PER = 3;
+const fighterRig = new RigPool(FIGHTER_PARTS, FIGHTERS_PER * 2, airMat);
+const bomberRig = new RigPool(BOMBER_PARTS, BOMBERS_PER * 2, airMat);
+const aaRig = new RigPool(AA_PARTS, AA_PER * 2, airMat);
+const AIR = { craft: [], guns: [], flak: [], lost: { union: 0, confederate: 0 }, dropped: 0 };
+
+function armyOf(side) { return side === 'union' ? U : C; }
+function foeSideOf(side) { return side === 'union' ? 'confederate' : 'union'; }
+/* 敌方正被压制的战线 z（航空兵据此规划航线） */
+function lineZ(side) {
+  const foe = armyOf(foeSideOf(side));
+  let s = 0, n = 0;
+  for (const u of foe.units) if (u.kind !== 'art' && u.men > 0 && !u.gone) { s += u.cz; n++; }
+  return n ? s / n : (side === 'union' ? 55 : -55);
+}
+
+for (const side of ['union', 'confederate']) {
+  const sgn = side === 'union' ? -1 : 1;
+  /* 直接生成在各自航线上（切向朝向），避免开局大回转冲出战场 */
+  for (let i = 0; i < FIGHTERS_PER; i++) {
+    const ang = (i / FIGHTERS_PER) * TAU + (side === 'union' ? 0 : 1.6);
+    const rad = 205 + i * 28, alt = 120 + i * 26;
+    AIR.craft.push({
+      side, kind: 'fighter', rig: fighterRig,
+      idx: (side === 'union' ? 0 : FIGHTERS_PER) + i,
+      x: Math.cos(ang) * rad, y: alt, z: Math.sin(ang) * rad,
+      yaw: Math.atan2(-Math.sin(ang), Math.cos(ang)), pitch: 0, roll: 0,
+      spd: 66, hp: 46, maxHp: 46, prop: 0, fireT: 0, burst: 0,
+      orbit: ang, rad, alt, state: 'patrol', smokeT: 0, dead: false, fallT: 0
+    });
+  }
+  for (let i = 0; i < BOMBERS_PER; i++) {
+    const rad = 172, alt = 150 + i * 16;
+    const sgd = side === 'union' ? 1 : -1, cz = lineZ(side) - sgd * rad;
+    const ang = (i / BOMBERS_PER) * TAU + (side === 'union' ? 0 : 3.1);
+    AIR.craft.push({
+      side, kind: 'bomber', rig: bomberRig,
+      idx: (side === 'union' ? 0 : BOMBERS_PER) + i,
+      x: Math.cos(ang) * rad, y: alt, z: cz + Math.sin(ang) * rad,
+      yaw: Math.atan2(-Math.sin(ang) * sgd, Math.cos(ang) * sgd), pitch: 0, roll: 0,
+      spd: 50, hp: 92, maxHp: 92, prop: 0, fireT: 0, burst: 0,
+      orbit: ang, rad, alt, state: 'bomb', dropT: 0, stick: 0, smokeT: 0, dead: false, fallT: 0
+    });
+  }
+  for (let i = 0; i < AA_PER; i++) {
+    const gx = (i - 1) * 76, gz = side === 'union' ? -113 : 113;
+    AIR.guns.push({
+      rig: aaRig, idx: (side === 'union' ? 0 : AA_PER) + i, side,
+      x: gx, y: terrainH(gx, gz), z: gz, yaw: side === 'union' ? 0 : Math.PI, pitch: 0.5,
+      reload: 1.4 + i * 0.5, burst: 0
+    });
+  }
+}
+for (const a of AIR.craft) a.rig.paint(a.idx, AIR_PAINT[a.side]);
+for (const g of AIR.guns) g.rig.paint(g.idx, AIR_PAINT[g.side]);
+
 const enemyOf = a => a === U ? C : U;
 const STEP = 1 / 60;
 const _v = { x: 0, z: 0 };
@@ -1551,7 +1924,7 @@ function volley(u) {
     s.recoil = 1;
     shots++;
   }
-  const kills = Math.max(0, Math.round((1 + rnd() * 2.4) * eff));
+  const kills = Math.max(0, Math.round((1 + rnd() * 2.4) * eff * (1 - 0.55 * (tgt.cover || 0))));
   const pool = tgt.aliveSoldiers();
   for (let i = 0; i < kills && pool.length; i++) {
     tgt.kill(pool.splice(Math.floor(rnd() * pool.length), 1)[0]);
@@ -1693,8 +2066,297 @@ function endBattle(winner) {
   blog('战斗结束 — ' + title, '#e8c470');
 }
 
+/* ---------- 航空兵：飞行模型 + 武器 ---------- */
+const ALT_MIN = 62;
+function steerTo(a, tx, ty, tz, dt) {
+  const dx = tx - a.x, dy = ty - a.y, dz = tz - a.z;
+  const dh = Math.max(1, Math.hypot(dx, dz));
+  let want = Math.atan2(dx, dz) - a.yaw;
+  while (want > Math.PI) want -= TAU;
+  while (want < -Math.PI) want += TAU;
+  /* 转弯半径 = 速度/角速率：轰炸机 50/0.42 ≈ 119 m 才能跟上 172 m 的航线 */
+  const aR = a.kind === 'fighter' ? 0.62 : 0.42;
+  const pR = a.kind === 'fighter' ? 0.75 : 0.30;
+  const wantPitch = clamp(Math.atan2(dy, dh), -0.55, 0.55);
+  a.yaw += clamp(want, -aR * dt, aR * dt);
+  a.pitch += clamp(wantPitch - a.pitch, -pR * dt, pR * dt);
+  const bank = clamp(-want * 1.1, -0.9, 0.9);
+  a.roll += (bank - a.roll) * Math.min(1, dt * 2.4);
+  return want;
+}
+const ALT_MAX = 250;
+function moveCraft(a, dt) {
+  const cp = Math.cos(a.pitch), sp = Math.sin(a.pitch);
+  a.x += Math.sin(a.yaw) * cp * a.spd * dt;
+  a.y += sp * a.spd * dt;
+  a.z += Math.cos(a.yaw) * cp * a.spd * dt;
+  a.prop += (a.spd * 2.2 + 9) * dt;
+  if (a.y < ALT_MIN) { a.y = ALT_MIN; a.pitch = Math.max(a.pitch, 0.1); }
+  else if (a.y > ALT_MAX) { a.y = ALT_MAX; a.pitch = Math.min(a.pitch, -0.1); }
+}
+function damageCraft(a, dmg, by) {
+  if (a.dead || a.state === 'falling') return;
+  a.hp -= dmg;
+  if (a.hp <= 0) {
+    a.state = 'falling'; a.fallT = 0; a.stick = 0;
+    AIR.lost[a.side]++;
+    blog((a.side === 'union' ? '联邦' : '邦联') + (a.kind === 'bomber' ? '轰炸机' : '战斗机') + '被' + by + '击落', '#f0a070');
+  }
+}
+function fighterUpdate(a, dt) {
+  let tgt = null, bd = 520;
+  for (const c of AIR.craft) {
+    if (c === a || c.dead || c.side === a.side || c.state === 'falling') continue;
+    const d = Math.hypot(c.x - a.x, c.y - a.y, c.z - a.z);
+    if (d < bd) { bd = d; tgt = c; }
+  }
+  /* 互相咬尾会一路飞出战场：离场心过远就脱离追击、回巡航航线 */
+  if (tgt && Math.hypot(a.x, a.z) > 290) tgt = null;
+  if (tgt) {
+    const tt = bd / 190;
+    const cp = Math.cos(tgt.pitch);
+    /* 高度瞄准限幅：互相咬尾时各自瞄准对方上方会形成无休止爬升 */
+    steerTo(a,
+      tgt.x + Math.sin(tgt.yaw) * cp * tgt.spd * tt,
+      clamp(tgt.y + Math.sin(tgt.pitch) * tgt.spd * tt, a.y - 30, a.y + 30),
+      tgt.z + Math.cos(tgt.yaw) * cp * tgt.spd * tt, dt);
+    const fx = Math.sin(a.yaw) * Math.cos(a.pitch), fy = Math.sin(a.pitch), fz = Math.cos(a.yaw) * Math.cos(a.pitch);
+    const dx = tgt.x - a.x, dy = tgt.y - a.y, dz = tgt.z - a.z;
+    const dd = Math.max(1, Math.hypot(dx, dy, dz));
+    const dot = (fx * dx + fy * dy + fz * dz) / dd;
+    if (bd < 320 && dot > 0.93 && a.fireT <= 0) {
+      a.fireT = 0.30;
+      const ox = a.x + fx * 3.6, oy = a.y + fy * 3.6, oz = a.z + fz * 3.6;
+      const dev = 0.012 + bd / 9000, sp = 300;
+      const ttl = clamp(bd / sp + 0.12, 0.2, 1.6);
+      for (let k = 0; k < 3; k++) {
+        emitTracer(ox, oy, oz,
+          (dx / dd + (rnd() - 0.5) * dev) * sp,
+          (dy / dd + (rnd() - 0.5) * dev) * sp,
+          (dz / dd + (rnd() - 0.5) * dev) * sp, ttl, 2.6);
+      }
+      flashPool.emit(ox, oy, oz, 1.1, 0.16, 0.045, 1, 0, 0, 0, 0);
+      if (rnd() < 0.16) damageCraft(tgt, 4 + rnd() * 6, '战斗机');
+    }
+  } else {
+    a.orbit += dt * (a.spd / a.rad);
+    steerTo(a, Math.cos(a.orbit) * a.rad, a.alt + Math.sin(a.orbit * 2.3) * 12, Math.sin(a.orbit) * a.rad, dt);
+  }
+}
+function dropBomb(a) {
+  const b = bombs[bombIdx++ % BOMB_COUNT];
+  const cp = Math.cos(a.pitch);
+  b.on = true; b.side = a.side;
+  b.x = a.x; b.y = a.y - 1.7; b.z = a.z;
+  b.vx = Math.sin(a.yaw) * cp * a.spd * 0.98 + (rnd() - 0.5) * 1.4;
+  b.vy = Math.sin(a.pitch) * a.spd * 0.98;
+  b.vz = Math.cos(a.yaw) * cp * a.spd * 0.98 + (rnd() - 0.5) * 1.4;
+  AIR.dropped++;
+}
+function bomberUpdate(a, dt) {
+  const tz = lineZ(a.side);
+  const sgn = a.side === 'union' ? 1 : -1;
+  const R = a.rad, cz = tz - sgn * R;
+  a.orbit += dt * (a.spd / R) * sgn;
+  const ta = a.orbit + 0.5 * sgn;
+  steerTo(a, Math.cos(ta) * R, a.alt + Math.sin(ta * 2.1) * 8, cz + Math.sin(ta) * R, dt);
+  if (a.stick > 0) {
+    a.dropT -= dt;
+    if (a.dropT <= 0) {
+      a.dropT = 0.26; a.stick--;
+      dropBomb(a);
+      if (a.stick === 0) a.dropT = 22;
+    }
+  } else {
+    a.dropT -= dt;
+    if (a.dropT <= 0 && Math.abs(a.z - tz) < 30) { a.stick = 4; a.dropT = 0; }
+  }
+}
+function airUpdate(dt) {
+  for (const a of AIR.craft) {
+    if (a.dead) continue;
+    a.fireT -= dt;
+    if (a.state === 'falling') {
+      a.fallT += dt;
+      a.spd = Math.max(14, a.spd - 16 * dt);
+      a.pitch = Math.max(a.pitch - 2.4 * dt, -1.4);
+      a.roll += dt * 1.4;
+      a.yaw += dt * 0.4;
+      const fcp = Math.cos(a.pitch);
+      a.x += Math.sin(a.yaw) * fcp * a.spd * dt;
+      a.z += Math.cos(a.yaw) * fcp * a.spd * dt;
+      a.y += Math.sin(a.pitch) * a.spd * dt - 9 * dt;
+      a.prop += (a.spd * 2.2 + 9) * dt;
+      a.smokeT -= dt;
+      if (a.smokeT <= 0) {
+        a.smokeT = 0.05;
+        burstPool.emit(a.x + (vrnd() - 0.5) * 1.4, a.y + (vrnd() - 0.5) * 1.4, a.z + (vrnd() - 0.5) * 1.4,
+          1.3, 5.2 + vrnd() * 1.6, 2.6 + vrnd(), 0.7, 0, -1.4, 0, 0);
+      }
+      if (a.y <= terrainH(a.x, a.z) + 0.7) {
+        a.dead = true;
+        a.rig.hide(a.idx);
+        groundBurst(a.x, a.z, a.kind === 'bomber' ? 1.8 : 1.25);
+        blog((a.side === 'union' ? '联邦' : '邦联') + (a.kind === 'bomber' ? '轰炸机' : '战斗机') + '坠毁', '#e08a60');
+        for (let i = 0; i < 4; i++) {
+          smokePool.emit(a.x + (vrnd() - 0.5) * 3, terrainH(a.x, a.z) + 1.4 + i * 1.6, a.z + (vrnd() - 0.5) * 3,
+            2.2, 7.4, 3.4, 0.7, 0, 1.5, (vrnd() - 0.5), (vrnd() - 0.5));
+        }
+      }
+      continue;
+    }
+    if (a.hp < a.maxHp * 0.42) {
+      a.smokeT -= dt;
+      if (a.smokeT <= 0) {
+        a.smokeT = 0.07;
+        burstPool.emit(a.x + (vrnd() - 0.5) * 1.1, a.y + (vrnd() - 0.5) * 1.1, a.z + (vrnd() - 0.5) * 1.1,
+          0.9, 3.6 + vrnd(), 1.7 + vrnd() * 0.6, 0.5, 0, -0.4, 0, 0);
+      }
+    }
+    if (a.kind === 'fighter') fighterUpdate(a, dt); else bomberUpdate(a, dt);
+    moveCraft(a, dt);
+  }
+}
+
+/* ---------- 高射炮：提前量解算 + 定时引信 ---------- */
+const FLAK_R = 10;
+function flakBurst(x, y, z) {
+  for (let i = 0; i < 5; i++) {
+    burstPool.emit(x + (vrnd() - 0.5) * 3.6, y + (vrnd() - 0.5) * 3.2, z + (vrnd() - 0.5) * 3.6,
+      1.3, 4.4 + vrnd(), 1.6 + vrnd() * 0.6, 0.9, 0, 0.12, (vrnd() - 0.5) * 1.2, (vrnd() - 0.5) * 1.2);
+  }
+  flashPool.emit(x, y, z, 2.4, 0.4, 0.06, 0.95, 0, 0, 0, 0);
+  for (const a of AIR.craft) {
+    if (a.dead || a.state === 'falling') continue;
+    const d = Math.hypot(a.x - x, a.y - y, a.z - z);
+    if (d < FLAK_R && rnd() < 0.10) damageCraft(a, 12 + rnd() * 10, '高射炮');
+  }
+}
+function aaUpdate(dt) {
+  for (const g of AIR.guns) {
+    g.reload -= dt;
+    const gy = g.y + 1.72;
+    let best = null, bd = 470;
+    for (const a of AIR.craft) {
+      if (a.dead || a.state === 'falling' || a.side === g.side) continue;
+      const d = Math.hypot(a.x - g.x, a.y - gy, a.z - g.z);
+      if (d < bd) { bd = d; best = a; }
+    }
+    if (!best) {
+      g.yaw += clamp(Math.atan2(-g.x, -g.z) - g.yaw, -0.6 * dt, 0.6 * dt);
+      g.pitch += clamp(0.45 - g.pitch, -0.5 * dt, 0.5 * dt);
+      continue;
+    }
+    const TR = 190, tf = bd / TR, cp = Math.cos(best.pitch);
+    const px = best.x + Math.sin(best.yaw) * cp * best.spd * tf;
+    const py = best.y + Math.sin(best.pitch) * best.spd * tf - 4.9 * tf * tf;
+    const pz = best.z + Math.cos(best.yaw) * cp * best.spd * tf;
+    const dx = px - g.x, dz = pz - g.z, dh = Math.max(1, Math.hypot(dx, dz));
+    let dy = Math.atan2(dx, dz) - g.yaw;
+    while (dy > Math.PI) dy -= TAU;
+    while (dy < -Math.PI) dy += TAU;
+    const dp = clamp(Math.atan2(py - gy, dh), -0.12, 1.3) - g.pitch;
+    g.yaw += clamp(dy, -1.9 * dt, 1.9 * dt);
+    g.pitch += clamp(dp, -1.5 * dt, 1.5 * dt);
+    if (g.reload <= 0 && Math.abs(dy) < 0.09 && Math.abs(dp) < 0.07) {
+      g.reload = 0.5 + rnd() * 0.6;
+      const c2 = Math.cos(g.pitch);
+      const ux = Math.sin(g.yaw) * c2, uy = Math.sin(g.pitch), uz = Math.cos(g.yaw) * c2;
+      const ox = g.x + ux * 3.6, oy = gy + uy * 3.6, oz = g.z + uz * 3.6;
+      emitTracer(ox, oy, oz, ux * TR, uy * TR, uz * TR, tf, 2.0);
+      flashPool.emit(ox, oy, oz, 1.6, 0.3, 0.05, 1, 0, 0, 0, 0);
+      smokePool.emit(ox + (vrnd() - 0.5), oy + 0.1, oz + (vrnd() - 0.5),
+        0.5, 2.0, 1.1, 0.5, 0, 0.5, ux * 2, uz * 2);
+      AIR.flak.push({ x: px, y: py, z: pz, t: tf });
+    }
+  }
+}
+
+/* ---------- 航弹 / 曳光弹 / 引信 ---------- */
+const BOMB_R = 8.5;
+function bombImpact(b) {
+  groundBurst(b.x, b.z, 1.55);
+  const foe = armyOf(foeSideOf(b.side));
+  let hits = 0;
+  for (const u of foe.units) {
+    if (u.kind === 'art' || u.men <= 0 || u.gone) continue;
+    for (const s of u.aliveSoldiers()) {
+      if (hits >= 3) break;
+      if (Math.hypot(s.x - b.x, s.z - b.z) < BOMB_R && rnd() < 0.75) { u.kill(s); hits++; }
+    }
+  }
+  if (hits > 0) blog('航空炸弹命中 ' + foe.side.label + ' 队列 — ' + hits + ' 人倒下', '#e8a060');
+}
+function groundBurst(x, z, power) {
+  const gY = terrainH(x, z);
+  boomPool.emit(x, gY + 1.1, z, 1.2 * power, 4.6 * power, 0.17, 1, 0, 0.6, 0, 0);
+  for (let i = 0; i < 8; i++) {
+    burstPool.emit(x + (vrnd() - 0.5) * 3.6, gY + 0.5 + vrnd() * 3.6, z + (vrnd() - 0.5) * 3.6,
+      1.6, 6.6 * power, 1.8 + vrnd() * 0.9, 0.85, 0, 1.4 + vrnd() * 1.8,
+      (vrnd() - 0.5) * 3.2, (vrnd() - 0.5) * 3.2);
+  }
+  for (let i = 0; i < 7; i++) {
+    dustPool.emit(x + (vrnd() - 0.5) * 5, gY + 0.4 + vrnd() * 4.2, z + (vrnd() - 0.5) * 5,
+      1.4, 5.4 * power, 1.8 + vrnd() * 0.8, 0.6, 0, 2.6 + vrnd() * 2.6,
+      (vrnd() - 0.5) * 4, (vrnd() - 0.5) * 4);
+  }
+  addCrater(x, z, 5.5 + vrnd() * 4.5);
+}
+function airProjectiles(dt) {
+  for (const t of tracers) {
+    if (!t.on) continue;
+    t.life -= dt;
+    if (t.life <= 0) { t.on = false; continue; }
+    t.x += t.vx * dt; t.y += t.vy * dt; t.z += t.vz * dt;
+    t.vy -= 4.5 * dt;
+  }
+  for (const b of bombs) {
+    if (!b.on) continue;
+    b.vy -= 9.8 * dt;
+    b.x += b.vx * dt; b.y += b.vy * dt; b.z += b.vz * dt;
+    if (b.y <= terrainH(b.x, b.z) + 0.25) { b.on = false; bombImpact(b); }
+  }
+  for (let i = AIR.flak.length - 1; i >= 0; i--) {
+    const f = AIR.flak[i];
+    f.t -= dt;
+    if (f.t <= 0) { AIR.flak.splice(i, 1); flakBurst(f.x, f.y, f.z); }
+  }
+}
+function airSync() {
+  for (const a of AIR.craft) {
+    if (a.dead) continue;
+    a.rig.write(a.idx, a.x, a.y, a.z, a.yaw, a.pitch, a.roll, { prop: a.prop });
+  }
+  for (const g of AIR.guns) g.rig.write(g.idx, g.x, g.y, g.z, 0, 0, 0, { yaw: g.yaw, pitch: g.pitch });
+  fighterRig.flush(); bomberRig.flush(); aaRig.flush();
+
+  for (let i = 0; i < TRACER_COUNT; i++) {
+    const t = tracers[i];
+    if (!t.on) { tracerMesh.setMatrixAt(i, _pm.makeScale(0, 0, 0)); continue; }
+    const f = clamp(t.life / t.ttl, 0, 1), sp = Math.hypot(t.vx, t.vy, t.vz) || 1;
+    _tq.setFromUnitVectors(PZ, _tv.set(t.vx / sp, t.vy / sp, t.vz / sp));
+    tracerMesh.setMatrixAt(i, _pm.compose(_pp.set(t.x, t.y, t.z), _tq, _ps.set(1, 1, 0.7 + f * 0.6)));
+    _pc.setRGB(f * t.hdr, f * t.hdr * 0.8, f * t.hdr * 0.45);
+    tracerMesh.setColorAt(i, _pc);
+  }
+  tracerMesh.instanceMatrix.needsUpdate = true;
+  tracerMesh.instanceColor.needsUpdate = true;
+  for (let i = 0; i < BOMB_COUNT; i++) {
+    const b = bombs[i];
+    if (!b.on) { bombMesh.setMatrixAt(i, _pm.makeScale(0, 0, 0)); continue; }
+    const sp = Math.hypot(b.vx, b.vy, b.vz) || 1;
+    _tq.setFromUnitVectors(PZ, _tv.set(b.vx / sp, b.vy / sp, b.vz / sp));
+    bombMesh.setMatrixAt(i, _pm.compose(_pp.set(b.x, b.y, b.z), _tq, _ps.set(1, 1, 1)));
+  }
+  bombMesh.instanceMatrix.needsUpdate = true;
+}
+
 function simulate(dt) {
   windUpdate();
+  for (const a of [U, C]) for (const u of a.units) if (u.kind !== 'art') u.cover = trenchCover(u);
+  airUpdate(dt);
+  aaUpdate(dt);
+  airProjectiles(dt);
   directorUpdate(dt);
   for (const u of U.units) unitUpdate(u, dt);
   for (const u of C.units) unitUpdate(u, dt);
@@ -1760,6 +2422,9 @@ function updateHUD(dt) {
   HUD.phase.textContent = { DEPLOY: '部署中', ADVANCE: '推进', FIRE: '火力准备', CHARGE: '冲锋', MELEE: '白刃战', END: '战斗结束' }[B.phase] || B.phase;
   HUD.clock.textContent = B.t.toFixed(1) + ' s' + (B.paused ? ' · 暂停' : '');
   HUD.speed.textContent = '速度 ×' + B.speed;
+  const airAlive = k => AIR.craft.filter(c => c.side === k && !c.dead).length + '/' + AIR.craft.filter(c => c.side === k).length;
+  HUD.air.textContent = '航空兵 联邦 ' + airAlive('union') + ' · 邦联 ' + airAlive('confederate')
+    + ' · 高炮 ' + AIR.guns.length + ' · 战壕 ' + (TRENCH_Z.union + '/' + TRENCH_Z.confederate) + 'm';
 }
 
 function bannersUpdate(dt) {
@@ -1774,6 +2439,7 @@ const VIEWS = [
   { id: 'union', label: '联邦军视角', pos: [0, 18, -132], tgt: [0, 8, 20], fov: 46 },
   { id: 'conf', label: '邦联军视角', pos: [0, 18, 132], tgt: [0, 8, -20], fov: 46 },
   { id: 'art', label: '炮兵阵地', pos: [-54, 12, -124], tgt: [-16, 3, -56], fov: 42 },
+  { id: 'air', label: '制空权', pos: [0, 168, 250], tgt: [0, 108, -10], fov: 52 },
   { id: 'melee', label: '跟拍战斗', follow: true, fov: 44 },
   { id: 'orbit', label: '环绕观赏', auto: true, fov: 50 }
 ];
@@ -1857,6 +2523,7 @@ function loop() {
   }
   syncArmy(U);
   syncArmy(C);
+  airSync();
   flashPool.sync(); smokePool.sync(); burstPool.sync();
   dustPool.sync(); boomPool.sync(); motePool.sync();
   frames++; fpsT += raw;
@@ -1883,7 +2550,7 @@ window.addEventListener('resize', () => {
 
 window.addEventListener('keydown', e => {
   if (e.code === 'Space') { B.paused = !B.paused; e.preventDefault(); }
-  if (e.key >= '1' && e.key <= '6') setView(VIEWS[+e.key - 1]);
+  if (e.key >= '1' && e.key <= '7') setView(VIEWS[+e.key - 1]);
   if (e.key === '[' || e.key === ']') {
     let i = SPEEDS.indexOf(B.speed);
     i = clamp(i + (e.key === ']' ? 1 : -1), 0, SPEEDS.length - 1);
@@ -2023,6 +2690,22 @@ window.__battle = {
     textures: renderer.info.memory.textures,
     programs: renderer.info.programs ? renderer.info.programs.length : null
   } : null,
+  air() {
+    return {
+      craft: AIR.craft.map(c => ({
+        side: c.side, kind: c.kind, state: c.state, dead: c.dead,
+        x: +c.x.toFixed(1), y: +c.y.toFixed(1), z: +c.z.toFixed(1),
+        yaw: +c.yaw.toFixed(3), hp: Math.round(c.hp)
+      })),
+      guns: AIR.guns.map(g => ({ side: g.side, yaw: +g.yaw.toFixed(2), pitch: +g.pitch.toFixed(2), reload: +g.reload.toFixed(2) })),
+      lost: AIR.lost, bombsDropped: AIR.dropped,
+      tracers: tracers.filter(t => t.on).length,
+      bombs: bombs.filter(b => b.on).length,
+      flakInFlight: AIR.flak.length,
+      trenchZ: TRENCH_Z
+    };
+  },
+  cover: () => [U, C].map(a => a.units.filter(u => u.kind !== 'art').map(u => u.name + ':' + (u.cover || 0).toFixed(2))).flat(),
   counts: () => ({
     unionFoot: U.foot.length, unionMount: U.mount.length,
     confFoot: C.foot.length, confMount: C.mount.length,
