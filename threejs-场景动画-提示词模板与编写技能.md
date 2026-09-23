@@ -397,6 +397,31 @@ window.__scene = {
   会战结束后 lost 不再增长。
 ```
 
+### T7 显示内容数量优化（静态烘焙 / 部件合并 / 阴影取舍）
+
+> 顺序很重要：先合并"永不动的东西"，再砍部件，最后才动阴影。改完必须用 info() 量前后差值。
+
+```
+【静态烘焙】永不动、同材质的道具/工事构件 → 烘焙成一个合并几何（1 个 draw call）：
+  bakedMesh(mat, [{geo, m4, col}])：克隆几何 → applyMatrix4(实例矩阵) → 写顶点色 → mergeGeometries。
+  · 比 InstancedMesh 好的地方：无逐实例矩阵更新；包围球按真实顶点算，视锥剔除依然有效；
+    并可 matrixAutoUpdate=false 省掉每帧矩阵重建。
+  · 坑：mergeGeometries 要求所有几何 index 状态一致 —— IcosahedronGeometry 是非索引的，
+    与 Box/Cylinder 混用会返回 null（随后 new Mesh(null) 在 updateMorphTargets 抛错），
+    必须先 toNonIndexed() 统一。
+【部件合并】同材质 + 不会各自独立运动的部件合成一个（偏移烘进几何）；
+  但**必须绕自身轴旋转**的部件（螺旋桨、桨盘、炮管）不能合并，否则会绕机体中心乱转。
+  本场景：战斗机 8→6、轰炸机 11→8、高炮 5→4 个部件。
+【阴影取舍】先算 texel 尺寸 = 2×halfExtent/mapSize；小于 1–2 个 texel 的物件投影只是糊影，
+  直接关掉 castShadow（沙袋、木桩、鹿砦、横墙、边灯），只保留读得出轮廓的（土垒、头木、建筑、车辆、飞机）。
+【进程内剔除】静态 InstancedMesh 保留 frustumCulled=true（包围球在首次渲染时算，之后不变仍然正确）；
+  动态 InstancedMesh 必须 frustumCulled=false —— Frustum.intersectsObject 只在 boundingSphere 为 null 时计算一次。
+【规模再大时】上百种"不同几何 + 同材质"才值得上 BatchedMesh：一次 draw call 承载整批，
+  并支持 setVisibleAt() 逐实例剔除、setGeometryIdAt() 逐实例切低模（每实例 LOD）；
+  注意它走 WebGL multi-draw 路径，WebGPU 双路工程要评估。THREE.LOD 只作用于单个对象，对实例化内容无效。
+【验收】用 __battle.info() 记录合并前后 calls/triangles（同机位同 t），并确认 __battle.census() 无新增可见性问题。
+```
+
 ---
 
 ## 10. 失败模式表（在原文第 11 节基础上新增）
@@ -433,6 +458,10 @@ window.__scene = {
 | 远处的地形/建筑/飞机"看不见" | 雾近端必须落在战场与机场之外（Fog 是 smoothstep(near,far,viewDepth)，近端太小会把远景洗成天空色） |
 | 一组实例化物件整批消失 | 动态 InstancedMesh 必须 frustumCulled=false：three 只在 boundingSphere 为 null 时算一次，之后不会随实例矩阵失效 |
 | 贴地弹坑/烧痕在远处闪或消失 | 共面贴花要开 polygonOffset，不能只靠几厘米抬升（深度精度不够） |
+| 物件一多就掉帧 / draw call 偏高 | 静态烘焙 + 按(材质,dyn)合并部件 + 选择性 castShadow，改完用 info() 量差值（T7） |
+| 合并几何返回 null / 报 updateMorphTargets 错 | 混合了索引与非索引几何（IcosahedronGeometry 非索引）→ 先 toNonIndexed() 统一（T7） |
+| 合并后螺旋桨绕机身乱转 | 需绕自身轴旋转的部件不能合并，必须各自独立（T7）|
+| 合并后远处物件整批消失 | 动态 InstancedMesh 必须 frustumCulled=false；烘焙网格则保留剔除（§可见性三条） |
 
 ---
 

@@ -351,24 +351,33 @@ function terrainBase(x, z) {
   return n * 2.6 * smooth(Math.hypot(dx, dz) / 48);
 }
 /* ---- 机场：跑道范围先在地形里压平，否则飞机是在起伏草地上滑跑/接地 ---- */
-/* 机场必须整个落在本军后方：跑道不得伸进战线/炮兵阵地，也不能占用观赏机位的空域 */
-const AIRFIELD = { union: { x: 0, z: -185 }, confederate: { x: 0, z: 185 } };
+/* 机场必须整个落在本军后方：跑道不得伸进战线/炮兵阵地，也不能占用观赏机位的空域。
+   yaw = 起飞方向（0 朝 +z，π/2 朝 +x）；跑道长轴与它对齐 —— 机场整体转 90° 后
+   跑道沿 x 铺开，两侧机场镜像，飞机改成朝侧翼起飞、升空后再转向战场。 */
+const AIRFIELD = { union: { x: 0, z: -185, yaw: Math.PI / 2 }, confederate: { x: 0, z: 185, yaw: -Math.PI / 2 } };
 const PAD_X = 40, PAD_Z = 78, PAD_FADE = 30;
+/* 机场局部坐标 <-> 世界坐标（局部 +z 即起飞方向） */
+const afWorld = (A, lx, lz) => [A.x + lx * Math.cos(A.yaw) + lz * Math.sin(A.yaw),
+  A.z - lx * Math.sin(A.yaw) + lz * Math.cos(A.yaw)];
+function afLocal(A, x, z) {
+  const dx = x - A.x, dz = z - A.z, c = Math.cos(A.yaw), s = Math.sin(A.yaw);
+  return [dx * c - dz * s, dx * s + dz * c];
+}
 const PAD_Y = {};
 for (const k in AIRFIELD) PAD_Y[k] = terrainBase(AIRFIELD[k].x, AIRFIELD[k].z);
 function onAirfield(x, z) {
   for (const k in AIRFIELD) {
-    const A = AIRFIELD[k];
-    if (Math.abs(x - A.x) < PAD_X + 12 && Math.abs(z - A.z) < PAD_Z + 12) return true;
+    const A = AIRFIELD[k], l = afLocal(A, x, z);
+    if (Math.abs(l[0]) < PAD_X + 12 && Math.abs(l[1]) < PAD_Z + 12) return true;
   }
   return false;
 }
 function terrainH(x, z) {
   let y = terrainBase(x, z);
   for (const k in AIRFIELD) {
-    const A = AIRFIELD[k];
-    const fx = clamp(1 - (Math.abs(x - A.x) - PAD_X) / PAD_FADE, 0, 1);
-    const fz = clamp(1 - (Math.abs(z - A.z) - PAD_Z) / PAD_FADE, 0, 1);
+    const A = AIRFIELD[k], l = afLocal(A, x, z);
+    const fx = clamp(1 - (Math.abs(l[0]) - PAD_X) / PAD_FADE, 0, 1);
+    const fz = clamp(1 - (Math.abs(l[1]) - PAD_Z) / PAD_FADE, 0, 1);
     const w = fx * fz;
     if (w > 0) y = lerp(y, PAD_Y[k], w);
   }
@@ -578,6 +587,29 @@ for (const k in SIDE) {
 const box = (w, h, d) => new THREE.BoxGeometry(w, h, d);
 const cyl = (rt, rb, h, s) => new THREE.CylinderGeometry(rt, rb, h, s);
 const at = (g, x, y, z) => { g.translate(x, y, z); return g; };
+/* 静态批处理：把一批"永不动、同材质"的实例烘焙成一个合并网格（1 个 draw call）。
+   相对 InstancedMesh 的好处：没有逐实例矩阵更新，包围球按真实顶点算（视锥剔除依然有效），
+   也不会踩到"动态 InstancedMesh 包围球不刷新"的坑；代价是不能再逐实例改属性，
+   所以只适合道具/工事构件这类静态物。 */
+function bakedMesh(mat, list) {
+  const parts = [];
+  for (const it of list) {
+    /* mergeGeometries 要求所有几何的 index 状态一致：IcosahedronGeometry 是非索引的，
+       与 Box/Cylinder 混在一起会直接失败 → 统一转成非索引再合并 */
+    const g = it.geo.index ? it.geo.toNonIndexed() : it.geo.clone();
+    g.applyMatrix4(it.m4);
+    const c = new THREE.Color(it.col), n = g.attributes.position.count;
+    const arr = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) { arr[i * 3] = c.r; arr[i * 3 + 1] = c.g; arr[i * 3 + 2] = c.b; }
+    g.setAttribute('color', new THREE.BufferAttribute(arr, 3));
+    parts.push(g);
+  }
+  const mesh = new THREE.Mesh(mergeGeometries(parts), mat);
+  mesh.matrixAutoUpdate = false;      // 静态对象：跳过每帧矩阵重建
+  mesh.updateMatrix();
+  scene.add(mesh);
+  return mesh;
+}
 
 const FOOT_PARTS = [
   { id: 'torso', anim: 'torso', mat: 'coat', pos: [0, 0.95, 0], geo: box(0.44, 0.66, 0.26) },
@@ -1654,9 +1686,7 @@ const trenchMat = new THREE.MeshStandardMaterial({
   map: trenchTex, vertexColors: true, roughness: 1, metalness: 0,
   polygonOffset: true, polygonOffsetFactor: -1.5, polygonOffsetUnits: -1.5
 });
-const sandbagMat = new THREE.MeshStandardMaterial({ color: 0x7a6a4a, roughness: 1 });
-const stakeMat = new THREE.MeshStandardMaterial({ color: 0x574429, roughness: 1 });
-const logMat = new THREE.MeshStandardMaterial({ color: 0x6b543a, roughness: 0.95 });
+
 
 /* TRENCH_ROWS / trenchRowH / workH / workTraverse 见 ROSTER 之前的声明 */
 function buildTrenchLine(key) {
@@ -1694,91 +1724,66 @@ function buildTrenchLine(key) {
   g.computeVertexNormals();
   const berm = new THREE.Mesh(g, trenchMat);
   berm.castShadow = true; berm.receiveShadow = true;
+  berm.matrixAutoUpdate = false; berm.updateMatrix();   // 静态：省掉每帧矩阵重建
   scene.add(berm);
 
   const o = new THREE.Object3D();
   const R2 = mulberry32(key === 'union' ? 0x1144 : 0x7755);
-  const put = (mesh, i, x, dz, h, rot, sc) => {
+  const mk = (geo, col, x, dz, h, rot, sc) => {
     const z = tz + (dz + trenchWob(x)) * f;
     o.position.set(x, terrainH(x, z) + h, z);
     o.rotation.set(rot[0], rot[1], rot[2]);
     o.scale.set(sc[0], sc[1], sc[2]);
     o.updateMatrix();
-    mesh.setMatrixAt(i, o.matrix);
+    return { geo, col, m4: o.matrix.clone() };
   };
 
-  /* 沙袋：胸墙顶(头木下方) + 背墙顶 */
+  /* 附属构件全部静态 → 按材质烘焙成 3 个合并网格（原来 5 个 InstancedMesh）：
+     沙袋+横墙、护壁桩+鹿砦、头木。 */
+  const bagsL = [], stakesL = [], logsL = [];
   const bagGeo = new THREE.SphereGeometry(0.34, 8, 6);
   bagGeo.scale(1.15, 0.62, 0.78);
   const BAGS = 132;
-  const bags = new THREE.InstancedMesh(bagGeo, sandbagMat, BAGS);
-  bags.castShadow = true; bags.receiveShadow = true; bags.frustumCulled = false;
   for (let i = 0; i < BAGS; i++) {
     const onPara = i < 84;
     const x = onPara
       ? lerp(xa, xb, (i + 0.5) / 84) + (R2() - 0.5) * 0.5
       : lerp(xa, xb, (i - 84 + 0.5) / (BAGS - 84)) + (R2() - 0.5) * 0.5;
-    const open = breachFactor(x);
-    if (onPara && open > 0.45) { put(bags, i, x, 1.62, 0.92, [0, 0, 0], [0, 0, 0]); continue; }
-    const dz = onPara ? 1.72 : -2.05;
-    const h = onPara ? 1.20 : 0.78;
-    put(bags, i, x, dz + (R2() - 0.5) * 0.18, h + R2() * 0.08,
-      [0, (R2() - 0.5) * 0.6, (R2() - 0.5) * 0.22], [1, 1, 1]);
+    if (onPara && breachFactor(x) > 0.45) continue;      // 出击口不码沙袋
+    const dz = onPara ? 1.72 : -2.05, h = onPara ? 1.20 : 0.78;
+    bagsL.push(mk(bagGeo, 0x7a6a4a, x, dz + (R2() - 0.5) * 0.18, h + R2() * 0.08,
+      [0, (R2() - 0.5) * 0.6, (R2() - 0.5) * 0.22], [1, 1, 1]));
   }
-  bags.instanceMatrix.needsUpdate = true;
-  scene.add(bags);
-
-  /* 头木 headlog：压在胸墙顶，与胸墙之间留出射孔 */
-  const LOG_SEG = 72, logGeo = cyl(0.13, 0.15, 2.6, 7);
+  /* 横墙 traverse：与胸墙垂直，横跨壕沟，限制纵射（同沙袋材质） */
+  const trvGeo = box(2.3, 1.15, 4.9);
+  for (const x of [-80, -60, -20, 20, 60]) {
+    bagsL.push(mk(trvGeo, 0x7a6a4a, x, -0.10, 0.62, [0, (R2() - 0.5) * 0.06, 0], [1, 1, 1]));
+  }
+  /* 头木 headlog：压在胸墙顶、下方留出射孔（史料：朝敌一侧架木护头肩） */
+  const logGeo = cyl(0.13, 0.15, 2.6, 7);
   logGeo.rotateZ(Math.PI / 2);
-  const logs = new THREE.InstancedMesh(logGeo, logMat, LOG_SEG);
-  logs.castShadow = true; logs.frustumCulled = false;
-  for (let i = 0; i < LOG_SEG; i++) {
-    const x = lerp(xa, xb, (i + 0.5) / LOG_SEG);
-    const open = breachFactor(x);
-    if (open > 0.45) { put(logs, i, x, 1.95, 1.30, [0, 0, 0], [0, 0, 0]); continue; }
-    /* 头木压在胸墙顶、下方留出射孔（史料：朝敌一侧架木护头肩） */
-    put(logs, i, x, 1.95, 1.36, [(R2() - 0.5) * 0.05, 0, 0], [1, 1, 1]);
+  for (let i = 0; i < 72; i++) {
+    const x = lerp(xa, xb, (i + 0.5) / 72);
+    if (breachFactor(x) > 0.45) continue;
+    logsL.push(mk(logGeo, 0x6b543a, x, 1.95, 1.36, [(R2() - 0.5) * 0.05, 0, 0], [1, 1, 1]));
   }
-  logs.instanceMatrix.needsUpdate = true;
-  scene.add(logs);
-
-  /* 护壁木桩：贴在壕沟两侧内壁（不是散在走道上） */
+  /* 护壁木桩（贴壕沟内壁）+ 鹿砦（胸墙前的拒马桩） */
   const stakeGeo = cyl(0.055, 0.075, 1.0, 6);
-  const STK = 96;
-  const stakes = new THREE.InstancedMesh(stakeGeo, stakeMat, STK);
-  stakes.castShadow = true; stakes.frustumCulled = false;
-  for (let i = 0; i < STK; i++) {
-    const front = i % 2 === 0;
-    const x = lerp(xa, xb, (i + 0.5) / STK) + (R2() - 0.5) * 0.5;
-    if (front) put(stakes, i, x, 0.95, 0.36, [(R2() - 0.5) * 0.1, 0, -f * 0.20], [1, 1, 1]);
-    else put(stakes, i, x, -1.35, 0.34, [(R2() - 0.5) * 0.1, 0, f * 0.20], [1, 1, 1]);
+  for (let i = 0; i < 96; i++) {
+    const x = lerp(xa, xb, (i + 0.5) / 96) + (R2() - 0.5) * 0.5;
+    stakesL.push(i % 2 === 0
+      ? mk(stakeGeo, 0x574429, x, 0.95, 0.36, [(R2() - 0.5) * 0.1, 0, -f * 0.20], [1, 1, 1])
+      : mk(stakeGeo, 0x574429, x, -1.35, 0.34, [(R2() - 0.5) * 0.1, 0, f * 0.20], [1, 1, 1]));
   }
-  stakes.instanceMatrix.needsUpdate = true;
-  scene.add(stakes);
-
-  /* 鹿砦 abatis：胸墙前斜插的拒马桩（障碍，不在壕内） */
-  const ABI = 54;
-  const abatis = new THREE.InstancedMesh(stakeGeo, stakeMat, ABI);
-  abatis.castShadow = true; abatis.frustumCulled = false;
-  for (let i = 0; i < ABI; i++) {
-    const x = lerp(xa, xb, (i + 0.5) / ABI) + (R2() - 0.5) * 0.8;
-    put(abatis, i, x, 3.55 + R2() * 0.5, 0.30, [(R2() - 0.5) * 0.2, R2() * TAU, f * (0.55 + R2() * 0.25)], [1, 1, 1]);
+  for (let i = 0; i < 54; i++) {
+    const x = lerp(xa, xb, (i + 0.5) / 54) + (R2() - 0.5) * 0.8;
+    stakesL.push(mk(stakeGeo, 0x574429, x, 3.55 + R2() * 0.5, 0.30,
+      [(R2() - 0.5) * 0.2, R2() * TAU, f * (0.55 + R2() * 0.25)], [1, 1, 1]));
   }
-  abatis.instanceMatrix.needsUpdate = true;
-  scene.add(abatis);
-
-  /* 横墙 traverse：与胸墙垂直，横跨壕沟，限制纵射 */
-  const TRV = 5, trvGeo = box(2.3, 1.15, 4.9);
-  const trvs = new THREE.InstancedMesh(trvGeo, sandbagMat, TRV);
-  trvs.castShadow = true; trvs.receiveShadow = true; trvs.frustumCulled = false;
-  const TRV_X = [-80, -60, -20, 20, 60];   // 避开出击口
-  for (let i = 0; i < TRV; i++) {
-    const x = TRV_X[i];
-    put(trvs, i, x, -0.10, 0.62, [0, (R2() - 0.5) * 0.06, 0], [1, 1, 1]);
-  }
-  trvs.instanceMatrix.needsUpdate = true;
-  scene.add(trvs);
+  const fitMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1 });
+  bakedMesh(fitMat, bagsL).receiveShadow = true;               // 沙袋/横墙：不投影(阴影 0.166 m/texel 解析不出)
+  bakedMesh(fitMat, stakesL).receiveShadow = true;             // 护壁桩/鹿砦
+  bakedMesh(fitMat, logsL).castShadow = true;                  // 头木保留投影（2.6 m 长，影子里读得出）
 }
 buildTrenchLine('union');
 buildTrenchLine('confederate');
@@ -1786,54 +1791,47 @@ buildTrenchLine('confederate');
 /* 障碍物网格：每类一个 InstancedMesh（共 5 个 draw call），几何贴合地形 */
 function buildObstacles() {
   const vr = mulberry32(0x51D0C3);
-  const stoneMat = new THREE.MeshStandardMaterial({ color: 0x8a8577, roughness: 0.98 });
-  const woodMat = new THREE.MeshStandardMaterial({ color: 0x6b563a, roughness: 1 });
-  const hayMat = new THREE.MeshStandardMaterial({ color: 0xa78f52, roughness: 1 });
   const logGeo = cyl(0.28, 0.32, 4.6, 8);
   logGeo.rotateZ(Math.PI / 2);
   const rockGeo = new THREE.IcosahedronGeometry(0.62, 0);
   rockGeo.scale(1, 0.75, 1.25);
   const defs = {
     wall: {
-      mat: stoneMat, geo: mergeGeometries([
+      col: 0x8a8577, geo: mergeGeometries([
         at(box(3.2, 0.5, 0.6), 0, 0.25, 0), at(box(3.5, 0.36, 0.7), 0, 0.66, 0)
       ])
     },
     log: {
-      mat: woodMat, geo: mergeGeometries([
+      col: 0x6b563a, geo: mergeGeometries([
         at(logGeo, 0, 0.30, 0), at(cyl(0.36, 0.42, 0.6, 8), 1.65, 0.30, 0),
         at(box(0.5, 0.12, 0.28), -0.9, 0.58, 0.1)
       ])
     },
     hay: {
-      mat: hayMat, geo: mergeGeometries([
+      col: 0xa78f52, geo: mergeGeometries([
         at(cyl(0.25, 1.18, 1.35, 10), 0, 0.68, 0), at(cyl(0.06, 0.34, 0.42, 8), 0, 1.5, 0)
       ])
     },
     fence: {
-      mat: woodMat, geo: mergeGeometries([
+      col: 0x6b563a, geo: mergeGeometries([
         at(box(0.16, 1.05, 0.16), -1.5, 0.52, 0), at(box(0.16, 1.05, 0.16), 1.5, 0.52, 0),
         at(box(3.2, 0.11, 0.09), 0, 0.74, 0), at(box(3.2, 0.11, 0.09), 0, 0.44, 0)
       ])
     },
-    rock: { mat: stoneMat, geo: rockGeo }
+    rock: { col: 0x8a8577, geo: rockGeo }
   };
-  const o = new THREE.Object3D();
-  for (const T of OBSTACLE_TYPES) {
-    const list = obstacles.filter(ob => ob.kind === T.id);
-    if (!list.length) continue;
-    const mesh = new THREE.InstancedMesh(defs[T.id].geo, defs[T.id].mat, list.length);
-    mesh.castShadow = true; mesh.receiveShadow = true; mesh.frustumCulled = false;
-    list.forEach((ob, i) => {
-      o.position.set(ob.x, terrainH(ob.x, ob.z) + 0.02, ob.z);
-      o.rotation.set(T.id === 'log' ? (vr() - 0.5) * 0.1 : 0, ob.rot, T.id === 'rock' ? (vr() - 0.5) * 0.3 : 0);
-      o.scale.set(ob.sc, ob.sc, ob.sc);
-      o.updateMatrix();
-      mesh.setMatrixAt(i, o.matrix);
-    });
-    mesh.instanceMatrix.needsUpdate = true;
-    scene.add(mesh);
+  /* 障碍物永不动 → 全部烘焙成一个顶点着色网格（原来 5 个 InstancedMesh = 5 个 draw call） */
+  const o = new THREE.Object3D(), baked = [];
+  for (const ob of obstacles) {
+    const D = defs[ob.kind];
+    o.position.set(ob.x, terrainH(ob.x, ob.z) + 0.02, ob.z);
+    o.rotation.set(ob.kind === 'log' ? (vr() - 0.5) * 0.1 : 0, ob.rot, ob.kind === 'rock' ? (vr() - 0.5) * 0.3 : 0);
+    o.scale.set(ob.sc, ob.sc, ob.sc);
+    o.updateMatrix();
+    baked.push({ geo: D.geo, col: D.col, m4: o.matrix.clone() });
   }
+  const mesh = bakedMesh(new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1 }), baked);
+  mesh.castShadow = true; mesh.receiveShadow = true;
 }
 buildObstacles();
 
@@ -1989,7 +1987,7 @@ const tinted = (geo, hex) => {
   const ao = new THREE.Object3D();
   let k = 0;
   for (const key in AIRFIELD) {
-    const A = AIRFIELD[key], by = terrainH(A.x, A.z), rot = key === 'union' ? 0 : Math.PI;
+    const A = AIRFIELD[key], by = terrainH(A.x, A.z), rot = A.yaw;
     ao.position.set(A.x, by + 0.02, A.z); ao.rotation.set(0, rot, 0);
     ao.scale.set(1, 1, 1); ao.updateMatrix();
     airfieldMesh.setMatrixAt(k, ao.matrix);
@@ -2002,24 +2000,19 @@ const tinted = (geo, hex) => {
   scene.add(airfieldMesh, runwayMesh);
 }
 
+/* 部件的划分原则：同一 material + 同一 dyn 的部件合并成一个（少数 draw call），
+   但"绕自身轴旋转"的部件（螺旋桨/桨盘/炮管）必须各自独立，否则会绕机体中心乱转。 */
 const FIGHTER_PARTS = [
   {
+    /* 机身+机翼+尾翼同材质同涂装且都不动 → 合并为一个部件（偏移烘进几何） */
     id: 'body', mat: 'skin', paint: 'body', pos: [0, 0, 0], geo: mergeGeometries([
       at(zc(cyl(0.32, 0.46, 6.4, 12)), 0, 0, -0.2),
       at(zc(cyl(0.30, 0.32, 0.5, 12)), 0, 0, 3.05),
-      at(box(0.66, 0.40, 2.0), 0, -0.34, 1.1)
-    ])
-  },
-  {
-    id: 'wing', mat: 'skin', paint: 'body', pos: [0, -0.02, 0.55], geo: mergeGeometries([
-      at(box(9.6, 0.17, 1.55), 0, 0, 0),
-      at(box(3.4, 0.13, 0.85), 0, 0.06, -3.3)
-    ])
-  },
-  {
-    id: 'fin', mat: 'skin', paint: 'body', pos: [0, 0.62, -3.35], geo: mergeGeometries([
-      at(box(0.14, 1.35, 0.95), 0, 0, 0),
-      at(box(0.12, 0.5, 0.5), 0, -0.9, 0.35)
+      at(box(0.66, 0.40, 2.0), 0, -0.34, 1.1),
+      at(box(9.6, 0.17, 1.55), 0, -0.02, 0.55),
+      at(box(3.4, 0.13, 0.85), 0, 0.04, -2.75),
+      at(box(0.14, 1.35, 0.95), 0, 0.62, -3.35),
+      at(box(0.12, 0.5, 0.5), 0, -0.28, -3.0)
     ])
   },
   { id: 'canopy', mat: 'glass', pos: [0, 0.42, 0.5], geo: new THREE.SphereGeometry(0.44, 12, 8) },
@@ -2039,23 +2032,19 @@ const BOMBER_PARTS = [
     id: 'body', mat: 'skin', paint: 'body', pos: [0, 0, 0], geo: mergeGeometries([
       at(zc(cyl(0.78, 0.95, 12.5, 12)), 0, 0, 0),
       at(new THREE.SphereGeometry(0.92, 12, 8), 0, 0.08, 6.4),
-      at(box(1.5, 0.85, 3.0), 0, -0.85, 0.9)
+      at(box(1.5, 0.85, 3.0), 0, -0.85, 0.9),
+      at(box(23, 0.42, 3.3), 0, -0.35, 0.6),
+      at(box(8.4, 0.26, 1.7), 0, -0.23, -5.8),
+      at(box(0.22, 2.0, 1.6), 0, 1.05, -6.6),
+      at(box(0.18, 0.8, 0.9), 0, -0.3, -6.1)
     ])
   },
   {
-    id: 'wing', mat: 'skin', paint: 'body', pos: [0, -0.35, 0.6], geo: mergeGeometries([
-      at(box(23, 0.42, 3.3), 0, 0, 0),
-      at(box(8.4, 0.26, 1.7), 0, 0.12, -6.4)
+    id: 'nac', mat: 'dark', pos: [0, 0, 0], geo: mergeGeometries([
+      at(zc(cyl(0.56, 0.62, 2.8, 10)), -4.7, -0.25, 0.8),
+      at(zc(cyl(0.56, 0.62, 2.8, 10)), 4.7, -0.25, 0.8)
     ])
   },
-  {
-    id: 'fins', mat: 'skin', paint: 'body', pos: [0, 1.05, -6.6], geo: mergeGeometries([
-      at(box(0.22, 2.0, 1.6), 0, 0, 0),
-      at(box(0.18, 0.8, 0.9), 0, -1.35, 0.5)
-    ])
-  },
-  { id: 'nacL', mat: 'dark', pos: [-4.7, -0.25, 0.8], geo: zc(cyl(0.56, 0.62, 2.8, 10)) },
-  { id: 'nacR', mat: 'dark', pos: [4.7, -0.25, 0.8], geo: zc(cyl(0.56, 0.62, 2.8, 10)) },
   { id: 'propL', mat: 'blade', dyn: 'prop', pos: [-4.7, -0.25, 2.3], geo: mergeGeometries([box(0.2, 3.6, 0.08), box(3.6, 0.2, 0.08)]) },
   { id: 'propR', mat: 'blade', dyn: 'prop', pos: [4.7, -0.25, 2.3], geo: mergeGeometries([box(0.2, 3.6, 0.08), box(3.6, 0.2, 0.08)]) },
   { id: 'blurL', mat: 'blur', dyn: 'prop', pos: [-4.7, -0.25, 2.34], geo: zc(cyl(1.8, 1.8, 0.02, 20)) },
@@ -2071,12 +2060,13 @@ const BOMBER_PARTS = [
 
 const AA_PARTS = [
   {
-    id: 'base', mat: 'gun', pos: [0, 0.16, 0], geo: mergeGeometries([
-      cyl(1.25, 1.5, 0.32, 12),
-      at(box(2.7, 0.1, 1.0), 0, -0.05, 0)
+    /* 底座 + 立柱同材质不动 → 合并 */
+    id: 'base', mat: 'gun', pos: [0, 0, 0], geo: mergeGeometries([
+      at(cyl(1.25, 1.5, 0.32, 12), 0, 0.16, 0),
+      at(box(2.7, 0.1, 1.0), 0, 0.11, 0),
+      at(cyl(0.52, 0.68, 1.35, 10), 0, 0.85, 0)
     ])
   },
-  { id: 'pedestal', mat: 'gun', pos: [0, 0.85, 0], geo: cyl(0.52, 0.68, 1.35, 10) },
   {
     id: 'deck', mat: 'gun', dyn: 'yaw', pos: [0, 1.62, 0], geo: mergeGeometries([
       at(box(1.7, 0.34, 1.7), 0, 0, 0),
@@ -2165,27 +2155,29 @@ function lineZ(side) {
 
 for (const side of ['union', 'confederate']) {
   /* 停在机场停机坪上，按顺序滑出、起飞、爬升，然后才进入各自任务 */
-  const f = side === 'union' ? 1 : -1;
   const A = AIRFIELD[side], PY = PAD_Y[side];
+  const park = (lx, lz) => { const w = afWorld(A, lx, lz); return { x: w[0], z: w[1] }; };
   for (let i = 0; i < FIGHTERS_PER; i++) {
-    const px = A.x - 16, pz = A.z - f * 46 + i * 15;
+    const p = park(-16, -46 + i * 15);
+    const px = p.x, pz = p.z;
     AIR.craft.push({
       side, kind: 'fighter', rig: fighterRig,
       idx: (side === 'union' ? 0 : FIGHTERS_PER) + i,
       x: px, y: PY + GND, z: pz, parkX: px, parkZ: pz,
-      yaw: f > 0 ? 0 : Math.PI, pitch: 0, roll: 0,
+      yaw: A.yaw, pitch: 0, roll: 0,
       spd: 0, cruise: 46, vr: 31, hp: 46, maxHp: 46, prop: 0, fireT: 0,
-      orbit: (i / FIGHTERS_PER) * TAU + (f > 0 ? 0 : 1.6), rad: 152 + i * 26, alt: 58 + i * 14,
+      orbit: (i / FIGHTERS_PER) * TAU + (side === 'union' ? 0 : 1.6), rad: 152 + i * 26, alt: 58 + i * 14,
       launchAt: 1.6 + i * 2.6, state: 'parked', smokeT: 0, dead: false
     });
   }
   for (let i = 0; i < BOMBERS_PER; i++) {
-    const px = A.x + 17, pz = A.z - f * 34 + i * 22;
+    const p = park(17, -34 + i * 22);
+    const px = p.x, pz = p.z;
     AIR.craft.push({
       side, kind: 'bomber', rig: bomberRig,
       idx: (side === 'union' ? 0 : BOMBERS_PER) + i,
       x: px, y: PY + GND, z: pz, parkX: px, parkZ: pz,
-      yaw: f > 0 ? 0 : Math.PI, pitch: 0, roll: 0,
+      yaw: A.yaw, pitch: 0, roll: 0,
       spd: 0, cruise: 34, vr: 23, hp: 92, maxHp: 92, prop: 0, fireT: 0,
       orbit: i * 1.7, alt: 76 + i * 14,
       lane: (i - (BOMBERS_PER - 1) / 2) * 130, run: BOMB_RUN, lat: 150, leg: 0,
@@ -2734,21 +2726,25 @@ function bomberUpdate(a, dt) {
 }
 /* ---------- 起飞与返场着陆（机场是战术循环的一部分，不只是起点） ---------- */
 function takeoffUpdate(a, dt) {
-  const key = a.side, A = AIRFIELD[key], f = key === 'union' ? 1 : -1, PY = PAD_Y[key];
-  a.yaw = f > 0 ? 0 : Math.PI;
+  const key = a.side, A = AIRFIELD[key], PY = PAD_Y[key];
+  a.yaw = A.yaw;
   if (a.state === 'taxi') {
     a.spd = Math.min(a.spd + 6 * dt, 9);
-    a.x = lerp(a.x, A.x, 1 - Math.exp(-dt * 1.4));       // 滑上跑道中线
+    /* 向跑道轴线靠拢（局部 x → 0），同时沿轴向前进 */
+    const l = afLocal(A, a.x, a.z);
+    const nx = lerp(l[0], 0, 1 - Math.exp(-dt * 1.6));
+    const w = afWorld(A, nx, l[1] + a.spd * dt);
+    a.x = w[0]; a.z = w[1];
     a.y = PY + GND;
-    a.z += Math.cos(a.yaw) * a.spd * dt;
     a.prop += (a.spd * 2 + 6) * dt;
-    if (Math.abs(a.x - A.x) < 0.9) a.state = 'roll';
+    if (Math.abs(nx) < 0.9) { a.rw = afLocal(A, a.x, a.z)[1]; a.state = 'roll'; }
     return;
   }
   if (a.state === 'roll') {
     a.spd = Math.min(a.spd + 12 * dt, a.vr);
-    a.x = A.x; a.y = PY + GND;
-    a.z += Math.cos(a.yaw) * a.spd * dt;
+    a.rw += a.spd * dt;                                  // 沿跑道轴的标量，不会漂出中线
+    const w = afWorld(A, 0, a.rw);
+    a.x = w[0]; a.z = w[1]; a.y = PY + GND;
     a.prop += (a.spd * 2.2 + 9) * dt;
     if (a.spd >= a.vr - 0.01) a.state = 'climb';
     return;
@@ -2756,29 +2752,29 @@ function takeoffUpdate(a, dt) {
   a.spd = Math.min(a.spd + 6 * dt, a.cruise);
   a.pitch = Math.min(a.pitch + 0.9 * dt, 0.20);
   moveCraft(a, dt, true);
-  if (a.y >= a.alt - 3) {
+  /* 爬够 30 m 就转入任务航向：否则会沿跑道方向一直飞出地形边缘（跑道转 90° 后尤其明显） */
+  if (a.y >= Math.min(30, a.alt - 3)) {
     a.pitch = 0;
     a.state = a.kind === 'fighter' ? 'patrol' : 'bomb';
   }
 }
 function landingUpdate(a, dt) {
-  const key = a.side, A = AIRFIELD[key], f = key === 'union' ? 1 : -1, PY = PAD_Y[key];
-  const hdg = f > 0 ? 0 : Math.PI;
-  /* 接地点 / 起始进近点：进近点夹在地面范围内，避免飞出地形边缘 */
-  const T = A.z - f * 70, IPz = clamp(T - f * 140, -370, 370);
+  const key = a.side, A = AIRFIELD[key], PY = PAD_Y[key];
+  /* 接地点在跑道进近端，起始进近点在跑道延长线上（局部坐标，自动跟随机场朝向） */
+  const T = afWorld(A, 0, -PAD_Z + 12), IP = afWorld(A, 0, -PAD_Z - 140);
   if (a.state === 'rtb') {
-    steerTo(a, A.x, PY + 38, IPz, dt);
+    steerTo(a, IP[0], PY + 38, IP[1], dt);
     moveCraft(a, dt, true);
     a.spd = Math.max(a.vr, a.spd - 5 * dt);
-    if (f * (a.z - IPz) > -20 && a.y < PY + 46) a.state = 'final';
+    if (Math.hypot(a.x - IP[0], a.z - IP[1]) < 46 && a.y < PY + 46) a.state = 'final';
     return;
   }
   if (a.state === 'final') {
-    const d = Math.abs(T - a.z);
-    steerTo(a, A.x, PY + Math.max(0, d * 0.11), T, dt);   // 下滑道：目标高度随距离线性下降
+    const d = Math.hypot(a.x - T[0], a.z - T[1]);
+    steerTo(a, T[0], PY + Math.max(0, d * 0.11), T[1], dt);   // 下滑道：目标高度随距离线性下降
     moveCraft(a, dt, true);
     a.spd = Math.max(a.vr, a.spd - 4 * dt);
-    if (a.y <= PY + 1.4 && Math.abs(a.z - T) < 46) { a.state = 'flare'; a.flareT = 0; }
+    if (a.y <= PY + 1.4 && d < 46) { a.state = 'flare'; a.flareT = 0; }
     return;
   }
   if (a.state === 'flare') {
@@ -2793,7 +2789,8 @@ function landingUpdate(a, dt) {
   /* rollout：跑道上减速滑行到停 */
   a.pitch = 0; a.y = PY + GND;
   a.spd = Math.max(0, a.spd - 7 * dt);
-  a.z += Math.cos(hdg) * a.spd * dt;
+  a.x += Math.sin(A.yaw) * a.spd * dt;
+  a.z += Math.cos(A.yaw) * a.spd * dt;
   a.prop += (a.spd * 2 + 4) * dt;
   if (a.spd <= 0.2) {
     a.spd = 0; a.state = 'parked';
