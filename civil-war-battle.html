@@ -35,15 +35,20 @@
   #clock{font-size:12px;opacity:.8;margin-top:3px;letter-spacing:1px}
   #log{position:absolute;left:14px;bottom:96px;width:340px;max-height:238px;overflow:hidden;
     display:flex;flex-direction:column;gap:5px}
-  #log div{font-size:12px;padding:5px 9px;line-height:1.45}
+  #log div{font-size:12px;padding:5px 9px;line-height:1.45;border-left:3px solid transparent}
   #help{position:absolute;right:14px;bottom:96px;padding:9px 12px;font-size:12px;line-height:1.75;text-align:right}
   #help b{color:var(--gold)}
   #views{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);
     display:flex;gap:6px;pointer-events:auto;flex-wrap:wrap;justify-content:center}
   #views button{font-family:inherit;font-size:12px;letter-spacing:1px;color:#efe8da;cursor:pointer;
-    background:var(--panel);border:1px solid var(--line);border-radius:5px;padding:6px 11px}
+    background:var(--panel);border:1px solid var(--line);border-radius:5px;padding:6px 11px;
+    transform-origin:50% 100%;will-change:transform}
   #views button:hover{border-color:var(--gold);color:var(--gold)}
   #views button.on{background:rgba(217,185,106,.22);color:var(--gold);border-color:var(--gold)}
+  #paused{position:absolute;left:50%;top:46%;transform:translate(-50%,-50%);padding:12px 30px;
+    font-size:15px;letter-spacing:7px;color:var(--gold);opacity:0;display:none}
+  #impact{position:fixed;inset:0;pointer-events:none;opacity:0;
+    background:radial-gradient(circle at 50% 56%,rgba(255,206,140,.34),rgba(255,124,44,.12) 44%,rgba(0,0,0,0) 74%)}
   #result{position:absolute;left:50%;top:44%;transform:translate(-50%,-50%);text-align:center;
     padding:26px 46px;display:none}
   #result h1{margin:0;font-size:34px;letter-spacing:10px;color:var(--gold);font-weight:700}
@@ -57,6 +62,7 @@
 <body>
 <div id="stage"></div>
 <div id="hud">
+  <div id="impact"></div>
   <div id="topbar">
     <div class="panel army union">
       <div class="name"><span>联邦军 · UNION</span><span id="u-units">—</span></div>
@@ -84,6 +90,7 @@
     <div><b>鼠标</b> 拖拽旋转 / 滚轮缩放</div>
   </div>
   <div id="views"></div>
+  <div class="panel" id="paused">已暂停 · 空格继续</div>
   <div class="panel" id="result"><h1></h1><p></p></div>
   <div class="panel" id="debug"></div>
 </div>
@@ -92,6 +99,8 @@
 <script>
 (function(){
   var base = 'https://cdn.jsdelivr.net/npm/three@0.185.0/';
+  /* Anime.js v4.5 起提供官方 three.js adapter（材质/灯光/雾/Color 可直接当动画目标） */
+  var animeBase = 'https://cdn.jsdelivr.net/npm/animejs@4.5.0/dist/modules/';
   var forceWebGL = /[?&]webgl=1/.test(location.search);
   window.__BOOT_ERR = null;
   function start(mode){
@@ -99,6 +108,8 @@
     var imports = {};
     imports['three'] = base + (mode === 'webgpu' ? 'build/three.webgpu.min.js' : 'build/three.module.js');
     imports['three/addons/'] = base + 'examples/jsm/';
+    imports['animejs'] = animeBase + 'index.js';
+    imports['animejs/adapters/three'] = animeBase + 'adapters/three/index.js';
     var im = document.createElement('script');
     im.type = 'importmap';
     im.textContent = JSON.stringify({ imports: imports });
@@ -298,6 +309,113 @@ if (FX.wanted) {
   }
 }
 try { if (renderer.info && 'autoReset' in renderer.info) renderer.info.autoReset = false; } catch (e) { }
+
+/* ==================== 动效层（Anime.js v4） ====================
+   只驱动"表现"：HUD 入场、镜头过渡、震屏、曝光脉冲、终局天色。
+   与战局随机流严格隔离——这里一个 rnd()/vrnd() 都不取，
+   所以动效怎么调都不会挪动战局；?anime=0 可整体关闭做 A/B。
+   Anime.js 4.5 起有官方 three.js adapter（Light / Fog / Material / Color 可直接当目标），
+   但它会改 fog.color，故只在终局（B.over）后才用。 */
+let animeOK = false, adapterOK = false;
+let animate = null, createTimeline = null, stagger = null;
+if (!/[?&]anime=0/.test(QUERY) && !NOHUD) {
+  try {
+    const A = await import('animejs');
+    animate = A.animate; createTimeline = A.createTimeline; stagger = A.stagger;
+    animeOK = true;
+    try { await import('animejs/adapters/three'); adapterOK = true; } catch (e) { }
+  } catch (e) {
+    console.warn('[anime] 加载失败，动效层退化为瞬时切换', e);
+  }
+}
+const MOTION = {
+  on: animeOK && !NOHUD,
+  shake: { amp: 0, t: 0 },
+  expo: { v: 1.12 },
+  anim: { shake: null, expo: null, flash: null, badge: null }
+};
+const _shakeOff = new THREE.Vector3();
+const _shakeQ = new THREE.Quaternion();
+function decayShake(dt) {
+  MOTION.shake.t += dt;
+  /* anime 在跑就由它的缓动包络衰减；没有 anime 时用帧率无关的指数衰减兜底 */
+  if (!animeOK) MOTION.shake.amp *= Math.pow(0.012, dt);
+  if (MOTION.shake.amp < 0.002) { MOTION.shake.amp = 0; return; }
+  const a = MOTION.shake.amp, t = MOTION.shake.t;
+  _shakeOff.set(Math.sin(t * 47.3) * a, Math.sin(t * 61.7 + 1.3) * a * 0.72, Math.sin(t * 38.9 + 0.6) * a * 0.45);
+}
+function shakeImpulse(amp) {
+  const s = MOTION.shake;
+  s.amp = Math.min(0.9, s.amp + amp);
+  if (!animeOK) return;
+  if (MOTION.anim.shake) MOTION.anim.shake.cancel();
+  MOTION.anim.shake = animate(s, { amp: 0, duration: 460 + amp * 900, ease: 'outQuad' });
+}
+function expoPunch(amp) {
+  if (!animeOK) return;
+  const e = MOTION.expo;
+  e.v = 1.12 + amp;
+  renderer.toneMappingExposure = e.v;
+  if (MOTION.anim.expo) MOTION.anim.expo.cancel();
+  MOTION.anim.expo = animate(e, { v: 1.12, duration: 400, ease: 'outQuad', onUpdate: () => { renderer.toneMappingExposure = e.v; } });
+}
+const IMPACT_EL = document.getElementById('impact');
+function flashImpact(a) {
+  if (!animeOK || !IMPACT_EL) return;
+  if (MOTION.anim.flash) MOTION.anim.flash.cancel();
+  IMPACT_EL.style.opacity = String(Math.min(0.92, a));
+  MOTION.anim.flash = animate(IMPACT_EL, { opacity: 0, duration: 380 + a * 900, ease: 'outQuad' });
+}
+/* 爆炸/炮弹落地的"冲击力"：震幅与闪光都随镜头距离衰减，远处炮击不会晃瞎眼 */
+function impactFeedback(power, x, z) {
+  if (!MOTION.on) return;
+  const d = Math.hypot(x - camera.position.x, z - camera.position.z);
+  shakeImpulse(clamp(power * 2.6 / (1 + d / 70), 0, 0.55));
+  expoPunch(clamp(power * 0.14 / (1 + d / 220), 0, 0.2));
+  if (d < 520) flashImpact(clamp(power * 0.3 / (1 + d / 150), 0, 0.5));
+}
+function logIn(d) {
+  if (!MOTION.on) return;
+  animate(d, { opacity: [0, 1], translateX: ['-16px', '0px'], scale: [0.96, 1], duration: 380, ease: 'outCubic' });
+}
+function phasePulse() {
+  if (!MOTION.on) return;
+  animate(HUD.phase, { scale: [1.34, 1], opacity: [0.3, 1], duration: 620, ease: 'outCubic' });
+}
+function pausedBadge(on) {
+  const el = document.getElementById('paused');
+  if (!el) return;
+  if (!MOTION.on) { el.style.display = on ? 'block' : 'none'; return; }
+  if (on) el.style.display = 'block';
+  if (MOTION.anim.badge) MOTION.anim.badge.cancel();
+  MOTION.anim.badge = on
+    ? animate(el, { opacity: [0, 1], scale: [0.9, 1], duration: 320, ease: 'outBack' })
+    : animate(el, { opacity: 0, scale: 0.94, duration: 220, ease: 'inCubic', onComplete: () => { el.style.display = 'none'; } });
+}
+function resultIn() {
+  if (!MOTION.on) return;
+  createTimeline({ defaults: { ease: 'outCubic' } })
+    .add(HUD.result, { opacity: [0, 1], scale: [0.78, 1], duration: 620 }, 0)
+    .add(HUD.result.querySelector('h1'), { opacity: [0, 1], letterSpacing: ['24px', '10px'], duration: 900 }, 40)
+    .add(HUD.result.querySelector('p'), { opacity: [0, 1], translateY: ['12px', '0px'], duration: 620 }, 260);
+}
+function introIn() {
+  if (!MOTION.on) return;
+  createTimeline({ defaults: { duration: 620, ease: 'outCubic' } })
+    .add('#topbar .panel', { opacity: [0, 1], translateY: ['-20px', '0px'], delay: stagger(90) }, 60)
+    .add('#log', { opacity: [0, 1], translateX: ['-24px', '0px'] }, 200)
+    .add('#help', { opacity: [0, 1], translateX: ['20px', '0px'] }, 300)
+    .add('#views button', { opacity: [0, 1], translateY: ['16px', '0px'], delay: stagger(55) }, 340);
+}
+/* 终局：日色转暖、雾转暮色。three adapter 让 Light/Fog/Color 直接当动画目标 */
+function duskFall() {
+  if (!MOTION.on) return;
+  animate(sun, { intensity: 1.75, duration: 2600, ease: 'inOutSine' });
+  if (adapterOK) {
+    animate(sun, { color: '#ffd6a0', duration: 2600, ease: 'inOutSine' });
+    animate(scene.fog, { color: '#c49b74', duration: 2600, ease: 'inOutSine' });
+  }
+}
 
 
 function canvasTexture(w, h, draw, repeat) {
@@ -873,10 +991,15 @@ class Unit {
     for (const s of this.soldiers) if (s.alive) a.push(s);
     return a;
   }
-  kill(s) {
+  /* 伤亡唯一收口：hx/hz 为弹丸来向，force 为冲击强度（1=普通枪弹，2=炮弹近失） */
+  kill(s, hx, hz, force) {
     if (!s.alive) return;
+    /* 溃兵离场后 state 已是 'gone'（aliveSoldiers 只筛 alive，所以仍可能被抽中），
+       这份"离场的人不再喷血"的判断必须在这里做——下面两行就会把 state 改成 'down' */
+    const wasGone = s.state === 'gone';
     s.alive = false; s.state = 'down'; s.fallT = 0; s.spd = 0; s.target = null;
     this.men--;
+    if (!wasGone) bloodBurst(s, hx, hz, force);
     const slot = this.soldierSlot[s.si];
     if (slot !== undefined && slot >= 0) {
       let last = this.slots.length - 1;
@@ -1170,6 +1293,68 @@ const shardPool = new ParticlePool({
   maxSize: 0.9, hdr: 2.3, tint: [1, 0.88, 0.66], tintVar: 0.16, bright: [0.85, 1.15],
   wind: 0.35, buoy: -15, drag: 0.5
 });
+
+/* ---------- 飞溅血肉（血雾 / 血滴 / 地面血渍） ----------
+   伤亡的唯一收口是 Unit.kill()，所以血液效果只挂那一个点：
+   齐射、炮弹、破片、骑兵冲击、白刃战、航弹自动全覆盖，不需要各自调一遍。
+   两个池的随机数全走 vrnd —— 改血的颜色/数量不会挪动战局随机流。
+   血是暗红、偏少于地面的浅土色，所以在浅草地上读作"暗下去"而不是亮斑。 */
+/* WebGPU 路径没有逐实例 alpha（premul 的 onBeforeCompile 失效），一坨血雾会一直按贴图满 alpha
+   画到 ttl 结束，读作地上的一块黑斑；把贴图 alpha 压到 0.36 就只剩一层淡红。 */
+const GOREA = MODE === 'webgl' ? 1 : 0.45;
+const bloodTex = puffTex(192, 0x6B1D02, [112, 17, 16], 0.8 * GOREA, 0.1);
+const dropTex = canvasTexture(32, 32, (g, w, h) => {
+  const r = mulberry32(0x5B100D);
+  for (let i = 0; i < 5; i++) {
+    const x = w / 2 + (r() - 0.5) * 12, y = h / 2 + (r() - 0.5) * 12, rad = 2 + r() * 3.4;
+    const rg = g.createRadialGradient(x, y, 0, x, y, rad);
+    /* 血滴也是 premul 池：WebGPU 路径没有逐实例 alpha，贴图 alpha 要跟着 GOREA 一起降，
+       否则一滴滴血会以 0.95 的不透明度挂到 ttl 结束，变成一地不褪的黑点 */
+    rg.addColorStop(0, 'rgba(104,13,11,' + (0.95 * GOREA).toFixed(3) + ')');
+    rg.addColorStop(0.6, 'rgba(78,10,9,' + (0.66 * GOREA).toFixed(3) + ')');
+    rg.addColorStop(1, 'rgba(54,7,6,0)');
+    g.fillStyle = rg; g.beginPath(); g.arc(x, y, rad, 0, TAU); g.fill();
+  }
+});
+const bloodPool = new ParticlePool({
+  count: 260, tex: bloodTex, blending: THREE.NormalBlending, rng: vrnd, premul: true,
+  maxSize: 2.6, tint: [1, 1, 1], tintVar: 0.12, bright: [0.82, 1.14],
+  wind: 0.15, buoy: -2.4, drag: 1.7, groundFade: 0.4
+});
+const dropPool = new ParticlePool({
+  count: 420, tex: dropTex, blending: THREE.NormalBlending, rng: vrnd, premul: true,
+  maxSize: 0.42, tint: [1, 1, 1], tintVar: 0.14, bright: [0.85, 1.15],
+  wind: 0.1, buoy: -15, drag: 0.4
+});
+/* hx,hz = 弹丸来向（由收口处传入）；缺省时按随机方向喷，用于爆炸破片等无方向伤亡。
+   已退出战场的溃兵（state==='gone'）由 kill() 在改状态之前判掉——这里状态已经是 'down'，
+   放在这里判是永远不成立的死分支。 */
+function bloodBurst(s, hx, hz, force) {
+  const f = force === undefined ? 1 : clamp(force, 0.5, 2.2);
+  let dx = hx || 0, dz = hz || 0;
+  const d = Math.hypot(dx, dz);
+  if (d > 1e-4) { dx /= d; dz /= d; }
+  else { const a = vrnd() * TAU; dx = Math.cos(a); dz = Math.sin(a); }
+  const y = s.y + 0.92 + (vrnd() - 0.5) * 0.24;
+  /* 血雾要"薄":小块、半透、短命，否则读成一朵红花而不是喷溅 */
+  for (let i = 0, n = 3 + (vrnd() < 0.5 ? 1 : 0); i < n; i++) {
+    bloodPool.emit(s.x + dx * 0.22 + (vrnd() - 0.5) * 0.3, y + (vrnd() - 0.5) * 0.3,
+      s.z + dz * 0.22 + (vrnd() - 0.5) * 0.3,
+      0.16, 0.62 + vrnd() * 0.46, 0.3 + vrnd() * 0.22, 0.62, 0,
+      0.7 + vrnd() * 1.5, dx * 1.9 * f + (vrnd() - 0.5) * 1.2, dz * 1.9 * f + (vrnd() - 0.5) * 1.2);
+  }
+  /* 血滴是主体：更小、更多、带重力抛物线，落地留痕 */
+  const base = Math.atan2(dz, dx);
+  for (let i = 0, n = 4 + Math.round(vrnd() * 4 * f); i < n; i++) {
+    const a = base + (vrnd() - 0.5) * (1 + 0.55 * f), sp = 2.2 + vrnd() * 4.4 * f;
+    dropPool.emit(s.x + dx * 0.18, y + (vrnd() - 0.5) * 0.55, s.z + dz * 0.18,
+      0.15, 0.09, 0.45 + vrnd() * 0.45, 1, 0,
+      1.2 + vrnd() * 2.2, Math.cos(a) * sp, Math.sin(a) * sp);
+  }
+  /* 不再往 flashPool（HDR 加色）里塞命中火花：它 hdr≈2.4，越过了 bloom 阈值 1.3，
+     一个人倒下会炸出一团橙色火球，10 个人同时倒下就是一片燃烧弹。血的读法靠暗红本身。 */
+  if (vrnd() < 0.26) addStain(s.x + dx * 0.7, s.z + dz * 0.7, 0.55 + vrnd() * 0.75);
+}
 let moteT = 0;
 function motesUpdate(dt) {
   moteT -= dt;
@@ -1235,10 +1420,60 @@ function addCrater(x, z, size) {
   craterMesh.instanceMatrix.needsUpdate = true;
 }
 
+/* 血渍：和弹坑/烧灼一样贴地，但 polygonOffset 比 scorch(-1) 浅，永远压在它们下面 */
+const stainMat = new THREE.MeshStandardMaterial({
+  map: canvasTexture(96, 96, (g, w, h) => {
+    const r = mulberry32(0x71B100D);
+    for (let i = 0; i < 26; i++) {
+      const a = r() * TAU, rad = Math.pow(r(), 0.6) * w * 0.42;
+      const x = w / 2 + Math.cos(a) * rad, y = h / 2 + Math.sin(a) * rad * 0.92;
+      const rr = 2 + r() * 9 * (1 - rad / (w * 0.5));
+      const rg = g.createRadialGradient(x, y, 0, x, y, rr);
+      rg.addColorStop(0, 'rgba(74,12,10,.66)');
+      rg.addColorStop(0.55, 'rgba(58,10,9,.38)');
+      rg.addColorStop(1, 'rgba(48,8,8,0)');
+      g.fillStyle = rg; g.beginPath(); g.arc(x, y, rr, 0, TAU); g.fill();
+    }
+  }),
+  transparent: true, depthWrite: false, roughness: 1,
+  polygonOffset: true, polygonOffsetFactor: -0.4, polygonOffsetUnits: -0.4
+});
+const STAIN_COUNT = 40;
+const stainMesh = new THREE.InstancedMesh(craterGeo, stainMat, STAIN_COUNT);
+stainMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+stainMesh.frustumCulled = false;
+/* 两个贴花都是 depthWrite:false 的透明网格、都挂在世界原点，renderOrder 相同时
+   three 只能退回 id 次序（后建的画在上面）。polygonOffset 只作用于与地面的深度，排不了贴花之间，
+   所以必须显式给 -1 才真的压在 scorch(0)/crater(1) 下面 */
+stainMesh.renderOrder = -1;
+for (let i = 0; i < STAIN_COUNT; i++) stainMesh.setMatrixAt(i, _pm.makeScale(0, 0, 0));
+stainMesh.instanceMatrix.needsUpdate = true;
+scene.add(stainMesh);
+let stainIdx = 0;
+/* 必须贴在"人站的那层面"而不是 terrainH：战壕/胸墙/障碍都算在 groundY 里，
+   而伤亡绝大多数发生在战壕里——用 terrainH 的话血渍会落到 0.04~1.3 m 以下的土工面下，被深度剔掉。 */
+let stainLift = 0;   // 已落血渍相对 terrainH 的最大抬升 = 该点 workH/obstacleH（>0 才说明贴花贴在了土工面上）
+function addStain(x, z, size) {
+  const i = stainIdx++ % STAIN_COUNT;
+  const sy = groundY(x, z) + 0.02;
+  stainLift = Math.max(stainLift, +(sy - 0.02 - terrainH(x, z)).toFixed(3));
+  _craterQ.copy(CRATER_X).multiply(_craterS.setFromAxisAngle(PZ, vrnd() * TAU));
+  stainMesh.setMatrixAt(i, _pm.compose(_pp.set(x, sy, z), _craterQ, _ps.set(size, size, 1)));
+  stainMesh.instanceMatrix.needsUpdate = true;
+}
+
 /* 统一的落地爆炸与爆炸伤亡：炮弹、航弹、坠机共用同一套参数与池 */
 function explodeGround(x, z, power) {
   const gY = terrainH(x, z);
   boomPool.emit(x, gY + 1.0 * power, z, 1.2 * power, 3.4 * power, 0.16, 1, 0, 0.6 * power, 0, 0);
+  /* 冲击力：低角度土浪环——贴地向外扒开的扬尘，爆点才读作"被砸出来的"而不是"冒出来的" */
+  const nring = Math.max(8, Math.round(10 * power));
+  for (let i = 0; i < nring; i++) {
+    const a = vrnd() * TAU, sp = 5 + vrnd() * 9 * power;
+    dustPool.emit(x + Math.cos(a) * 1.1, gY + 0.28 + vrnd() * 0.7, z + Math.sin(a) * 1.1,
+      0.7, 2.4 + vrnd() * 1.2, 0.66 + vrnd() * 0.5, 0.55, 0,
+      1.1 + vrnd() * 1.5, Math.cos(a) * sp, Math.sin(a) * sp);
+  }
   /* 破片/火星：高初速抛出、带重力落回地面（伤害结算见 blastCasualties 的破片环） */
   const nf = Math.max(8, Math.round(16 * power));
   for (let i = 0; i < nf; i++) {
@@ -1261,6 +1496,7 @@ function explodeGround(x, z, power) {
   }
   addCrater(x, z, (5 + vrnd() * 3.5) * power);
   addScorch(x, z, (7 + vrnd() * 4.5) * power);
+  impactFeedback(power, x, z);
 }
 function blastCasualties(foe, x, z, radius, cap, chance) {
   let hits = 0;
@@ -1268,7 +1504,7 @@ function blastCasualties(foe, x, z, radius, cap, chance) {
     if (u.kind === 'art' || u.men <= 0 || u.gone) continue;
     for (const s of u.aliveSoldiers()) {
       if (hits >= cap) break;
-      if (Math.hypot(s.x - x, s.z - z) < radius && rnd() < chance) { u.kill(s); hits++; }
+      if (Math.hypot(s.x - x, s.z - z) < radius && rnd() < chance) { u.kill(s, s.x - x, s.z - z, 1.6); hits++; }
     }
   }
   return hits;
@@ -1665,10 +1901,11 @@ function blog(text, color) {
   const d = document.createElement('div');
   d.className = 'panel';
   d.textContent = text;
-  if (color) d.style.color = color;
+  if (color) { d.style.color = color; d.style.borderLeftColor = color; }
   HUD.log.prepend(d);
   while (HUD.log.children.length > 7) HUD.log.lastChild.remove();
   B.entries.push({ t: +B.t.toFixed(1), text });
+  logIn(d);
 }
 /* ==================== 战壕 · 高射炮 · 航空兵 ====================
    全部走物理步进（simulate），随机数严格分流：
@@ -2629,8 +2866,21 @@ function volley(u) {
   }
   const kills = Math.max(0, Math.round((1 + rnd() * 2.4) * eff * (1 - 0.55 * coverAgainst(tgt, u.cz))));
   const pool = tgt.aliveSoldiers();
+  const bdx = tgt.cx - u.cx, bdz = tgt.cz - u.cz;
   for (let i = 0; i < kills && pool.length; i++) {
-    tgt.kill(pool.splice(Math.floor(rnd() * pool.length), 1)[0]);
+    tgt.kill(pool.splice(Math.floor(rnd() * pool.length), 1)[0], bdx, bdz, 1);
+  }
+  /* 弹药冲击力：弹丸落点扬尘。即使这一轮没打中人，目标线前后也要被打出烟尘，
+     否则"齐射"只看得见枪口火光、看不见打在哪儿。 */
+  const ux = bdx, uz = bdz, ul = Math.hypot(ux, uz) || 1;
+  const spanX = Math.max(14, tgt.files * tgt.sx * 1.5);
+  for (let i = 0, n = 4 + Math.round(vrnd() * 3); i < n; i++) {
+    const over = (vrnd() - 0.25) * 7;
+    const px = tgt.cx + (vrnd() - 0.5) * spanX + (ux / ul) * over;
+    const pz = tgt.cz + (vrnd() - 0.5) * 5 + (uz / ul) * over;
+    dustPool.emit(px, groundY(px, pz) + 0.22, pz,
+      0.32, 1.0 + vrnd() * 0.7, 0.42 + vrnd() * 0.36, 0.5, 0,
+      1.5 + vrnd() * 2.1, (vrnd() - 0.5) * 1.7, (vrnd() - 0.5) * 1.7);
   }
   tgt.shock = clamp(tgt.shock + 0.008 * kills, 0, 0.2);
   blog(u.name + ' 齐射 — 命中 ' + kills + ' 人（' + Math.round(d) + ' m）', u.army.side.css);
@@ -2640,7 +2890,7 @@ function cavalryImpact(cav, inf) {
   if (!inf || inf.men <= 0) return;
   const pool = inf.aliveSoldiers();
   const kills = Math.min(pool.length, 5 + Math.floor(rnd() * 6));
-  for (let i = 0; i < kills; i++) inf.kill(pool.splice(Math.floor(rnd() * pool.length), 1)[0]);
+  for (let i = 0; i < kills; i++) inf.kill(pool.splice(Math.floor(rnd() * pool.length), 1)[0], inf.cx - cav.cx, inf.cz - cav.cz, 1.4);
   inf.shock = clamp(inf.shock + 0.24, 0, 0.45);
   cav.impact = true;
   const sx = (cav.cx + inf.cx) * 0.5, sz = (cav.cz + inf.cz) * 0.5;
@@ -2716,7 +2966,7 @@ function soldierUpdate(s, dt) {
       const t = s.target;
       if (t && t.alive && Math.hypot(t.x - s.x, t.z - s.z) < 1.8) {
         if (rnd() < (s.mounted ? 0.12 : 0.06)) {
-          t.unit.kill(t);
+          t.unit.kill(t, t.x - s.x, t.z - s.z, s.mounted ? 1.3 : 1);
           s.target = null;
           flashPool.emit(t.x, t.y + 1.1, t.z, 0.5, 0.1, 0.08, 0.8, 0, 0, 0, 0);
         }
@@ -2767,6 +3017,8 @@ function endBattle(winner) {
   HUD.result.querySelector('p').innerHTML =
     '联邦军 ' + us + ' / ' + u0 + ' 人 &nbsp;·&nbsp; 邦联军 ' + cs + ' / ' + c0 + ' 人<br>交战用时 ' + B.t.toFixed(1) + ' 秒';
   blog('战斗结束 — ' + title, '#e8c470');
+  resultIn();
+  duskFall();
 }
 
 /* ---------- 航空兵：飞行模型 + 武器 ---------- */
@@ -3113,6 +3365,19 @@ function airProjectiles(dt) {
     if (t.life <= 0) { t.on = false; continue; }
     t.x += t.vx * dt; t.y += t.vy * dt; t.z += t.vz * dt;
     t.vy -= 4.5 * dt;
+    /* 曳光弹打在地上/胸墙上要留弹着点：一层扬尘 + 几点跳弹火星。
+       顺带把"打空了的曳光弹"从空中抹掉，弹幕才不会凭空消失在天上。 */
+    if (t.y <= groundY(t.x, t.z) + 0.1) {
+      t.on = false;
+      dustPool.emit(t.x, t.y + 0.2, t.z, 0.2, 0.8 + vrnd() * 0.5, 0.3, 0.45, 0,
+        1.3 + vrnd() * 1.4, (vrnd() - 0.5) * 1.2, (vrnd() - 0.5) * 1.2);
+      for (let k = 0, kn = 1 + (vrnd() < 0.5 ? 1 : 0); k < kn; k++) {
+        const a = vrnd() * TAU, sp = 1.4 + vrnd() * 2.6;
+        shardPool.emit(t.x, t.y + 0.1, t.z, 0.16, 0.06, 0.22 + vrnd() * 0.2, 1, 0,
+          2.2 + vrnd() * 2.4, Math.cos(a) * sp, Math.sin(a) * sp);
+      }
+      continue;
+    }
   }
   for (const b of bombs) {
     if (!b.on) continue;
@@ -3353,6 +3618,7 @@ function simulate(dt) {
   projectilesUpdate(dt);
   flashPool.update(dt); smokePool.update(dt); burstPool.update(dt);
   dustPool.update(dt); boomPool.update(dt); motePool.update(dt); shardPool.update(dt);
+  bloodPool.update(dt); dropPool.update(dt);
   motesUpdate(dt);
   let melee = 0;
   for (const a of [U, C]) for (const u of a.units) if (u.state === 'melee') melee++;
@@ -3388,7 +3654,7 @@ function syncArmy(army) {
   }
 }
 
-let hudT = 0, bannerT = 0;
+let hudT = 0, bannerT = 0, lastPhase = null;
 function updateHUD(dt) {
   hudT -= dt;
   if (hudT > 0) return;
@@ -3406,6 +3672,7 @@ function updateHUD(dt) {
     h.mbar.style.width = (mor * 100).toFixed(0) + '%';
   }
   HUD.phase.textContent = { DEPLOY: '部署中', ADVANCE: '推进', FIRE: '火力准备', CHARGE: '冲锋', MELEE: '白刃战', END: '战斗结束' }[B.phase] || B.phase;
+  if (B.phase !== lastPhase) { lastPhase = B.phase; phasePulse(); }   // 阶段切换给一次缩放脉冲
   HUD.clock.textContent = B.t.toFixed(1) + ' s' + (B.paused ? ' · 暂停' : '');
   HUD.speed.textContent = '速度 ×' + B.speed;
   const airAlive = k => AIR.craft.filter(c => c.side === k && !c.dead).length + '/' + AIR.craft.filter(c => c.side === k).length;
@@ -3433,14 +3700,49 @@ const VIEWS = [
 ];
 let view = VIEWS[0];
 let autoA = 0.6;
-function setView(v) {
+/* 机位过渡：k 由 Anime.js 从 0 缓到 1，p0/t0 是按下按钮那一刻的镜头快照。
+   以前 setView 是硬切（瞬间跳到新机位），现在是一条 0.95 s 的 inOutQuart 运镜。 */
+const CAMT = {
+  k: 1,
+  p0: new THREE.Vector3(), p1: new THREE.Vector3(),
+  t0: new THREE.Vector3(), t1: new THREE.Vector3(),
+  f0: 48, f1: 48, anim: null
+};
+function applyCamTween() {
+  const k = CAMT.k;
+  camera.position.lerpVectors(CAMT.p0, CAMT.p1, k);
+  controls.target.lerpVectors(CAMT.t0, CAMT.t1, k);
+  camera.fov = lerp(CAMT.f0, CAMT.f1, k);
+  camera.updateProjectionMatrix();
+  controls.update();
+}
+function cancelCamTween() {
+  if (CAMT.anim) { CAMT.anim.cancel(); CAMT.anim = null; }
+}
+function setView(v, instant) {
   view = v;
+  const btn = [...HUD.views.children].find(b => b.dataset.id === v.id);
   [...HUD.views.children].forEach(b => b.classList.toggle('on', b.dataset.id === v.id));
-  if (!v.follow && !v.auto) {
-    camera.fov = v.fov || 48;
+  if (v.follow || v.auto) { cancelCamTween(); return; }
+  const f = v.fov || 48;
+  if (MOTION.on && !instant) {
+    if (btn) animate(btn, { scale: [0.9, 1], duration: 320, ease: 'outBack' });
+    cancelCamTween();
+    CAMT.p0.copy(camera.position); CAMT.t0.copy(controls.target); CAMT.f0 = camera.fov;
+    CAMT.p1.set(v.pos[0], v.pos[1], v.pos[2]);
+    CAMT.t1.set(v.tgt[0], v.tgt[1], v.tgt[2]);
+    CAMT.f1 = f; CAMT.k = 0;
+    CAMT.anim = animate(CAMT, {
+      k: 1, duration: 950, ease: 'inOutQuart',
+      onUpdate: applyCamTween, onComplete: () => { CAMT.anim = null; }
+    });
+  } else {
+    cancelCamTween();
+    camera.fov = f;
     camera.updateProjectionMatrix();
     camera.position.set(v.pos[0], v.pos[1], v.pos[2]);
     controls.target.set(v.tgt[0], v.tgt[1], v.tgt[2]);
+    controls.update();
   }
 }
 VIEWS.forEach((v, i) => {
@@ -3450,7 +3752,10 @@ VIEWS.forEach((v, i) => {
   b.onclick = () => setView(v);
   HUD.views.appendChild(b);
 });
-setView(VIEWS[0]);
+/* 用户一动鼠标就把运镜让出去，否则镜头动画会跟拖拽互相抢 */
+controls.addEventListener('start', () => cancelCamTween());
+setView(VIEWS[0], true);
+introIn();
 
 const _cam = new THREE.Vector3();
 const _tgt = new THREE.Vector3();
@@ -3489,6 +3794,9 @@ function camUpdate(dt) {
     camera.position.lerp(_cam, 1 - Math.exp(-dt * 1.1));
     controls.target.lerp(_tgt.set(0, 6, 0), 1 - Math.exp(-dt * 2));
   }
+  /* 跟拍/环绕机位每帧都要真的对准目标：OrbitControls 只在指针事件里 update()，
+     不在这里补一次，镜头会平移而朝向僵在切进来的那一帧 */
+  if (view.follow || view.auto) controls.update();
 }
 
 const clock = new THREE.Timer();
@@ -3515,6 +3823,16 @@ function loop() {
   vehSync();
   flashPool.sync(); smokePool.sync(); burstPool.sync();
   dustPool.sync(); boomPool.sync(); motePool.sync(); shardPool.sync();
+  bloodPool.sync(); dropPool.sync();
+  /* 震屏：渲染前叠加平移扰动并重新对准目标，渲完立刻还原位置与朝向，
+     绝不污染 camera 的真实状态（相机是渲染态，不是战局态） */
+  decayShake(raw);
+  const shaking = MOTION.shake.amp > 0.002;
+  if (shaking) {
+    camera.position.add(_shakeOff);
+    _shakeQ.copy(camera.quaternion);
+    camera.lookAt(controls.target);
+  }
   frames++; fpsT += raw;
   if (fpsT > 0.5) { fps = frames / fpsT; frames = 0; fpsT = 0; }
   if (renderer.info) renderer.info.reset();
@@ -3523,6 +3841,10 @@ function loop() {
     composer.render();
   } else {
     renderer.render(scene, camera);
+  }
+  if (shaking) {
+    camera.position.sub(_shakeOff);
+    camera.quaternion.copy(_shakeQ);
   }
 }
 renderer.setAnimationLoop(loop);
@@ -3538,7 +3860,7 @@ window.addEventListener('resize', () => {
 });
 
 window.addEventListener('keydown', e => {
-  if (e.code === 'Space') { B.paused = !B.paused; e.preventDefault(); }
+  if (e.code === 'Space') { B.paused = !B.paused; pausedBadge(B.paused); e.preventDefault(); }
   if (e.key >= '1' && e.key <= '7') setView(VIEWS[+e.key - 1]);
   if (e.key === '[' || e.key === ']') {
     let i = SPEEDS.indexOf(B.speed);
@@ -3605,8 +3927,9 @@ window.__battle = {
     }
     return null;
   },
-  camera: id => setView(VIEWS.find(v => v.id === id) || VIEWS[0]),
+  camera: id => setView(VIEWS.find(v => v.id === id) || VIEWS[0], true),
   freecam(px, py, pz, tx, ty, tz, fov) {
+    cancelCamTween();
     view = { id: 'free', label: '自由', fov: fov || 45 };
     [...HUD.views.children].forEach(b => b.classList.remove('on'));
     camera.fov = fov || 45;
@@ -3616,19 +3939,20 @@ window.__battle = {
     controls.update();
     return { pos: camera.position.toArray(), tgt: controls.target.toArray() };
   },
-  pause: v => { B.paused = !!v; },
+  pause: v => { B.paused = !!v; pausedBadge(B.paused); },
   speed: v => { B.speed = v; },
   fps: () => +fps.toFixed(1),
   particles() {
     const p = {
       flash: flashPool.alive(), smoke: smokePool.alive(), burst: burstPool.alive(),
-      dust: dustPool.alive(), boom: boomPool.alive(), mote: motePool.alive(), shard: shardPool.alive()
+      dust: dustPool.alive(), boom: boomPool.alive(), mote: motePool.alive(), shard: shardPool.alive(),
+      blood: bloodPool.alive(), drop: dropPool.alive()
     };
-    p.total = p.flash + p.smoke + p.burst + p.dust + p.boom + p.mote + p.shard;
+    p.total = p.flash + p.smoke + p.burst + p.dust + p.boom + p.mote + p.shard + p.blood + p.drop;
     return p;
   },
   pools(show) {
-    const list = [['flash', flashPool], ['smoke', smokePool], ['burst', burstPool], ['dust', dustPool], ['boom', boomPool], ['mote', motePool], ['shard', shardPool]];
+    const list = [['flash', flashPool], ['smoke', smokePool], ['burst', burstPool], ['dust', dustPool], ['boom', boomPool], ['mote', motePool], ['shard', shardPool], ['blood', bloodPool], ['drop', dropPool]];
     if (show) for (const p of list) p[1].mesh.visible = show.indexOf(p[0]) >= 0;
     return list.map(p => ({
       name: p[0], visible: p[1].mesh.visible, cap: p[1].mesh.count, alive: p[1].alive(),
@@ -3637,8 +3961,39 @@ window.__battle = {
       color: p[1].mesh.instanceColor ? p[1].mesh.instanceColor.count : null
     }));
   },
+  /* 动效/血肉层自检：anime 是否加载、three adapter 是否生效、震屏与曝光当前值、血渍落点数 */
+  ux() {
+    const el = document.getElementById('paused');
+    return {
+      anime: animeOK, adapter: adapterOK, motion: MOTION.on,
+      shake: +MOTION.shake.amp.toFixed(3),
+      exposure: +renderer.toneMappingExposure.toFixed(3),
+      camTween: !!CAMT.anim,
+      pausedBadge: el ? el.style.display : null,
+      impactOpacity: IMPACT_EL ? +(IMPACT_EL.style.opacity || 0) : null,
+      blood: bloodPool.alive(), drops: dropPool.alive(), stains: stainIdx,
+      trees: treeSpots.length, stainLift: stainLift,
+      logNodes: HUD.log.children.length,
+      sun: +sun.intensity.toFixed(3),
+      fog: '#' + scene.fog.color.getHexString(),
+      result: HUD.result.style.display + '/' + (HUD.result.style.opacity || '')
+    };
+  },
+  /* 视觉验收：在镜头目标处喷 n 次血（只走 vrnd，不碰战局） */
+  gore(n) {
+    const cx = controls.target.x, cz = controls.target.z;
+    for (let i = 0, k = Math.max(1, n || 4); i < k; i++) {
+      bloodBurst({ x: cx + (vrnd() - 0.5) * 6, y: groundY(cx, cz), z: cz + (vrnd() - 0.5) * 6, state: 'down', crew: false }, 1, 0.3, 1.6);
+    }
+    return this.particles();
+  },
+  /* 视觉验收：在镜头目标处触发一次冲击反馈（震屏 + 曝光 + 闪光） */
+  impact(power) {
+    impactFeedback(power || 1.2, controls.target.x, controls.target.z);
+    return this.ux();
+  },
   blend(id, mode) {
-    const p = { flash: flashPool, smoke: smokePool, burst: burstPool, dust: dustPool, boom: boomPool, mote: motePool, shard: shardPool }[id];
+    const p = { flash: flashPool, smoke: smokePool, burst: burstPool, dust: dustPool, boom: boomPool, mote: motePool, shard: shardPool, blood: bloodPool, drop: dropPool }[id];
     if (!p) return null;
     const m = p.mat;
     if (mode) {
