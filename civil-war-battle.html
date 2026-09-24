@@ -140,6 +140,10 @@ window.addEventListener('error', ev => fatal(ev.error || ev.message));
 window.addEventListener('unhandledrejection', ev => fatal(ev.reason));
 
 const TAU = Math.PI * 2;
+/* 战场尺度：布局距离（战线纵深、正面展开、机场/炮兵/障碍散布）统一乘 S。
+   注意：只放大"空间"，不放大人与物件的尺寸与战术距离（射程、杀伤半径、弹坑）——
+   否则等于把整个世界等比例放大，看起来毫无变化。 */
+const S = 4;
 const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
 const lerp = (a, b, t) => a + (b - a) * t;
 const smooth = t => { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); };
@@ -193,27 +197,28 @@ if (LOADING) LOADING.remove();
 const scene = new THREE.Scene();
 const FOG_COLOR = 0xcdbfa2;
 /* 雾的近端要落在战场与机场之外：近端 140 m 会把机场(150~260 m)与远处障碍洗成天空色 */
-scene.fog = new THREE.Fog(FOG_COLOR, 260, 1350);
+scene.fog = new THREE.Fog(FOG_COLOR, 200 * S, 750 * S);
 
-const camera = new THREE.PerspectiveCamera(48, window.innerWidth / window.innerHeight, 0.5, 2400);
-camera.position.set(0, 86, 205);
+const camera = new THREE.PerspectiveCamera(48, window.innerWidth / window.innerHeight, 0.5, 2400 * S);
+camera.position.set(0, 86 * S, 205 * S);
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.075;
 controls.minDistance = 12;
-controls.maxDistance = 520;
+controls.maxDistance = 520 * S;
 controls.maxPolarAngle = Math.PI / 2.06;
 controls.target.set(0, 5, 0);
 
 const SUN_DIR = new THREE.Vector3(0.52, 0.72, 0.34).normalize();
 const sun = new THREE.DirectionalLight(0xfff1d6, 2.6);
-sun.position.copy(SUN_DIR).multiplyScalar(240);
+sun.position.copy(SUN_DIR).multiplyScalar(240 * S);
 sun.castShadow = true;
-sun.shadow.mapSize.set(2048, 2048);
-sun.shadow.camera.left = -170; sun.shadow.camera.right = 170;
-sun.shadow.camera.top = 170; sun.shadow.camera.bottom = -170;
-sun.shadow.camera.near = 60; sun.shadow.camera.far = 560;
+/* 阴影范围随战场放大：2048 贴图在 ±680 m 上是 0.66 m/texel（糊成一片），故提到 4096 */
+sun.shadow.mapSize.set(4096, 4096);
+sun.shadow.camera.left = -170 * S; sun.shadow.camera.right = 170 * S;
+sun.shadow.camera.top = 170 * S; sun.shadow.camera.bottom = -170 * S;
+sun.shadow.camera.near = 60 * S; sun.shadow.camera.far = 560 * S;
 sun.shadow.bias = -0.0008;
 sun.shadow.normalBias = 0.07;
 sun.shadow.camera.updateProjectionMatrix();
@@ -347,14 +352,14 @@ function terrainBase(x, z) {
     + 0.55 * Math.sin((x + z) * 0.037 + 2.1)
     + 0.32 * Math.cos((x - z) * 0.055 - 1.1)
     + 0.20 * Math.sin(x * 0.088) * Math.sin(z * 0.079);
-  const dz = Math.max(Math.abs(z) - 94, 0), dx = Math.max(Math.abs(x) - 152, 0);
-  return n * 2.6 * smooth(Math.hypot(dx, dz) / 48);
+  const dz = Math.max(Math.abs(z) - 94 * S, 0), dx = Math.max(Math.abs(x) - 152 * S, 0);
+  return n * 2.6 * smooth(Math.hypot(dx, dz) / (48 * S));   // 战场内压平，外围按比例起坡
 }
 /* ---- 机场：跑道范围先在地形里压平，否则飞机是在起伏草地上滑跑/接地 ---- */
 /* 机场必须整个落在本军后方：跑道不得伸进战线/炮兵阵地，也不能占用观赏机位的空域。
    yaw = 起飞方向（0 朝 +z，π/2 朝 +x）；跑道长轴与它对齐 —— 机场整体转 90° 后
    跑道沿 x 铺开，两侧机场镜像，飞机改成朝侧翼起飞、升空后再转向战场。 */
-const AIRFIELD = { union: { x: 0, z: -185, yaw: Math.PI / 2 }, confederate: { x: 0, z: 185, yaw: -Math.PI / 2 } };
+const AIRFIELD = { union: { x: 0, z: -185 * S, yaw: Math.PI / 2 }, confederate: { x: 0, z: 185 * S, yaw: -Math.PI / 2 } };
 const PAD_X = 40, PAD_Z = 78, PAD_FADE = 30;
 /* 机场局部坐标 <-> 世界坐标（局部 +z 即起飞方向） */
 const afWorld = (A, lx, lz) => [A.x + lx * Math.cos(A.yaw) + lz * Math.sin(A.yaw),
@@ -399,7 +404,9 @@ const grassTex = canvasTexture(256, 256, (g, w, h) => {
   }
 }, 52);
 
-const groundGeo = new THREE.PlaneGeometry(780, 780, 128, 128);
+grassTex.wrapS = grassTex.wrapT = THREE.RepeatWrapping;
+grassTex.repeat.set(S, S);          // 保持与放大前相同的贴图密度
+const groundGeo = new THREE.PlaneGeometry(780 * S, 780 * S, 384, 384);   // 分段随尺度提高，跑道压平才不至于被网格吃掉
 groundGeo.rotateX(-Math.PI / 2);
 {
   const pos = groundGeo.attributes.position;
@@ -435,10 +442,10 @@ const dirtTex = canvasTexture(256, 256, (g, w, h) => {
   }
 });
 dirtTex.wrapS = dirtTex.wrapT = THREE.RepeatWrapping;
-dirtTex.repeat.set(26, 1);
-const road = new THREE.Mesh(new THREE.PlaneGeometry(780, 7.5), new THREE.MeshStandardMaterial({ map: dirtTex, roughness: 1 }));
+dirtTex.repeat.set(26 * S, 1);   // 道路也按尺度加密
+const road = new THREE.Mesh(new THREE.PlaneGeometry(780 * S, 7.5), new THREE.MeshStandardMaterial({ map: dirtTex, roughness: 1 }));
 road.rotation.x = -Math.PI / 2;
-road.position.set(0, 0.02, 15);
+road.position.set(0, 0.02, 15 * S);
 road.receiveShadow = true;
 scene.add(road);
 
@@ -447,8 +454,8 @@ postGeo.translate(0, 0.72, 0);
 const railGeo = new THREE.BoxGeometry(2.35, 0.09, 0.07);
 const woodMat = new THREE.MeshStandardMaterial({ color: 0x8a7a5c, roughness: 0.95 });
 const postSpots = [];
-for (let x = -150; x <= 150; x += 2.4) { if (x > -14 && x < 16) continue; postSpots.push([x, -78]); }
-for (let x = -120; x <= 120; x += 2.4) { if (x > -6 && x < 6) continue; postSpots.push([x, 76]); }
+for (let x = -150 * S; x <= 150 * S; x += 2.4 * S) { if (x > -14 * S && x < 16 * S) continue; postSpots.push([x, -78 * S]); }
+for (let x = -120 * S; x <= 120 * S; x += 2.4 * S) { if (x > -6 * S && x < 6 * S) continue; postSpots.push([x, 76 * S]); }
 const postMesh = new THREE.InstancedMesh(postGeo, woodMat, postSpots.length);
 const railMesh = new THREE.InstancedMesh(railGeo, woodMat, postSpots.length * 3);
 postMesh.castShadow = railMesh.castShadow = true;
@@ -475,16 +482,16 @@ postMesh.receiveShadow = railMesh.receiveShadow = true;
 scene.add(postMesh, railMesh);
 
 const treeSpots = [];
-for (let i = 0; i < 170; i++) {
-  const a = rnd() * TAU, rad = 158 + rnd() * 185;
+for (let i = 0; i < 170 * S * 2; i++) {
+  const a = rnd() * TAU, rad = (158 + rnd() * 185) * S;
   const x = Math.cos(a) * rad, z = Math.sin(a) * rad * 0.92;
-  if (Math.abs(z) < 94 && Math.abs(x) < 164) continue;
+  if (Math.abs(z) < 94 * S && Math.abs(x) < 164 * S) continue;
   if (onAirfield(x, z)) continue;                 // 机场净空：跑道与停机坪上不长树
   treeSpots.push([x, z, 0.75 + rnd() * 0.75]);
 }
-for (let i = 0; i < 30; i++) treeSpots.push([76 + rnd() * 92, 68 + rnd() * 92, 0.8 + rnd() * 0.6]);
-for (let i = 0; i < 26; i++) {
-  const x = -172 + rnd() * 84, z = -70 - rnd() * 92;
+for (let i = 0; i < 30 * S * 2; i++) treeSpots.push([(76 + rnd() * 92) * S, (68 + rnd() * 92) * S, 0.8 + rnd() * 0.6]);
+for (let i = 0; i < 26 * S * 2; i++) {
+  const x = (-172 + rnd() * 84) * S, z = (-70 - rnd() * 92) * S;
   if (onAirfield(x, z)) continue;
   treeSpots.push([x, z, 0.75 + rnd() * 0.7]);
 }
@@ -532,11 +539,11 @@ scene.add(trunkMesh, canopyMesh);
   const chimney = new THREE.Mesh(new THREE.BoxGeometry(1.3, 3, 1.3), stone);
   chimney.position.set(-4.4, 6.6, 0); farm.add(chimney);
   farm.traverse(o => { o.castShadow = true; o.receiveShadow = true; });
-  farm.position.set(104, terrainH(104, 96), 96);
+  farm.position.set(104 * S, terrainH(104 * S, 96 * S), 96 * S);
   farm.rotation.y = -0.5;
   scene.add(farm);
   const barn = new THREE.Mesh(new THREE.BoxGeometry(16, 7, 12), new THREE.MeshStandardMaterial({ color: 0x6b3f33, roughness: 0.95 }));
-  barn.position.set(133, terrainH(133, 112) + 3.5, 112);
+  barn.position.set(133 * S, terrainH(133 * S, 112 * S) + 3.5, 112 * S);
   barn.rotation.y = 0.35;
   barn.castShadow = barn.receiveShadow = true;
   scene.add(barn);
@@ -1315,11 +1322,14 @@ for (let i = 0; i < 26; i++) {
 }
 let shellIdx = 0;
 function fireShell(gun) {
+  /* 有坦克目标就优先打坦克——炮兵是唯一能拦住它的兵种 */
+  const tank = gun.tank && !gun.tank.dead ? gun.tank : null;
   const target = gun.targetUnit;
-  if (!target) return;
+  if (!tank && !target) return;
   const sh = shells[shellIdx++ % shells.length];
   const sx = gun.x, sz = gun.z;
-  const tx = target.cx + (rnd() - 0.5) * 14, tz = target.cz + (rnd() - 0.5) * 12;
+  const tx = (tank ? tank.x : target.cx) + (rnd() - 0.5) * (tank ? 8 : 14);
+  const tz = (tank ? tank.z : target.cz) + (rnd() - 0.5) * (tank ? 8 : 12);
   const dx = tx - sx, dz = tz - sz;
   const flat = Math.max(1, Math.hypot(dx, dz));
   const dist = Math.max(26, flat);
@@ -1373,13 +1383,20 @@ function projectilesUpdate(dt) {
       const hits = blastCasualties(foe, sh.x, sh.z, SHELL_KILL_RADIUS, 8, 0.85)
         + blastCasualties(foe, sh.x, sh.z, SHELL_FRAG_RADIUS, 4, 0.20);
       if (hits > 0) blog('炮弹落入 ' + foe.side.label + ' 队列 — ' + hits + ' 人倒下（含破片）', '#d9a05a');
+      /* 破片也能伤坦克：直接命中重、破片环轻 */
+      for (const t of ARMOR.tanks) {
+        if (t.dead || t.side === sh.side) continue;
+        const td = Math.hypot(t.x - sh.x, t.z - sh.z);
+        if (td < SHELL_KILL_RADIUS && rnd() < 0.55) damageTank(t, 110 + rnd() * 90, '炮兵直击');
+        else if (td < SHELL_FRAG_RADIUS && rnd() < 0.18) damageTank(t, 40 + rnd() * 50, '炮弹破片');
+      }
     }
   }
 }
 
 /* ---- 战壕关键尺寸（先声明：布阵时要把步兵放进壕沟，不能靠手调 z ----） ---- */
-const TRENCH_Z = { union: -46, confederate: 46 };
-const HALF_TRENCH = 92;
+const TRENCH_Z = { union: -46 * S, confederate: 46 * S };
+const HALF_TRENCH = 92 * S;
 const TRENCH_DITCH_DZ = -0.175;   // 壕沟底中心相对工程中心线的朝敌偏移
 const trenchWob = x => Math.sin(x * 0.19) * 0.5 + Math.sin(x * 0.066 + 2.1) * 0.95;
 const trenchFace = key => key === 'union' ? 1 : -1;
@@ -1387,8 +1404,8 @@ const trenchFace = key => key === 'union' ? 1 : -1;
 const trenchDitchZ = (key, x) => TRENCH_Z[key] + (trenchWob(x) + TRENCH_DITCH_DZ) * trenchFace(key);
 /* 出击口（散兵口）：开在各单位之间的空档上，胸墙/踏台/头木在这段压低成可跨越的缓坡。
    刻意不开在单位正面——那是掩护最不该被削弱的位置，而且口子里没有胸墙就没有掩护。 */
-const BREACH_X = [-41, -1, 38, 80];
-const BREACH_HALF = 12;
+const BREACH_X = [-368, -291, -194, -97, 0, 97, 194, 291];   // 开在各单位之间（间距 97 m）
+const BREACH_HALF = 16;
 function breachFactor(x) {
   let o = 0;
   for (const c of BREACH_X) o = Math.max(o, clamp(1 - Math.abs(x - c) / BREACH_HALF, 0, 1));
@@ -1460,24 +1477,24 @@ function workTraverse(kind, x, z) {
    掩体值进 coverAt（挡弹）。空间哈希网格保证逐士兵查询 O(1)。 */
 const ornd = mulberry32(0x0B57AC1E);
 const OBSTACLE_TYPES = [
-  { id: 'wall', h: 0.78, cover: 0.62, minR: 1.6, maxR: 2.6, count: 34 },
-  { id: 'log', h: 0.46, cover: 0.44, minR: 1.3, maxR: 2.1, count: 26 },
-  { id: 'hay', h: 0.72, cover: 0.28, minR: 1.1, maxR: 1.6, count: 22 },
-  { id: 'fence', h: 0.86, cover: 0.38, minR: 1.7, maxR: 2.8, count: 30 },
-  { id: 'rock', h: 0.62, cover: 0.50, minR: 1.0, maxR: 1.6, count: 26 }
+  { id: 'wall', h: 0.78, cover: 0.62, minR: 1.6, maxR: 2.6, count: 34 * 8 },
+  { id: 'log', h: 0.46, cover: 0.44, minR: 1.3, maxR: 2.1, count: 26 * 8 },
+  { id: 'hay', h: 0.72, cover: 0.28, minR: 1.1, maxR: 1.6, count: 22 * 8 },
+  { id: 'fence', h: 0.86, cover: 0.38, minR: 1.7, maxR: 2.8, count: 30 * 8 },
+  { id: 'rock', h: 0.62, cover: 0.50, minR: 1.0, maxR: 1.6, count: 26 * 8 }
 ];
 const obstacles = [];
 {
   const freeAt = (x, z) => {
-    if (Math.abs(Math.abs(z) - 46) < 13 && Math.abs(x) < 106) return false;  // 不压战壕与出发线
-    if (Math.abs(Math.abs(z) - 98) < 10 && Math.abs(x) < 62) return false;   // 不占用炮兵阵地
-    if (Math.abs(x) < 26 && Math.abs(z) < 22) return false;                  // 中央接触区留空
+    if (Math.abs(Math.abs(z) - 46 * S) < 40 && Math.abs(x) < 420) return false;  // 不压战壕与出发线
+    if (Math.abs(Math.abs(z) - 392) < 60 && Math.abs(x) < 520) return false;   // 不占用炮兵阵地
+    if (Math.abs(x) < 104 && Math.abs(z) < 88) return false;                  // 中央接触区留空
     return !onAirfield(x, z);
   };
   for (const T of OBSTACLE_TYPES) {
     let made = 0, guard = 0;
     while (made < T.count && guard++ < T.count * 50) {
-      const x = (ornd() - 0.5) * 310, z = (ornd() - 0.5) * 250;
+      const x = (ornd() - 0.5) * 310 * S, z = (ornd() - 0.5) * 250 * S;
       if (!freeAt(x, z)) continue;
       obstacles.push({
         kind: T.id, x, z, r: lerp(T.minR, T.maxR, ornd()), h: T.h, cover: T.cover,
@@ -1521,40 +1538,34 @@ function obstacleCover(x, z) {
   return clamp(c, 0, 0.72);
 }
 
-const ROSTER = {
-  union: {
-    infantry: [
-      { resolve: 0.06, name: '第 20 缅因团', title: '第20缅因', x: -60, z: -46, files: 14, ranks: 3, yaw: 0 },
-      { resolve: 0.06, name: '第 69 纽约团', title: '第69纽约', x: -20, z: -46, files: 14, ranks: 3, yaw: 0 },
-      { resolve: 0.06, name: '第 1 明尼苏达团', title: '第1明尼苏达', x: 21, z: -46, files: 14, ranks: 3, yaw: 0 },
-      { resolve: 0.06, name: '爱尔兰旅', title: '爱尔兰旅', x: 61, z: -46, files: 14, ranks: 3, yaw: 0 }
-    ],
-    cavalry: [
-      { resolve: 0.06, name: '第 6 骑兵团', title: '第6骑兵', x: -98, z: -58, files: 6, ranks: 2, yaw: 0, sx: 2.3, sz: 2.6 },
-      { resolve: 0.06, name: '第 1 骑兵团', title: '第1骑兵', x: 100, z: -58, files: 6, ranks: 2, yaw: 0, sx: 2.3, sz: 2.6 }
-    ],
-    artillery: [
-      { resolve: 0.06, name: '第 2 炮兵连', title: '第2炮兵连', x: -34, z: -98, guns: 3, yaw: 0 },
-      { resolve: 0.06, name: '第 5 炮兵连', title: '第5炮兵连', x: 38, z: -98, guns: 3, yaw: 0 }
-    ]
-  },
-  confederate: {
-    infantry: [
-      { resolve: -0.01, name: '第 1 弗吉尼亚团', title: '第1弗吉尼亚', x: 58, z: 46, files: 14, ranks: 3, yaw: Math.PI },
-      { resolve: -0.01, name: '第 4 阿拉巴马团', title: '第4阿拉巴马', x: 19, z: 46, files: 14, ranks: 3, yaw: Math.PI },
-      { resolve: -0.01, name: '第 2 密西西比团', title: '第2密西西比', x: -21, z: 46, files: 14, ranks: 3, yaw: Math.PI },
-      { resolve: -0.01, name: '石墙旅', title: '石墙旅', x: -61, z: 46, files: 14, ranks: 3, yaw: Math.PI }
-    ],
-    cavalry: [
-      { resolve: -0.01, name: '第 1 弗吉尼亚骑兵', title: '第1弗骑', x: 99, z: 58, files: 6, ranks: 2, yaw: Math.PI, sx: 2.3, sz: 2.6 },
-      { resolve: -0.01, name: '汉普顿军团', title: '汉普顿军团', x: -99, z: 58, files: 6, ranks: 2, yaw: Math.PI, sx: 2.3, sz: 2.6 }
-    ],
-    artillery: [
-      { resolve: -0.01, name: '华盛顿炮兵', title: '华盛顿炮兵', x: 30, z: 98, guns: 3, yaw: Math.PI },
-      { resolve: -0.01, name: '石墙炮兵', title: '石墙炮兵', x: -32, z: 98, guns: 3, yaw: Math.PI }
-    ]
-  }
+/* 阵容：每方 8 个步兵团沿放大后的正面展开（间距 97 m），两翼各 1 个骑兵团，
+   后方 2 个炮兵连；双方步兵互相错开 24 m（对着对方的间隙），接触更有咬合感。
+   步兵的 z 只需名义值——makeArmyUnits 会用 trenchDitchZ 把整队放进壕沟。 */
+const INF_NAMES = {
+  union: ['第 20 缅因团', '第 69 纽约团', '第 1 明尼苏达团', '爱尔兰旅', '第 2 威斯康星团', '第 19 印第安纳团', '第 5 新罕布什尔团', '第 8 俄亥俄团'],
+  confederate: ['第 1 弗吉尼亚团', '第 4 阿拉巴马团', '第 2 密西西比团', '石墙旅', '第 3 田纳西团', '第 6 北卡罗来纳团', '第 7 佐治亚团', '第 5 德克萨斯团']
 };
+const ROSTER = { union: { infantry: [], cavalry: [], artillery: [] }, confederate: { infantry: [], cavalry: [], artillery: [] } };
+for (const key of ['union', 'confederate']) {
+  const f = key === 'union' ? 1 : -1;                    // 朝敌方向
+  const yaw = f > 0 ? 0 : Math.PI, res = f > 0 ? 0.06 : -0.01;
+  INF_NAMES[key].forEach((n, i) => ROSTER[key].infantry.push({
+    resolve: res, name: n, title: n.replace(/\s/g, ''), x: (i - 3.5) * 97 + f * 12,
+    z: -46 * f, files: 14, ranks: 3, yaw
+  }));
+  ROSTER[key].cavalry.push(
+    { resolve: res, name: f > 0 ? '第 6 骑兵团' : '第 1 弗吉尼亚骑兵', title: f > 0 ? '第6骑兵团' : '第1弗骑',
+      x: -398, z: -232 * f, files: 6, ranks: 2, yaw, sx: 2.3, sz: 2.6 },
+    { resolve: res, name: f > 0 ? '第 1 骑兵团' : '汉普顿军团', title: f > 0 ? '第1骑兵团' : '汉普顿军团',
+      x: 398, z: -232 * f, files: 6, ranks: 2, yaw, sx: 2.3, sz: 2.6 }
+  );
+  ROSTER[key].artillery.push(
+    { resolve: res, name: f > 0 ? '第 2 炮兵连' : '华盛顿炮兵', title: f > 0 ? '第2炮兵连' : '华盛顿炮兵',
+      x: -168, z: -392 * f, guns: 2, yaw },
+    { resolve: res, name: f > 0 ? '第 5 炮兵连' : '石墙炮兵', title: f > 0 ? '第5炮兵连' : '石墙炮兵',
+      x: 168, z: -392 * f, guns: 2, yaw }
+  );
+}
 
 function buildArmy(key) {
   const roster = ROSTER[key];
@@ -1901,6 +1912,7 @@ class RigPool {
       if (d.dyn === 'yaw') P.local.rotation.set(0, dyn.yaw, 0);
       else if (d.dyn === 'barrel') P.local.rotation.set(-dyn.pitch, dyn.yaw, 0);
       else if (d.dyn === 'prop') P.local.rotation.set(0, 0, dyn.prop);
+      else if (d.dyn === 'wheel') P.local.rotation.set(dyn.wheel || 0, 0, 0);
       if (d.dyn) P.local.updateMatrix();
       _rigPart.multiplyMatrices(_rigRoot, P.local.matrix);
       P.mesh.setMatrixAt(idx, _rigPart);
@@ -2090,6 +2102,111 @@ const AA_PARTS = [
   }
 ];
 
+/* ---------- 一战载具：菱形重坦 / 轻型坦克 / 卡车 / 摩托（局部 +z 为车头方向） ----------
+   部件划分照旧：同材质且不各自转动的合并（重坦只剩 3 个部件），
+   但车轮必须能绕自身轴转 → 单独成部件并挂 dyn:'wheel'。 */
+const vehMat = {
+  armor: new THREE.MeshStandardMaterial({ color: 0xa8ad9c, roughness: 0.6, metalness: 0.32 }),
+  track: new THREE.MeshStandardMaterial({ color: 0x3a3832, roughness: 0.86, metalness: 0.3 }),
+  canvas: new THREE.MeshStandardMaterial({ color: 0xbcb086, roughness: 1 }),
+  gun: new THREE.MeshStandardMaterial({ color: 0x5c6166, roughness: 0.44, metalness: 0.68 })
+};
+const VEH_PAINT = { union: { body: [0.60, 0.66, 0.62] }, confederate: { body: [0.80, 0.73, 0.54] } };
+/* 履带：侧板 + 上下履带片 + 首尾包角（同一几何复用到左右两侧） */
+const trackLoopGeo = (() => {
+  const g = [box(0.44, 0.34, 7.6)];
+  for (let i = 0; i < 11; i++) {
+    g.push(at(box(0.52, 0.16, 0.5), 0, 0.66, -3.4 + i * 0.68));
+    g.push(at(box(0.52, 0.16, 0.5), 0, -0.66, -3.4 + i * 0.68));
+  }
+  g.push(at(box(0.5, 0.62, 0.6), 0, 0.28, 3.85));
+  g.push(at(box(0.5, 0.62, 0.6), 0, 0.28, -3.85));
+  return mergeGeometries(g);
+})();
+/* 菱形重坦（Mark 系列轮廓）：车体+前后面板+指挥塔+侧炮塔+短炮（合并成一个部件） */
+const TANK_H_PARTS = [
+  {
+    id: 'hull', mat: 'armor', paint: 'body', pos: [0, 0, 0], geo: mergeGeometries([
+      at(box(2.5, 1.45, 6.2), 0, 1.55, 0),
+      at(box(2.5, 1.15, 3.3).rotateX(-0.30), 0, 1.2, 2.35),
+      at(box(2.5, 1.15, 2.7).rotateX(0.30), 0, 1.2, -2.3),
+      at(box(1.9, 1.0, 2.0), 0, 2.35, 1.05),
+      at(box(2.44, 0.5, 3.0), 0, 2.42, -0.4),
+      at(box(0.95, 1.05, 2.2), -1.78, 1.42, 0),          // 左侧炮塔
+      at(box(0.95, 1.05, 2.2), 1.78, 1.42, 0),           // 右侧炮塔
+      at(cyl(0.10, 0.12, 1.5, 8).rotateZ(Math.PI / 2), -2.5, 1.42, 0),
+      at(cyl(0.10, 0.12, 1.5, 8).rotateZ(Math.PI / 2), 2.5, 1.42, 0)
+    ])
+  },
+  { id: 'trackL', mat: 'track', pos: [-1.42, 0.9, 0], geo: trackLoopGeo },
+  { id: 'trackR', mat: 'track', pos: [1.42, 0.9, 0], geo: trackLoopGeo }
+];
+/* 轻型坦克（雷诺 FT 风格）：车体+尾撑+炮塔（炮塔可转 → dyn:'yaw'）+ 履带 */
+const TANK_L_PARTS = [
+  {
+    id: 'hull', mat: 'armor', paint: 'body', pos: [0, 0, 0], geo: mergeGeometries([
+      at(box(1.7, 0.95, 3.6), 0, 1.0, 0),
+      at(box(1.5, 0.5, 0.9), 0, 1.2, 1.9),
+      at(box(0.16, 0.16, 1.9).rotateX(0.5), 0, 0.55, -2.5),
+      at(box(1.5, 0.42, 0.35), 0, 0.45, -3.2),
+      at(box(0.55, 0.55, 0.5), -0.72, 0.45, -3.2),
+      at(box(0.55, 0.55, 0.5), 0.72, 0.45, -3.2)
+    ])
+  },
+  {
+    id: 'turret', mat: 'armor', paint: 'body', dyn: 'yaw', pos: [0, 1.42, 0.35], geo: mergeGeometries([
+      at(cyl(0.62, 0.66, 0.62, 10), 0, 0.31, 0),
+      at(cyl(0.09, 0.11, 1.5, 8).rotateX(Math.PI / 2), 0, 0.3, 0.95)
+    ])
+  },
+  { id: 'trackL', mat: 'track', pos: [-0.98, 0.42, 0], geo: trackLoopGeo },
+  { id: 'trackR', mat: 'track', pos: [0.98, 0.42, 0], geo: trackLoopGeo }
+];
+/* 卡车：车头+货厢（帆布篷）+ 六轮（dyn:'wheel' 一起转） */
+const TRUCK_PARTS = [
+  {
+    id: 'body', mat: 'armor', paint: 'body', pos: [0, 0, 0], geo: mergeGeometries([
+      at(box(2.0, 0.9, 1.5), 0, 0.82, 2.5),
+      at(box(1.7, 0.55, 0.5), 0, 1.5, 2.15),
+      at(box(2.2, 0.4, 6.0), 0, 0.62, -0.6),
+      at(box(1.9, 0.9, 0.3), 0, 1.35, 3.15)
+    ])
+  },
+  { id: 'canvas', mat: 'canvas', pos: [0, 0, 0], geo: mergeGeometries([
+    at(box(2.1, 1.25, 3.6), 0, 1.5, -0.9),
+    at(cyl(1.05, 1.05, 3.6, 10, 1, false, 0, Math.PI).rotateZ(Math.PI / 2), 0, 1.55, -0.9)
+  ]) },
+  /* 每个轮轴一个部件：部件原点落在轴线上，左右轮只差 x 偏移——
+     绕 x 旋转时左右轮心不动、轮缘自转（合并成一个部件就会绕车心乱转） */
+  { id: 'axleF', mat: 'track', dyn: 'wheel', pos: [0, 0.52, 2.3], geo: mergeGeometries([
+    at(cyl(0.52, 0.52, 0.34, 10).rotateZ(Math.PI / 2), -1.15, 0, 0),
+    at(cyl(0.52, 0.52, 0.34, 10).rotateZ(Math.PI / 2), 1.15, 0, 0)
+  ]) },
+  { id: 'axleM', mat: 'track', dyn: 'wheel', pos: [0, 0.52, -1.1], geo: mergeGeometries([
+    at(cyl(0.52, 0.52, 0.34, 10).rotateZ(Math.PI / 2), -1.15, 0, 0),
+    at(cyl(0.52, 0.52, 0.34, 10).rotateZ(Math.PI / 2), 1.15, 0, 0)
+  ]) },
+  { id: 'axleR', mat: 'track', dyn: 'wheel', pos: [0, 0.52, -2.2], geo: mergeGeometries([
+    at(cyl(0.52, 0.52, 0.34, 10).rotateZ(Math.PI / 2), -1.15, 0, 0),
+    at(cyl(0.52, 0.52, 0.34, 10).rotateZ(Math.PI / 2), 1.15, 0, 0)
+  ]) }
+];
+/* 摩托+骑手：车架/车把/骑手（合并）+ 双轮 */
+const MOTO_PARTS = [
+  {
+    id: 'body', mat: 'armor', paint: 'body', pos: [0, 0, 0], geo: mergeGeometries([
+      at(box(0.5, 0.5, 1.9), 0, 0.78, 0),
+      at(box(0.14, 0.5, 0.14), 0, 1.05, 0.75),
+      at(box(1.0, 0.12, 0.14), 0, 1.16, 0.72),
+      at(box(0.42, 0.55, 0.3), 0, 1.2, -0.15),
+      at(new THREE.SphereGeometry(0.16, 8, 6), 0, 1.62, -0.1),
+      at(box(0.5, 0.14, 0.18), 0, 1.8, -0.1)
+    ])
+  },
+  { id: 'wheelF', mat: 'track', dyn: 'wheel', pos: [0, 0.42, 0.95], geo: cyl(0.42, 0.42, 0.16, 10).rotateZ(Math.PI / 2) },
+  { id: 'wheelR', mat: 'track', dyn: 'wheel', pos: [0, 0.42, -0.95], geo: cyl(0.42, 0.42, 0.16, 10).rotateZ(Math.PI / 2) }
+];
+
 /* ---------- 曳光弹 / 航弹 ---------- */
 const TRACER_COUNT = 160;
 const tracerMesh = new THREE.InstancedMesh(
@@ -2136,8 +2253,8 @@ for (let i = 0; i < BOMB_COUNT; i++) bombs.push({ on: false, drawn: false, x: 0,
 let bombIdx = 0;
 
 /* ---------- 航空兵系统 ---------- */
-const FIGHTERS_PER = 3, BOMBERS_PER = 2, AA_PER = 3;
-const BOMB_RUN = 300;          // 轰炸航线单程长度（需 >> 弹道横抛，留出对准余量）
+const FIGHTERS_PER = 4, BOMBERS_PER = 3, AA_PER = 8;
+const BOMB_RUN = 900;          // 轰炸航线单程长度（需 >> 弹道横抛，留出对准余量）
 const fighterRig = new RigPool(FIGHTER_PARTS, FIGHTERS_PER * 2, airMat);
 const bomberRig = new RigPool(BOMBER_PARTS, BOMBERS_PER * 2, airMat);
 const aaRig = new RigPool(AA_PARTS, AA_PER * 2, airMat);
@@ -2150,7 +2267,7 @@ function lineZ(side) {
   const foe = armyOf(foeSideOf(side));
   let s = 0, n = 0;
   for (const u of foe.units) if (u.kind !== 'art' && u.men > 0 && !u.gone) { s += u.cz; n++; }
-  return n ? s / n : (side === 'union' ? 55 : -55);
+  return n ? s / n : (side === 'union' ? 220 : -220);
 }
 
 for (const side of ['union', 'confederate']) {
@@ -2165,8 +2282,8 @@ for (const side of ['union', 'confederate']) {
       idx: (side === 'union' ? 0 : FIGHTERS_PER) + i,
       x: px, y: PY + GND, z: pz, parkX: px, parkZ: pz,
       yaw: A.yaw, pitch: 0, roll: 0,
-      spd: 0, cruise: 46, vr: 31, hp: 46, maxHp: 46, prop: 0, fireT: 0,
-      orbit: (i / FIGHTERS_PER) * TAU + (side === 'union' ? 0 : 1.6), rad: 152 + i * 26, alt: 58 + i * 14,
+      spd: 0, cruise: 60, vr: 40, hp: 46, maxHp: 46, prop: 0, fireT: 0,
+      orbit: (i / FIGHTERS_PER) * TAU + (side === 'union' ? 0 : 1.6), rad: 304 + i * 52, alt: 58 + i * 14,
       launchAt: 1.6 + i * 2.6, state: 'parked', smokeT: 0, dead: false
     });
   }
@@ -2178,14 +2295,14 @@ for (const side of ['union', 'confederate']) {
       idx: (side === 'union' ? 0 : BOMBERS_PER) + i,
       x: px, y: PY + GND, z: pz, parkX: px, parkZ: pz,
       yaw: A.yaw, pitch: 0, roll: 0,
-      spd: 0, cruise: 34, vr: 23, hp: 92, maxHp: 92, prop: 0, fireT: 0,
+      spd: 0, cruise: 44, vr: 30, hp: 92, maxHp: 92, prop: 0, fireT: 0,
       orbit: i * 1.7, alt: 76 + i * 14,
-      lane: (i - (BOMBERS_PER - 1) / 2) * 130, run: BOMB_RUN, lat: 150, leg: 0,
+      lane: (i - (BOMBERS_PER - 1) / 2) * 260, run: BOMB_RUN, lat: 520, leg: 0,
       launchAt: 2.4 + i * 3.4, state: 'parked', dropT: 0, stick: 0, smokeT: 0, dead: false
     });
   }
   for (let i = 0; i < AA_PER; i++) {
-    const gx = (i - 1) * 76, gz = side === 'union' ? -113 : 113;
+    const gx = (i - (AA_PER - 1) / 2) * 97, gz = -452 * (side === 'union' ? 1 : -1);
     AIR.guns.push({
       rig: aaRig, idx: (side === 'union' ? 0 : AA_PER) + i, side,
       x: gx, y: terrainH(gx, gz), z: gz, yaw: side === 'union' ? 0 : Math.PI, pitch: 0.5,
@@ -2195,6 +2312,55 @@ for (const side of ['union', 'confederate']) {
 }
 for (const a of AIR.craft) a.rig.paint(a.idx, AIR_PAINT[a.side]);
 for (const g of AIR.guns) g.rig.paint(g.idx, AIR_PAINT[g.side]);
+
+/* ---------- 装甲与摩托化部队 ----------
+   坦克不进 U/C.units（所以排枪打不到它），只有炮弹/航弹能伤它；
+   它靠"装甲恐惧"逼散敌方步兵，是唯一能靠自重压过胸墙的单位。 */
+const ARMOR = { tanks: [], trucks: [], motos: [], lost: { union: 0, confederate: 0 } };
+const tankHRig = new RigPool(TANK_H_PARTS, 4, vehMat);
+const tankLRig = new RigPool(TANK_L_PARTS, 6, vehMat);
+const truckRig = new RigPool(TRUCK_PARTS, 6, vehMat);
+const motoRig = new RigPool(MOTO_PARTS, 4, vehMat);
+for (const side of ['union', 'confederate']) {
+  const f = side === 'union' ? 1 : -1;
+  const con = side === 'union' ? 'confederate' : 'union';
+  /* 重坦 2 / 轻坦 3 / 卡车 3 / 摩托 2（每方） */
+  for (let i = 0; i < 2; i++) {
+    const x = (i - 0.5) * 190, z = -232 * f;
+    ARMOR.tanks.push({
+      heavy: true, rig: tankHRig, idx: (side === 'union' ? 0 : 2) + i, side, foe: con,
+      x, y: groundY(x, z), z, yaw: f > 0 ? 0 : Math.PI, wheel: 0,
+      hp: 620, maxHp: 620, range: 320, reload: 2 + i, spd: 3.4, dead: false, state: 'advance'
+    });
+  }
+  for (let i = 0; i < 3; i++) {
+    const x = (i - 1) * 150, z = -268 * f;
+    ARMOR.tanks.push({
+      heavy: false, rig: tankLRig, idx: (side === 'union' ? 0 : 3) + i, side, foe: con,
+      x, y: groundY(x, z), z, yaw: f > 0 ? 0 : Math.PI, wheel: 0,
+      hp: 260, maxHp: 260, range: 200, reload: 1.2 + i * 0.4, spd: 5.0, dead: false, state: 'advance'
+    });
+  }
+  for (let i = 0; i < 3; i++) {
+    const x = (i - 1) * 170, z = -575 * f;
+    ARMOR.trucks.push({
+      rig: truckRig, idx: (side === 'union' ? 0 : 3) + i, side,
+      depotX: x, depotZ: z, x, y: groundY(x, z), z, yaw: f > 0 ? 0 : Math.PI,
+      wheel: 0, cargo: 0, t: 4 + i * 5, state: 'idle', target: null
+    });
+  }
+  for (let i = 0; i < 2; i++) {
+    const x = (i - 0.5) * 760, z = -250 * f;
+    ARMOR.motos.push({
+      rig: motoRig, idx: (side === 'union' ? 0 : 2) + i, side,
+      x, y: groundY(x, z), z, yaw: 0, wheel: 0, leg: 0,
+      p1: [x, -250 * f], p2: [x, 250 * f], t: i * 3
+    });
+  }
+}
+for (const t of ARMOR.tanks) t.rig.paint(t.idx, VEH_PAINT[t.side]);
+for (const v of ARMOR.trucks) v.rig.paint(v.idx, VEH_PAINT[v.side]);
+for (const m of ARMOR.motos) m.rig.paint(m.idx, VEH_PAINT[m.side]);
 
 const enemyOf = a => a === U ? C : U;
 const STEP = 1 / 60;
@@ -2239,12 +2405,12 @@ function aiUpdate(army, dt) {
     ai.flanker = flanker;
     if (flanker) blog(army.side.label + ' ' + flanker.name + ' 向侧翼迂回', army.side.css);
   }
-  ai.flankX = flanker ? clamp(flanker.cx + (flanker.army.key === 'union' ? 1 : -1) * 46, -86, 86) : 0;
+  ai.flankX = flanker ? clamp(flanker.cx + (flanker.army.key === 'union' ? 1 : -1) * 184, -86 * S, 86 * S) : 0;
   const rest = mine.filter(u => u !== ai.flanker && !ai.focusUnits.includes(u));
   const reserve = rest.length > 1 ? rest.slice().sort((a, b) => (b.men / b.maxMen) - (a.men / a.maxMen))[0] : null;
   /* 3) 预备队投入条件：敌方整体动摇 / 己方有人被打残 / 时间压力 */
   const foeMorale = theirs.reduce((s, e) => s + e.morale, 0) / theirs.length;
-  if (!ai.committed && (foeMorale < 0.62 || mine.some(u => u.men < u.maxMen * 0.45) || B.t > 26)) {
+  if (!ai.committed && (foeMorale < 0.62 || mine.some(u => u.men < u.maxMen * 0.45) || B.t > 60)) {
     ai.committed = true;
     if (reserve) blog(army.side.label + ' 投入预备队 — ' + reserve.name + ' 加入战线', army.side.css);
   }
@@ -2289,11 +2455,19 @@ function unitUpdate(u, dt) {
       for (const e of foe.units) {
         if (e.kind === 'art' || e.men <= 0 || e.gone || e.state === 'rout') continue;
         const d = Math.hypot(e.cx - gun.x, e.cz - gun.z);
-        if (d > 340) continue;
+        if (d > 340 * S) continue;
         const score = e.men * 0.55 + (1 - clamp(e.morale, 0, 1)) * 42 - d * 0.10 + (e.kind === 'cav' ? -14 : 0);
         if (score > bs) { bs = score; best = e; }
       }
       gun.targetUnit = best;
+      /* 就近选取敌方坦克作为优先目标 */
+      let tank = null, td = 1e9;
+      for (const t of ARMOR.tanks) {
+        if (t.dead || t.side === u.army.key) continue;
+        const d = Math.hypot(t.x - gun.x, t.z - gun.z);
+        if (d < td && d < 340 * S) { td = d; tank = t; }
+      }
+      gun.tank = tank;
       gun.recoil = Math.max(0, gun.recoil - dt * 1.9);
       gun.barrel.position.z = 0.1 - 0.42 * gun.recoil;
       for (const s of gun.crew) s.recoil = Math.max(0, s.recoil - dt * 3.4);
@@ -2320,11 +2494,11 @@ function unitUpdate(u, dt) {
   u.traverse = trav;
 
   if (u.state === 'rout') {
-    u.spd = 5.7 * trav;
+    u.spd = 5.6 * trav;
     const dir = u.army.key === 'union' ? -1 : 1;
     u.yaw = dir < 0 ? Math.PI : 0;
     u.cz += dir * u.spd * dt;
-    if (Math.abs(u.cz) > 168) {
+    if (Math.abs(u.cz) > 168 * S) {
       u.gone = true;
       u.banner.visible = false;
       for (const s of u.soldiers) if (s.alive) s.state = 'gone';
@@ -2332,7 +2506,7 @@ function unitUpdate(u, dt) {
     return;
   }
 
-  if (!u.target || u.target.men <= 0 || u.target.gone) orderAdvance(u);
+  if (!u.target || u.target.men <= 0 || u.target.gone || u.target.state === 'rout') orderAdvance(u);
   const tgt = u.target;
   const dist = tgt ? Math.hypot(tgt.cx - u.cx, tgt.cz - u.cz) : 9999;
   const toward = u.army.key === 'union' ? 1 : -1;
@@ -2344,9 +2518,9 @@ function unitUpdate(u, dt) {
       break;
     case 'advance':
       /* 集团 AI：预备队未投入前只守在自己的壕沟里；固守模式不推进到中线 */
-      if (u.order === 'reserve' && Math.abs(u.cz) > 54) { u.state = 'hold'; break; }
-      if (u.order === 'hold' && Math.abs(u.cz) > 40) { u.state = 'hold'; break; }
-      u.spd = 2.8 * trav;
+      if (u.order === 'reserve' && Math.abs(u.cz) > 54 * S) { u.state = 'hold'; break; }
+      if (u.order === 'hold' && Math.abs(u.cz) > 40 * S) { u.state = 'hold'; break; }
+      u.spd = 4.2 * trav;
       if (tgt) u.yaw = Math.atan2(tgt.cx - u.cx, tgt.cz - u.cz);
       if (u.order === 'flank' && u.army.ai) {   // 侧翼迂回：先横向靠拢，再压上
         u.cx += clamp(u.army.ai.flankX - u.cx, -1, 1) * 1.6 * trav * dt;
@@ -2376,7 +2550,7 @@ function unitUpdate(u, dt) {
       }
       break;
     case 'charge': {
-      u.spd = (u.kind === 'cav' ? 7.6 : 5.5) * trav;
+      u.spd = (u.kind === 'cav' ? 10.0 : 7.5) * trav;
       if (tgt) u.yaw = Math.atan2(tgt.cx - u.cx, tgt.cz - u.cz);
       const tx = tgt ? tgt.cx : u.cx;
       const tz = tgt ? tgt.cz : u.cz + 12 * toward;
@@ -2413,12 +2587,19 @@ function unitUpdate(u, dt) {
   const dmg = 1 - u.men / u.maxMen;
   u.shock = Math.max(0, u.shock - dt * 0.035);
   u.morale = clamp(1 + u.resolve - dmg * 1.65 - u.shock, 0, 1);
-  if (u.state === 'melee' && u.meleeT > 3 && (u.men / u.maxMen < 0.3 || u.morale < 0.22)) {
+  const routed = (u.state === 'melee' && u.meleeT > 3 && (u.men / u.maxMen < 0.3 || u.morale < 0.22))
+    || (u.state !== 'melee' && u.men / u.maxMen < 0.22);
+  if (routed) {
     u.state = 'rout';
-    blog(u.name + ' 阵型崩解，溃退！', '#e08a5a');
-  } else if (u.state !== 'melee' && u.men / u.maxMen < 0.22) {
-    u.state = 'rout';
-    blog(u.name + ' 伤亡过半，脱离战线！', '#e08a5a');
+    blog(u.name + (u.men / u.maxMen < 0.22 ? ' 伤亡过半，脱离战线！' : ' 阵型崩解，溃退！'), '#e08a5a');
+    /* 溃退冲击波：正面展开到 4× 宽之后，一队崩掉不会自动带动邻队，
+       整条线会打成 5 分钟的地方拉锯 → 给附近友军加一次衰减冲击，让战线成波次塌陷 */
+    const foe = enemyOf(u.army);
+    for (const t of u.army.units) {
+      if (t === u || t.kind === 'art' || !t.onField) continue;
+      const d = Math.hypot(t.cx - u.cx, t.cz - u.cz);
+      if (d < 300) t.shock = Math.min(1.2, t.shock + 0.26 * (1 - d / 300));
+    }
   }
 }
 function startCharge(u) {
@@ -2510,7 +2691,7 @@ function soldierUpdate(s, dt) {
   } else {
     u.slotWorld(u.soldierSlot[s.si], _v);
     desX = _v.x; desZ = _v.z;
-    cap = u.state === 'charge' ? 7.4 : u.state === 'rout' ? 6.4 : u.state === 'advance' ? 3.8 : 1.5;
+    cap = u.state === 'charge' ? 10.1 : u.state === 'rout' ? 6.6 : u.state === 'advance' ? 5.4 : 1.5;
     s.state = u.state === 'charge' ? 'charge' : u.state === 'fire' ? 'fire' : (u.spd > 0.15 ? 'walk' : 'idle');
   }
   const dx = desX - s.x, dz = desZ - s.z;
@@ -2568,7 +2749,7 @@ function directorUpdate(dt) {
   if (uAct === 0 && cAct === 0) endBattle('draw');
   else if (uAct === 0) endBattle('confederate');
   else if (cAct === 0) endBattle('union');
-  else if (B.t > 400) {
+  else if (B.t > 640) {
     const us = U.units.reduce((a, u) => a + u.men, 0), cs = C.units.reduce((a, u) => a + u.men, 0);
     endBattle(us > cs * 1.12 ? 'union' : cs > us * 1.12 ? 'confederate' : 'draw');
   }
@@ -2628,14 +2809,14 @@ function damageCraft(a, dmg, by) {
   }
 }
 function fighterUpdate(a, dt) {
-  let tgt = null, bd = 520;
+  let tgt = null, bd = 520 * 2;
   for (const c of AIR.craft) {
     if (c === a || c.dead || c.side === a.side || c.state === 'falling') continue;
     const d = Math.hypot(c.x - a.x, c.y - a.y, c.z - a.z);
     if (d < bd) { bd = d; tgt = c; }
   }
   /* 互相咬尾会一路飞出战场：离场心过远就脱离追击、回巡航航线 */
-  if (tgt && Math.hypot(a.x, a.z) > 290) tgt = null;
+  if (tgt && Math.hypot(a.x, a.z) > 290 * 2) tgt = null;
   if (tgt) {
     const tt = bd / 190;
     const cp = Math.cos(tgt.pitch);
@@ -2648,7 +2829,7 @@ function fighterUpdate(a, dt) {
     const dx = tgt.x - a.x, dy = tgt.y - a.y, dz = tgt.z - a.z;
     const dd = Math.max(1, Math.hypot(dx, dy, dz));
     const dot = (fx * dx + fy * dy + fz * dz) / dd;
-    if (!B.over && bd < 320 && dot > 0.93 && a.fireT <= 0) {
+    if (!B.over && bd < 320 * 2 && dot > 0.93 && a.fireT <= 0) {
       a.fireT = 0.30;
       const ox = a.x + fx * 3.6, oy = a.y + fy * 3.6, oz = a.z + fz * 3.6;
       const dev = 0.012 + bd / 9000, sp = 300;
@@ -2876,7 +3057,7 @@ function aaUpdate(dt) {
   for (const g of AIR.guns) {
     g.reload -= dt;
     const gy = g.y + 1.72;
-    let best = null, bd = 470;
+    let best = null, bd = 470 * 2;
     for (const a of AIR.craft) {
       if (a.dead || a.state === 'falling' || a.side === g.side) continue;
       const d = Math.hypot(a.x - g.x, a.y - gy, a.z - g.z);
@@ -2920,6 +3101,10 @@ function bombImpact(b) {
   const hits = blastCasualties(foe, b.x, b.z, BOMB_R, 3, 0.75)
     + blastCasualties(foe, b.x, b.z, BOMB_R * 2, 3, 0.18);
   if (hits > 0) blog('航空炸弹命中 ' + foe.side.label + ' 队列 — ' + hits + ' 人倒下（含破片）', '#e8a060');
+  for (const t of ARMOR.tanks) {
+    if (t.dead || t.side === b.side) continue;
+    if (Math.hypot(t.x - b.x, t.z - b.z) < BOMB_R * 2 && rnd() < 0.34) damageTank(t, 130 + rnd() * 150, '航弹');
+  }
 }
 function airProjectiles(dt) {
   for (const t of tracers) {
@@ -2985,10 +3170,176 @@ function airSync() {
   if (bTouched) bombMesh.instanceMatrix.needsUpdate = true;
 }
 
+/* ---------- 装甲 / 摩托化：更新与实例矩阵同步 ---------- */
+function reinforce(u, n) {
+  let k = 0;
+  for (const s of u.soldiers) {
+    if (k >= n) break;
+    if (s.alive) continue;
+    /* kill() 会压实槽位登记表，所以复活必须补回一个空槽——否则新兵会和别人挤在同一位置 */
+    let slot = -1;
+    for (let i = 0; i < u.slots.length; i++) if (u.slotSoldier[i] === -1) { slot = i; break; }
+    if (slot < 0) break;
+    s.alive = true; s.state = 'idle'; s.target = null; s.fallT = 0; s.tilt = 0;
+    u.slotSoldier[slot] = s.si;
+    u.soldierSlot[s.si] = slot;
+    k++;
+  }
+  if (k) u.men = Math.min(u.maxMen, u.men + k);
+  return k;
+}
+/* 挑一个最缺员、且仍在战线上的己方步兵单位 */
+function neediest(army) {
+  let best = null, bs = 0.95;
+  for (const u of army.units) {
+    if (u.kind !== 'inf' || !u.onField) continue;
+    const r = u.men / u.maxMen;
+    if (r < bs) { bs = r; best = u; }
+  }
+  return best;
+}
+function armorUpdate(dt) {
+  for (const t of ARMOR.tanks) {
+    if (t.dead) continue;
+    t.reload -= dt;
+    const foe = armyOf(t.foe);
+    let best = null, bd = 1e9;
+    for (const u of foe.units) {
+      if (u.kind === 'art' || u.men <= 0 || u.gone || u.state === 'rout') continue;
+      const d = Math.hypot(u.cx - t.x, u.cz - t.z);
+      if (d < bd) { bd = d; best = u; }
+    }
+    /* 装甲恐惧：附近敌步兵持续掉士气、友军略回升（一战坦克的战术核心） */
+    const terrR = t.heavy ? 78 : 54;
+    for (const a of [U, C]) {
+      const isFoe = a.key !== t.side;
+      for (const u of a.units) {
+        if (u.kind === 'art' || !u.onField) continue;
+        const d = Math.hypot(u.cx - t.x, u.cz - t.z);
+        if (d > terrR) continue;
+        const k = (1 - d / terrR) * dt;
+        u.shock = isFoe ? Math.min(1.4, u.shock + 2.4 * k) : Math.max(0, u.shock - 1.2 * k);
+      }
+    }
+    if (!best) continue;
+    let dy = Math.atan2(best.cx - t.x, best.cz - t.z) - t.yaw;
+    while (dy > Math.PI) dy -= TAU;
+    while (dy < -Math.PI) dy += TAU;
+    t.yaw += clamp(dy, -0.45 * dt, 0.45 * dt);
+    /* 推进：坦克自重能压过胸墙，过壕只减速约 35%（步兵是 72%） */
+    const pen = 1 - 0.38 * clamp(workH(t.x, t.z) / 1.3, 0, 1);
+    if (bd > t.range * 0.55) {
+      const s = t.spd * pen;
+      t.x += Math.sin(t.yaw) * s * dt;
+      t.z += Math.cos(t.yaw) * s * dt;
+      t.wheel += s * dt * 1.6;
+      t.state = 'advance';
+    } else t.state = 'engage';
+    t.y = groundY(t.x, t.z);
+    if (t.reload <= 0 && bd < t.range && B.t > 8) {
+      t.reload = (t.heavy ? 5.4 : 3.6) + rnd() * 1.4;
+      const sx = t.x + Math.sin(t.yaw) * 4.5, sz = t.z + Math.cos(t.yaw) * 4.5;
+      const gY = groundY(t.x, t.z) + 2.2;
+      const tx = best.cx + (rnd() - 0.5) * 26, tz = best.cz + (rnd() - 0.5) * 26;
+      flashPool.emit(sx, gY, sz, 2.2, 0.4, 0.08, 1, 0, 0, 0, 0);
+      for (let i = 0; i < 3; i++) {
+        smokePool.emit(sx + (vrnd() - 0.5), gY, sz + (vrnd() - 0.5),
+          0.6, 2.4, 1.6, 0.5, 0, 0.3, Math.sin(t.yaw) * 2, Math.cos(t.yaw) * 2);
+      }
+      explodeGround(tx, tz, t.heavy ? 1.05 : 0.7);
+      const hits = blastCasualties(foe, tx, tz, 7.5, 5, 0.8);
+      if (hits > 0) blog((t.heavy ? '重坦克' : '轻坦克') + ' 炮击 ' + foe.side.label + ' — ' + hits + ' 人倒下', '#c8a05a');
+    }
+  }
+}
+function damageTank(t, dmg, by) {
+  if (t.dead) return;
+  t.hp -= dmg;
+  if (t.hp <= 0) {
+    t.dead = true;
+    ARMOR.lost[t.side]++;
+    t.rig.paint(t.idx, { body: [0.14, 0.12, 0.11] });   // 残骸留场：整车涂黑当烧毁车体
+    explodeGround(t.x, t.z, t.heavy ? 1.9 : 1.4);
+    for (let i = 0; i < 6; i++) {
+      burstPool.emit(t.x + (vrnd() - 0.5) * 3, groundY(t.x, t.z) + 1 + i * 1.3, t.z + (vrnd() - 0.5) * 3,
+        2.0, 7.0, 3.0, 0.75, 0, 1.6, (vrnd() - 0.5), (vrnd() - 0.5));
+    }
+    blog('坦克被' + by + '击毁！', '#f0a070');
+  }
+}
+function motorUpdate(dt) {
+  for (const v of ARMOR.trucks) {
+    const army = armyOf(v.side);
+    if (v.state === 'idle') {
+      v.t -= dt;
+      if (v.t > 0 || B.over) continue;
+      const best = neediest(army);
+      if (best) { v.target = best; v.cargo = 14; v.state = 'march'; }
+      else v.t = 8;
+      continue;
+    }
+    /* 途中目标被打崩/撤离就换一个，换不到再返场 */
+    if (v.state === 'march' && (!v.target || !v.target.onField)) {
+      v.target = neediest(army);
+      if (!v.target) { v.state = 'return'; }
+    }
+    const back = v.state === 'return';
+    const tx = back ? v.depotX : (v.target ? v.target.cx : v.depotX);
+    const tz = back ? v.depotZ : (v.target ? v.target.cz : v.depotZ);
+    if (Math.hypot(tx - v.x, tz - v.z) < 24) {
+      if (!back && v.target) {
+        const k = reinforce(v.target, v.cargo);
+        if (k > 0) blog('卡车补充兵抵达 ' + v.target.name + ' — 补入 ' + k + ' 人', '#a8c86a');
+        v.state = 'return';
+      } else { v.state = 'idle'; v.t = 16; }
+      continue;
+    }
+    let dy = Math.atan2(tx - v.x, tz - v.z) - v.yaw;
+    while (dy > Math.PI) dy -= TAU;
+    while (dy < -Math.PI) dy += TAU;
+    v.yaw += clamp(dy, -1.3 * dt, 1.3 * dt);
+    const sp = back ? 7.5 : 9.5;
+    v.x += Math.sin(v.yaw) * sp * dt;
+    v.z += Math.cos(v.yaw) * sp * dt;
+    v.y = groundY(v.x, v.z);
+    v.wheel += sp * dt * 2.4;
+  }
+  for (const m of ARMOR.motos) {
+    const tgt = m.leg ? m.p2 : m.p1;
+    if (Math.hypot(tgt[0] - m.x, tgt[1] - m.z) < 18) { m.leg = 1 - m.leg; continue; }
+    let dy = Math.atan2(tgt[0] - m.x, tgt[1] - m.z) - m.yaw;
+    while (dy > Math.PI) dy -= TAU;
+    while (dy < -Math.PI) dy += TAU;
+    m.yaw += clamp(dy, -1.6 * dt, 1.6 * dt);
+    const sp = 13;
+    m.x += Math.sin(m.yaw) * sp * dt;
+    m.z += Math.cos(m.yaw) * sp * dt;
+    m.y = groundY(m.x, m.z);
+    m.wheel += sp * dt * 3;
+    const army = armyOf(m.side);
+    if (army.ai) army.ai.t = Math.min(army.ai.t, 1.2);   // 传令兵：缩短下一次思考延迟
+    if (vrnd() < dt * 6) {
+      dustPool.emit(m.x, m.y + 0.2, m.z, 0.5, 1.6, 0.7, 0.35, 0, 0.3,
+        (vrnd() - 0.5) * 0.8, (vrnd() - 0.5) * 0.8);
+    }
+  }
+}
+function vehSync() {
+  for (const t of ARMOR.tanks) {
+    if (t.dead) continue;
+    t.rig.write(t.idx, t.x, t.y, t.z, t.yaw, 0, 0, { wheel: t.wheel, yaw: 0, pitch: 0 });
+  }
+  for (const v of ARMOR.trucks) v.rig.write(v.idx, v.x, v.y, v.z, v.yaw, 0, 0, { wheel: v.wheel });
+  for (const m of ARMOR.motos) m.rig.write(m.idx, m.x, m.y, m.z, m.yaw, 0, 0, { wheel: m.wheel });
+  tankHRig.flush(); tankLRig.flush(); truckRig.flush(); motoRig.flush();
+}
+
 function simulate(dt) {
   windUpdate();
   for (const a of [U, C]) for (const u of a.units) if (u.kind !== 'art') u.cover = coverAt(u);
   aiUpdate(U, dt); aiUpdate(C, dt);
+  armorUpdate(dt);
+  motorUpdate(dt);
   airUpdate(dt);
   aaUpdate(dt);
   airProjectiles(dt);
@@ -3058,8 +3409,9 @@ function updateHUD(dt) {
   HUD.clock.textContent = B.t.toFixed(1) + ' s' + (B.paused ? ' · 暂停' : '');
   HUD.speed.textContent = '速度 ×' + B.speed;
   const airAlive = k => AIR.craft.filter(c => c.side === k && !c.dead).length + '/' + AIR.craft.filter(c => c.side === k).length;
-  HUD.air.textContent = '航空兵 联邦 ' + airAlive('union') + ' · 邦联 ' + airAlive('confederate')
-    + ' · 高炮 ' + AIR.guns.length + ' · 战壕 ' + (TRENCH_Z.union + '/' + TRENCH_Z.confederate) + 'm';
+  const tankAlive = k => ARMOR.tanks.filter(t => t.side === k && !t.dead).length + '/' + ARMOR.tanks.filter(t => t.side === k).length;
+  HUD.air.textContent = '航空兵 ' + airAlive('union') + '/' + airAlive('confederate')
+    + ' · 坦克 ' + tankAlive('union') + '/' + tankAlive('confederate') + ' · 高炮 ' + AIR.guns.length;
 }
 
 function bannersUpdate(dt) {
@@ -3071,11 +3423,11 @@ function bannersUpdate(dt) {
 
 const VIEWS = [
   /* 全景必须高于航空器上限(ALT_MAX=120)，否则飞机直接从镜头里穿过、挡住半个画面 */
-  { id: 'overview', label: '全景', pos: [0, 140, 215], tgt: [0, 8, -20], fov: 46 },
-  { id: 'union', label: '联邦军视角', pos: [0, 16, -92], tgt: [0, 8, 20], fov: 46 },
-  { id: 'conf', label: '邦联军视角', pos: [0, 16, 92], tgt: [0, 8, -20], fov: 46 },
-  { id: 'art', label: '炮兵阵地', pos: [-54, 12, -124], tgt: [-16, 3, -56], fov: 42 },
-  { id: 'air', label: '制空权', pos: [0, 168, 250], tgt: [0, 108, -10], fov: 52 },
+  { id: 'overview', label: '全景', pos: [0, 430, 760], tgt: [0, 16, -60], fov: 48 },
+  { id: 'union', label: '联邦军视角', pos: [0, 26, -368], tgt: [0, 10, 80], fov: 46 },
+  { id: 'conf', label: '邦联军视角', pos: [0, 26, 368], tgt: [0, 10, -80], fov: 46 },
+  { id: 'art', label: '炮兵阵地', pos: [-216, 30, -496], tgt: [-64, 6, -224], fov: 42 },
+  { id: 'air', label: '制空权', pos: [0, 300, 900], tgt: [0, 140, -40], fov: 52 },
   { id: 'melee', label: '跟拍战斗', follow: true, fov: 44 },
   { id: 'orbit', label: '环绕观赏', auto: true, fov: 50 }
 ];
@@ -3160,6 +3512,7 @@ function loop() {
   syncArmy(U);
   syncArmy(C);
   airSync();
+  vehSync();
   flashPool.sync(); smokePool.sync(); burstPool.sync();
   dustPool.sync(); boomPool.sync(); motePool.sync(); shardPool.sync();
   frames++; fpsT += raw;
@@ -3372,6 +3725,17 @@ window.__battle = {
       });
     });
     return { total, notDrawn, rows: rows.slice(0, 40) };
+  },
+  armor() {
+    return {
+      tanks: ARMOR.tanks.map(t => ({
+        side: t.side, kind: t.heavy ? 'heavy' : 'light', state: t.state, dead: t.dead,
+        hp: Math.round(t.hp), x: Math.round(t.x), z: Math.round(t.z)
+      })),
+      trucks: ARMOR.trucks.map(v => ({ side: v.side, state: v.state, x: Math.round(v.x), z: Math.round(v.z), cargo: v.cargo })),
+      motos: ARMOR.motos.map(m => ({ side: m.side, x: Math.round(m.x), z: Math.round(m.z) })),
+      lost: ARMOR.lost
+    };
   },
   ai() {
     const one = a => ({
