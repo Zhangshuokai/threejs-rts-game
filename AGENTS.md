@@ -33,6 +33,10 @@ The rules below are the ones agents most often get wrong; they generalize from t
 | A camera view "shows nothing / only grass" | §Motion: `OrbitControls` only `update()`s on pointer events — call it after moving the camera |
 | One soldier dying blooms into an orange fireball | §Motion: `flashPool` is HDR (2.4) and crosses the 1.3 bloom threshold — never use an additive pool for hit sparks |
 | Draw-call count differs between two builds *at the default view* | §Motion: a now-correct camera aim legitimately sees more objects; compare budgets from an all-visible camera |
+| 机场/道路/河道在画面里看不见 | §Terrain: 共面贴花缺 `polygonOffset`、跑道与草同亮度、`fogNear` 在内容之内、`anisotropy=1` |
+| 一条河"画"在地面上、没有河岸 | §Terrain: 下沉河道必须挖进 `terrainBase`（`terrainFlat + riverDepth`），水面/河床另建 ribbon |
+| 炮台/英雄单位开火一阵后永久停火 | §Terrain: 开火闸门用了只在开火分支内自增的计数器（`best` 为 null 即死锁） |
+| 新加的静态建筑糊住某条中线机位 | §Terrain: 结构侧移（x=±300），不要为了躲它抬高机位 |
 
 ## General three.js generation rules (any scene)
 - Lock `three` ~r185+; use `renderer.setAnimationLoop` + `Timer/Clock.getDelta()`; **never** frame-rate-dependent `+= constant`. Handle window resize.
@@ -125,6 +129,17 @@ The rules below are the ones agents most often get wrong; they generalize from t
 - **Wheels/axles obey the same rig rule as propellers**: a part rotates about its *own* origin, so wheels spinning about the part origin swing around the vehicle. Build **one part per axle** whose origin lies on the axle line, with the left/right wheels offset only along x (invariant under the x-rotation) — then a `dyn: 'wheel'` part spins in place. The truck has 3 axles, the motorcycle 2.
 - **Motorised reserve = a logistics loop, not scenery**: trucks pick the most depleted on-field friendly infantry (`neediest`), drive to it, `reinforce()` up to N men, return to the depot and wait. Two traps: (1) `kill()` **compacts the slot registry**, so a revived soldier must be given a free slot (`slotSoldier`/`soldierSlot`) or it renders on top of a living man; (2) re-target when the destination dies or routes mid-drive, or the truck arrives to an empty field and unloads nothing.
 - Motorcycles are couriers: a two-point patrol at 13 m/s that also clamps the army's AI think timer (`ai.t = min(ai.t, 1.2)`) so the command layer reacts sooner where they run.
+
+## Terrain features (airfield / road / river) & hero layer (measured in `civil-war-battle.html`)
+- **"看不到机场/道路/河道" 是三类原因叠加，不是"没画"**：(1) **共面贴花没有 `polygonOffset`** —— 道路/跑道只抬高 2–7 cm，在 500 m 外已落在深度精度内，会随镜头闪烁甚至整段消失；材质加 `polygonOffset: true, factor/units ≈ −3…−4`（＋ `renderOrder`）才稳定。(2) **对比度** —— 跑道底色 `#6d6552` 与草色同亮度，从空中看就是草地；改成亮砾石/混凝土色并画粗标线后一眼可辨。(3) **`fogNear` 在内容之内** —— 旧 `Fog(200*S, 750*S)` 把 |z|=740 的机场洗成 0.32 雾；推到 `260*S/900*S` 只让远景变清晰，600 m 内本来无雾、观感不变。再加 `texture.anisotropy = MAXANISO`（`renderer.capabilities.getMaxAnisotropy()`，WebGPU 后端没有该 API，兜底 4）：掠射角下 `anisotropy=1` 会把 26 m 宽的跑道 mip 成一片草色。
+- **一条"下沉"的河必须挖进 `terrainBase`，不能用贴花画**：把 `terrainBase` 拆成 `terrainFlat + riverDepth(x,z)`（对河心线 |z−RIVER.z(x)| 的平滑槽），`groundY` / 贴花 / 士兵 y 就自动跟着河床走 —— 河道于是是个真属性。地面网格 8.1 m/格表示不了 26 m 水面的细岸，所以水面/河床另建 ribbon（304 段），河岸才不呈锯齿。水面用 `MeshStandardMaterial` + 滚动 `normalMap`（UV offset 是标准材质 uniform，WebGPU 也成立）；`Water`/`Water2` 是 `ShaderMaterial`，WebGPU 后端直接失败，不能用。
+- **河床/岸坡颜色是乘两次的结果**：`map × vertexColor` —— 岸外行用草色、水线用沙色、河心用泥色；贴图底色必须偏亮（`#cbb994`），否则整条 68 m 河谷被乘成黑褐色（第一版就是）。水面半宽必须 < `bank × (1−0.55)` 量级，否则水线落到河床之下、水面反而看不见。
+- **浅水要进 `workTraverse`，不能做硬阻挡**：`waterTraverse` 河心 ×0.72（步）/ ×0.55（骑）叠进通行系数，战线才不会卡在河边；实测 180 s 内仍正常以 union 取胜结束。
+- **英雄建筑（重型堡垒）**：每方 1 座，2 个 draw call（烘焙顶点色几何）。属性必须真的接线，否则只是布景 —— 3 门要塞炮 → `fireShell`（给它加 `gun.muzzleY` 抬到炮眼高度）+ `explodeGround`；对 48 m 内友军方向性掩护 → `coverAt`；耐久 → `damageFort`，炮弹与航弹两条路径都接（`projectilesUpdate` / `bombImpact`）。选址 **x=±300**：中央 z=∓330 虽是 y=0 的平地，却会糊住两条 26 m 高的中线机位，侧移才不挡镜（不要靠抬高机位躲）。
+- **炮台的"攻城弹"闸门不能只靠一个只在开火分支里自增的计数器**：`if (best && seq%4===3)` 一旦 `best` 变 null，`seq` 永不前进 → 永久停火（实测 hp 冻在 t≈45）。改为"无步兵目标时必须允许打堡垒"。实测炮弹能把 1500 → 1264，摧毁后整座压成焦石色（`mat.color`）而不是纯黑剪影。
+- **英雄单位（重型战车）**：每方 1 辆、独立 `RigPool`（2 例），`hero: true` 分支把恐惧半径 78 → 132 m、单发 `blastCasualties(13 m, cap 10)`；炮塔用 `dyn:'yaw'` 独立跟踪目标（轻坦也受益），`vehSync` 写 `t.turret`。仍然只有火炮/航弹能伤它（复用 §Armour 的免疫结构）。
+- HUD 的 `air` 行与 debug API 都加了 `重战车`/`堡垒`，新增 `__battle.fort()`。新增机位 `战场地形`（侧向剖面，一眼看全河/路/壕线/堡垒/机场）与 `机场`（按钮 6/7，键盘 1–9）。
+- **预算**：默认全景 440 calls / 1.129e6 tris（原 417 / 1.117e6），+23 calls / +12 k tris = 河道 2 + 桥 2 + 侧路 4 + 停机坪 1 + 堡垒 2 + 英雄车 4（+ 城堡/英雄车各一份阴影 pass）。确定性探针：`sim(75)` 的玩法哈希两次加载均为 `c5e7e028`；曳光弹 3→5 的视觉旋钮下哈希不变（`9099f831`）、粒子数 1203→1205。
 
 ## Draw-call budget / displayed-content reduction (measured in `civil-war-battle.html`)
 Measured at the default view, t=30, same visible content: **252 → 238 meshes, 436 → 404 draw calls, 4.76e5 → 4.42e5 tris**.

@@ -85,7 +85,7 @@
   </div>
   <div id="log"></div>
   <div class="panel" id="help">
-    <div><b>1-7</b> 切换机位 &nbsp; <b>空格</b> 暂停</div>
+    <div><b>1-9</b> 切换机位 &nbsp; <b>空格</b> 暂停</div>
     <div><b>[ ]</b> 战斗速度 &nbsp; <b>R</b> 重开</div>
     <div><b>鼠标</b> 拖拽旋转 / 滚轮缩放</div>
   </div>
@@ -204,11 +204,22 @@ if (renderer.shadowMap) {
 renderer.domElement.style.touchAction = 'none';
 document.getElementById('stage').appendChild(renderer.domElement);
 if (LOADING) LOADING.remove();
+/* 各向异性：地面/道路/跑道全是掠射角平面，anisotropy=1 时远处纹理被 mip 抹平成
+   "一片草色"，特征直接消失。取硬件上限（WebGPU 后端没有 capabilities.getMaxAnisotropy，兜底 4）。 */
+const MAXANISO = (() => {
+  try {
+    const c = renderer.capabilities;
+    return c && typeof c.getMaxAnisotropy === 'function' ? Math.min(16, c.getMaxAnisotropy()) : 4;
+  } catch (e) { return 4; }
+})();
 
 const scene = new THREE.Scene();
 const FOG_COLOR = 0xcdbfa2;
 /* 雾的近端要落在战场与机场之外：近端 140 m 会把机场(150~260 m)与远处障碍洗成天空色 */
-scene.fog = new THREE.Fog(FOG_COLOR, 200 * S, 750 * S);
+/* fogNear 必须在战区之外：机场在 |z|=740、侧路到 ±1000，旧值 200*S 把远处的
+   机场/河道整体洗成天色（"看不见机场"的第二个原因）。推远起点只影响远景清晰度，
+   近处(600 m 内)本来就无雾，观感不变。 */
+scene.fog = new THREE.Fog(FOG_COLOR, 260 * S, 900 * S);
 
 const camera = new THREE.PerspectiveCamera(48, window.innerWidth / window.innerHeight, 0.5, 2400 * S);
 camera.position.set(0, 86 * S, 205 * S);
@@ -424,7 +435,7 @@ function canvasTexture(w, h, draw, repeat) {
   const t = new THREE.CanvasTexture(c);
   t.colorSpace = THREE.SRGBColorSpace;
   if (repeat) { t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(repeat, repeat); }
-  t.anisotropy = 4;
+  t.anisotropy = MAXANISO;
   return t;
 }
 function radialTex(size, stops) {
@@ -465,7 +476,7 @@ const sky = new THREE.Mesh(
 sky.renderOrder = -20;
 scene.add(sky);
 
-function terrainBase(x, z) {
+function terrainFlat(x, z) {
   const n = Math.sin(x * 0.019 + 1.3) * Math.cos(z * 0.016 - 0.7)
     + 0.55 * Math.sin((x + z) * 0.037 + 2.1)
     + 0.32 * Math.cos((x - z) * 0.055 - 1.1)
@@ -473,6 +484,22 @@ function terrainBase(x, z) {
   const dz = Math.max(Math.abs(z) - 94 * S, 0), dx = Math.max(Math.abs(x) - 152 * S, 0);
   return n * 2.6 * smooth(Math.hypot(dx, dz) / (48 * S));   // 战场内压平，外围按比例起坡
 }
+/* ---- 河道（浅水河，横贯战场）----
+   把"下挖"写进 terrainBase：groundY / 贴花 / 士兵 y 全都自动跟着河床走，
+   河道于是是个真属性而不是一张贴图。水面单独建 ribbon（比 8 m 地面网格密），
+   河岸才不会被网格拉成锯齿；河心线在 x=0 处过 0，与正中的桥对齐。
+   注意：只改几何，不额外取 rnd()，否则会挪动后面建树/建制用的随机流。 */
+const RIVER = {
+  half: 13,                    // 水面半宽（水线正好落在河床与岸坡相交处）
+  bank: 30,                    // 下挖影响半径（岸坡渐变宽度）
+  depth: 1.15,                 // 河床相对天然地面的下沉
+  drop: 0.62,                  // 水面低于岸顶 = 中心水深约 0.53 m
+  z: x => 16 * Math.sin(x * 0.0016) + 9 * (Math.sin(x * 0.0031 + 0.4) - Math.sin(0.4))
+};
+const riverCore = (x, z) => clamp(1 - Math.abs(z - RIVER.z(x)) / RIVER.bank, 0, 1);
+function riverDepth(x, z) { const t = riverCore(x, z); return RIVER.depth * t * t * (3 - 2 * t); }
+const riverWaterY = x => terrainFlat(x, RIVER.z(x)) - RIVER.drop;
+function terrainBase(x, z) { return terrainFlat(x, z) - riverDepth(x, z); }
 /* ---- 机场：跑道范围先在地形里压平，否则飞机是在起伏草地上滑跑/接地 ---- */
 /* 机场必须整个落在本军后方：跑道不得伸进战线/炮兵阵地，也不能占用观赏机位的空域。
    yaw = 起飞方向（0 朝 +z，π/2 朝 +x）；跑道长轴与它对齐 —— 机场整体转 90° 后
@@ -486,6 +513,12 @@ function afLocal(A, x, z) {
   const dx = x - A.x, dz = z - A.z, c = Math.cos(A.yaw), s = Math.sin(A.yaw);
   return [dx * c - dz * s, dx * s + dz * c];
 }
+/* 英雄建筑（重型堡垒）选址：中央炮兵线之间的空档，|z|=330 在内圈平地上（大地坐标与
+   ROSTER 一致、不乘 S）。常量提前声明，障碍物布点 freeAt 与堡垒建造共用一处定义。 */
+/* 选址偏移 x=±300：中央 z=∓330 虽然是平地，但正好挡住"联邦军/邦联军视角"两条
+   中线机位（26 m 高、38 m 外的城堡会糊住半个画面）。移到侧翼既保持内圈平地(y=0)、
+   不与炮兵/骑兵/步兵线重叠，又让中线机位干净。 */
+const FORT_SITE = { union: { x: 300, z: -330, yaw: 0 }, confederate: { x: -300, z: 330, yaw: Math.PI } };
 const PAD_Y = {};
 for (const k in AIRFIELD) PAD_Y[k] = terrainBase(AIRFIELD[k].x, AIRFIELD[k].z);
 function onAirfield(x, z) {
@@ -560,12 +593,155 @@ const dirtTex = canvasTexture(256, 256, (g, w, h) => {
   }
 });
 dirtTex.wrapS = dirtTex.wrapT = THREE.RepeatWrapping;
-dirtTex.repeat.set(26 * S, 1);   // 道路也按尺度加密
-const road = new THREE.Mesh(new THREE.PlaneGeometry(780 * S, 7.5), new THREE.MeshStandardMaterial({ map: dirtTex, roughness: 1 }));
+dirtTex.repeat.set(26 * S, 1);
+
+/* ---- 道路：与草地同亮度是"看不见"的首因。改用亮砾石色 + 深色车辙 + 浅色路肩线，
+   并给材质 polygonOffset —— 与地面共面时 2 cm 抬升在 200 m 外已在深度精度之内，
+   会随镜头闪烁/消失（真实原因，不是"没画"）。 ---- */
+const roadTex = canvasTexture(256, 256, (g, w, h) => {
+  g.fillStyle = '#9a8a68'; g.fillRect(0, 0, w, h);
+  const r = mulberry32(77);
+  for (let i = 0; i < 5200; i++) {
+    const v = r();
+    g.fillStyle = v < 0.55 ? 'rgba(128,113,86,.45)' : 'rgba(190,178,146,.5)';
+    g.fillRect(r() * w, r() * h, 1 + r() * 3, 1 + r() * 2);
+  }
+  for (const u of [0.30, 0.70]) {                 // 两条车辙（沿路长方向重复）
+    g.strokeStyle = 'rgba(104,90,66,.42)'; g.lineWidth = 13;
+    g.beginPath(); g.moveTo(u * w, 0); g.lineTo(u * w + 4, h); g.stroke();
+  }
+  g.fillStyle = 'rgba(214,204,176,.75)';           // 路肩亮线，从空中一眼能读出条带
+  g.fillRect(0, 0, w, 5); g.fillRect(0, h - 5, w, 5);
+});
+roadTex.wrapS = roadTex.wrapT = THREE.RepeatWrapping;
+roadTex.repeat.set(30 * S, 1);
+const roadMat = new THREE.MeshStandardMaterial({
+  map: roadTex, roughness: 1, color: 0xffffff,
+  polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4
+});
+const road = new THREE.Mesh(new THREE.PlaneGeometry(780 * S, 10), roadMat);
 road.rotation.x = -Math.PI / 2;
-road.position.set(0, 0.02, 15 * S);
+road.position.set(0, 0.05, 15 * S);
+road.renderOrder = 1;
 road.receiveShadow = true;
 scene.add(road);
+
+/* ---- 河道：河床/岸坡（贴地）与水面（独立细网格）两个 ribbon ----
+   河岸用 sand→mud 顶点色把水线勾出来；水面只有 2 行顶点，靠 normalMap 的
+   流动高光读作"水"。都是标准材质，WebGPU 后端同样成立。 */
+/* 河床贴图要偏亮：它会被顶点色再乘一次，底色太暗会把整条河谷压成黑褐色 */
+const bankTex = canvasTexture(256, 256, (g, w, h) => {
+  g.fillStyle = '#cbb994'; g.fillRect(0, 0, w, h);
+  const r = mulberry32(125);
+  for (let i = 0; i < 4200; i++) {
+    g.fillStyle = r() < 0.5 ? 'rgba(150,132,98,.5)' : 'rgba(214,198,160,.5)';
+    g.fillRect(r() * w, r() * h, 1 + r() * 3, 1 + r() * 2);
+  }
+});
+bankTex.wrapS = bankTex.wrapT = THREE.RepeatWrapping;
+bankTex.repeat.set(20, 3);
+const waterTex = canvasTexture(256, 256, (g, w, h) => {
+  g.fillStyle = '#4f8b93'; g.fillRect(0, 0, w, h);
+  for (let i = 0; i < 260; i++) {
+    const y = (i * 37) % h;
+    g.strokeStyle = 'rgba(' + (168 + (i * 13) % 70) + ',' + (212 + (i * 7) % 40) + ',' + (220 + (i * 5) % 35) + ',.26)';
+    g.lineWidth = 1 + (i % 3);
+    g.beginPath(); g.moveTo(0, y); g.lineTo(w, y + 6); g.stroke();
+  }
+});
+waterTex.wrapS = waterTex.wrapT = THREE.RepeatWrapping;
+waterTex.repeat.set(10, 2);
+const waterNrm = canvasTexture(256, 256, (g, w, h) => {
+  g.fillStyle = 'rgb(128,128,255)'; g.fillRect(0, 0, w, h);
+  const r = mulberry32(313);
+  for (let i = 0; i < 900; i++) {
+    const x = r() * w, y = r() * h, s = 1 + r() * 4;
+    g.fillStyle = r() < 0.5 ? 'rgba(150,150,255,.5)' : 'rgba(106,106,255,.5)';
+    g.beginPath(); g.ellipse(x, y, s * 2.4, s, 0, 0, TAU); g.fill();
+  }
+});
+waterNrm.wrapS = waterNrm.wrapT = THREE.RepeatWrapping;
+waterNrm.repeat.set(26, 3);
+const RIVERFX = { map: waterTex, nrm: waterNrm };
+{
+  const X0 = -760 * S, X1 = 760 * S, NX = 304;
+  const w1 = RIVER.half, w2 = RIVER.bank + 4, R = 7;
+  const rows = [-w2, -w1, -w1 * 0.45, 0, w1 * 0.45, w1, w2];
+  const rrnd = mulberry32(0x5A17C0DE);      // 河道几何专用流，不碰 rnd/vrnd
+  const pos = [], col = [], uv = [], idx = [];
+  /* 岸外行用草色（不是土色）：否则整条 68 m 的下挖带会读成"一条土路"而不是河谷 */
+  const cSand = new THREE.Color(0xbfa878), cMud = new THREE.Color(0x565340), cGrass = new THREE.Color(0x77854a);
+  for (let i = 0; i <= NX; i++) {
+    const x = lerp(X0, X1, i / NX), zc = RIVER.z(x);
+    for (const dz of rows) {
+      const z = zc + dz;
+      pos.push(x, terrainBase(x, z) + 0.05, z);
+      const a = Math.abs(dz) / w2;
+      const c = cGrass.clone().lerp(cSand, 1 - a).lerp(cMud, clamp(1 - Math.abs(dz) / w1, 0, 1) * 0.7);
+      const j = 0.9 + rrnd() * 0.2;
+      col.push(c.r * j, c.g * j, c.b * j);
+      uv.push(x / 40, dz / 12);
+    }
+  }
+  for (let i = 0; i < NX; i++) for (let j = 0; j < R - 1; j++) {
+    const a = i * R + j, b = a + R, c = a + 1, d = b + 1;
+    idx.push(a, c, b, b, c, d);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setIndex(idx); g.computeVertexNormals();
+  const bed = new THREE.Mesh(g, new THREE.MeshStandardMaterial({
+    map: bankTex, vertexColors: true, roughness: 1,
+    polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3
+  }));
+  bed.receiveShadow = true; bed.matrixAutoUpdate = false; bed.updateMatrix();
+  scene.add(bed);
+
+  const wp = [], wi = [], wu = [];
+  for (let i = 0; i <= NX; i++) {
+    const x = lerp(X0, X1, i / NX), zc = RIVER.z(x), y = riverWaterY(x);
+    wp.push(x, y, zc - w1, x, y, zc + w1);
+    wu.push(x / 26, 0, x / 26, 1);
+  }
+  for (let i = 0; i < NX; i++) { const a = i * 2; wi.push(a, a + 1, a + 2, a + 1, a + 3, a + 2); }
+  const wg = new THREE.BufferGeometry();
+  wg.setAttribute('position', new THREE.Float32BufferAttribute(wp, 3));
+  wg.setAttribute('uv', new THREE.Float32BufferAttribute(wu, 2));
+  wg.setIndex(wi); wg.computeVertexNormals();
+  const water = new THREE.Mesh(wg, new THREE.MeshStandardMaterial({
+    map: waterTex, normalMap: waterNrm, normalScale: new THREE.Vector2(0.85, 0.85),
+    color: 0xffffff, roughness: 0.13, metalness: 0.0,
+    transparent: true, opacity: 0.94
+  }));
+  water.renderOrder = 1; water.matrixAutoUpdate = false; water.updateMatrix();
+  scene.add(water);
+}
+
+/* ---- 石拱桥：架在两条侧路与河道的交叉点上（侧路在 x=±620，远离部队行进带，
+   单位不会从桥身里穿过去）。桥面/栏板/桥墩共用一套顶点色，一座桥 1 个 draw call。 */
+function buildBridge(x) {
+  const zc = RIVER.z(x), deck = terrainFlat(x, zc) + 1.1, parts = [];
+  parts.push(tinted(at(box(11, 0.7, 34), 0, deck, 0), 0x928d7c));
+  for (const s of [-1, 1]) parts.push(tinted(at(box(0.7, 1.05, 34), s * 5.6, deck + 0.9, 0), 0x7d7868));
+  for (let k = -2; k <= 2; k++) parts.push(tinted(at(cyl(1.7, 2.0, deck + 1.8, 10), 0, (deck - 1.8) / 2, k * 7.4), 0x6f6a5c));
+  const m = new THREE.Mesh(mergeGeometries(parts), new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.95 }));
+  m.position.set(x, 0, zc); m.castShadow = true; m.receiveShadow = true;
+  m.matrixAutoUpdate = false; m.updateMatrix();
+  scene.add(m);
+}
+for (const bx of [-620, 620]) {
+  buildBridge(bx);
+  const zc = RIVER.z(bx);
+  for (const s of [-1, 1]) {
+    const seg = new THREE.Mesh(new THREE.PlaneGeometry(9, 620), roadMat);
+    seg.rotation.x = -Math.PI / 2;
+    seg.position.set(bx, 0.05, zc + s * (17 + 310));
+    seg.renderOrder = 1; seg.receiveShadow = true;
+    scene.add(seg);
+  }
+}
 
 const postGeo = new THREE.CylinderGeometry(0.09, 0.11, 1.45, 6);
 postGeo.translate(0, 0.72, 0);
@@ -605,6 +781,7 @@ for (let i = 0; i < 170 * S * 2; i++) {
   const x = Math.cos(a) * rad, z = Math.sin(a) * rad * 0.92;
   if (Math.abs(z) < 94 * S && Math.abs(x) < 164 * S) continue;
   if (onAirfield(x, z)) continue;                 // 机场净空：跑道与停机坪上不长树
+  if (riverCore(x, z) > 0.02) continue;           // 河道与岸坡上不长树（否则树会插进水里）
   treeSpots.push([x, z, 0.75 + rnd() * 0.75]);
 }
 for (let i = 0; i < 30 * S * 2; i++) treeSpots.push([(76 + rnd() * 92) * S, (68 + rnd() * 92) * S, 0.8 + rnd() * 0.6]);
@@ -709,9 +886,10 @@ for (const k in SIDE) {
   };
 }
 
-const box = (w, h, d) => new THREE.BoxGeometry(w, h, d);
-const cyl = (rt, rb, h, s) => new THREE.CylinderGeometry(rt, rb, h, s);
-const at = (g, x, y, z) => { g.translate(x, y, z); return g; };
+/* 同样用函数声明：河道桥在文件前部就调用它们（声明提升） */
+function box(w, h, d) { return new THREE.BoxGeometry(w, h, d); }
+function cyl(rt, rb, h, s) { return new THREE.CylinderGeometry(rt, rb, h, s); }
+function at(g, x, y, z) { g.translate(x, y, z); return g; }
 /* 静态批处理：把一批"永不动、同材质"的实例烘焙成一个合并网格（1 个 draw call）。
    相对 InstancedMesh 的好处：没有逐实例矩阵更新，包围球按真实顶点算（视锥剔除依然有效），
    也不会踩到"动态 InstancedMesh 包围球不刷新"的坑；代价是不能再逐实例改属性，
@@ -1558,21 +1736,26 @@ for (let i = 0; i < 26; i++) {
 }
 let shellIdx = 0;
 function fireShell(gun) {
-  /* 有坦克目标就优先打坦克——炮兵是唯一能拦住它的兵种 */
+  /* 有坦克目标就优先打坦克——炮兵是唯一能拦住它的兵种；
+     英雄建筑（堡垒）也可被炮击：堡垒炮会轮换"攻城"模式互轰，否则伤害路径永不触发 */
   const tank = gun.tank && !gun.tank.dead ? gun.tank : null;
+  const fort = gun.fort && !gun.fort.dead ? gun.fort : null;
   const target = gun.targetUnit;
-  if (!tank && !target) return;
+  if (!tank && !target && !fort) return;
   const sh = shells[shellIdx++ % shells.length];
   const sx = gun.x, sz = gun.z;
-  const tx = (tank ? tank.x : target.cx) + (rnd() - 0.5) * (tank ? 8 : 14);
-  const tz = (tank ? tank.z : target.cz) + (rnd() - 0.5) * (tank ? 8 : 12);
+  const ax = fort ? fort.x : tank ? tank.x : target.cx;
+  const az = fort ? fort.z : tank ? tank.z : target.cz;
+  const spx = fort ? 10 : tank ? 8 : 14, spz = fort ? 10 : tank ? 8 : 12;
+  const tx = ax + (rnd() - 0.5) * spx;
+  const tz = az + (rnd() - 0.5) * spz;
   const dx = tx - sx, dz = tz - sz;
   const flat = Math.max(1, Math.hypot(dx, dz));
   const dist = Math.max(26, flat);
   const ang = 0.31;
   const v = Math.sqrt(dist * 9.8 / Math.sin(2 * ang));
   const ux = dx / flat, uz = dz / flat;
-  sh.x = sx + ux * 2.3; sh.y = 1.7; sh.z = sz + uz * 2.3;
+  sh.x = sx + ux * 2.3; sh.y = gun.muzzleY || 1.7; sh.z = sz + uz * 2.3;
   sh.vx = ux * v * Math.cos(ang); sh.vz = uz * v * Math.cos(ang); sh.vy = v * Math.sin(ang);
   sh.active = true; sh.dist = 0.62; sh.mesh.visible = true; sh.side = gun.army.key;
   sh.mesh.position.set(sh.x, sh.y, sh.z);
@@ -1625,6 +1808,11 @@ function projectilesUpdate(dt) {
         const td = Math.hypot(t.x - sh.x, t.z - sh.z);
         if (td < SHELL_KILL_RADIUS && rnd() < 0.55) damageTank(t, 110 + rnd() * 90, '炮兵直击');
         else if (td < SHELL_FRAG_RADIUS && rnd() < 0.18) damageTank(t, 40 + rnd() * 50, '炮弹破片');
+      }
+      /* 英雄建筑也进同一套伤害结算：堡垒不是布景，会被炮击打掉 */
+      for (const F of FORT) {
+        if (F.dead || F.side === sh.side) continue;
+        if (Math.hypot(F.x - sh.x, F.z - sh.z) < 24 && rnd() < 0.5) damageFort(F, 90 + rnd() * 90, '炮兵直击');
       }
     }
   }
@@ -1697,6 +1885,11 @@ function abatisFactor(x, z) {
 }
 /* 通行代价（1 = 如履平地）：断面高差 —— 骑兵翻 1.3 m 胸墙几乎被挡停；
    再叠加胸墙前鹿砦的阻滞。这个属性必须进移动积分，否则工事只是贴图。 */
+/* 涉水代价：河心最慢，骑兵更怕水。浅滩仍可通过，不设硬阻挡——否则战线会卡在河边 */
+function waterTraverse(kind, x, z) {
+  const d = clamp((riverCore(x, z) - 0.30) / 0.55, 0, 1);
+  return kind === 'cav' ? 1 - 0.45 * d : 1 - 0.26 * d;
+}
 function workTraverse(kind, x, z) {
   const h = Math.max(workH(x, z), obstacleH(x, z));
   let fac = kind === 'cav'
@@ -1704,6 +1897,7 @@ function workTraverse(kind, x, z) {
     : 1 - 0.72 * clamp((h - 0.15) / 1.00, 0, 1);
   const ab = abatisFactor(x, z);
   fac *= kind === 'cav' ? 1 - 0.78 * ab : 1 - 0.35 * ab;
+  fac *= waterTraverse(kind, x, z);
   return clamp(fac, kind === 'cav' ? 0.05 : 0.25, 1);
 }
 
@@ -1725,6 +1919,11 @@ const obstacles = [];
     if (Math.abs(Math.abs(z) - 46 * S) < 40 && Math.abs(x) < 420) return false;  // 不压战壕与出发线
     if (Math.abs(Math.abs(z) - 392) < 60 && Math.abs(x) < 520) return false;   // 不占用炮兵阵地
     if (Math.abs(x) < 104 && Math.abs(z) < 88) return false;                  // 中央接触区留空
+    if (riverCore(x, z) > 0.01) return false;                                 // 河道/岸坡上不放障碍物
+    for (const key in FORT_SITE) {                                            // 堡垒基座上不放障碍物
+      const F = FORT_SITE[key];
+      if (Math.abs(x - F.x) < 34 && Math.abs(z - F.z) < 30) return false;
+    }
     return !onAirfield(x, z);
   };
   for (const T of OBSTACLE_TYPES) {
@@ -2095,7 +2294,7 @@ function trenchCover(u) {
 }
 /* 综合掩体：战壕工事与随机障碍物取较优者（位置判定；方向性统一由 coverAgainst 施加） */
 function coverAt(u) {
-  return Math.max(trenchCover(u), obstacleCover(u.cx, u.cz));
+  return Math.max(trenchCover(u), obstacleCover(u.cx, u.cz), fortCover(u));
 }
 /* 方向性：只有来自胸墙一侧的火力才被掩体削弱（侧射/背射不吃掩护） */
 function coverAgainst(tgt, shooterZ) {
@@ -2176,23 +2375,43 @@ const zc = g => g.rotateX(Math.PI / 2);
 
 /* ---------- 机场：压平的土跑道 + 机库/帐篷/风袋/油桶（合并成一个实例化网格） ---------- */
 const GND = 0.55;                    // 停机/滑跑时飞机"站在起落架上"的抬升量
+/* 跑道原来比草地还暗（#6d6552），从空中看和草色一个亮度 → "看不见机场"。
+   改亮砾石/混凝土色 + 更粗的标线，再加 polygonOffset（与压平的停机坪共面）。 */
 const runwayTex = canvasTexture(256, 512, (g, w, h) => {
-  g.fillStyle = '#6d6552'; g.fillRect(0, 0, w, h);
-  for (let i = 0; i < 3400; i++) {
-    g.fillStyle = 'rgba(' + (92 + (i * 37) % 58) + ',' + (84 + (i * 29) % 52) + ',' + (64 + (i * 23) % 44) + ',.5)';
-    g.fillRect((i * 71) % w, (i * 131) % h, 2, 2);
+  g.fillStyle = '#9d9480'; g.fillRect(0, 0, w, h);
+  const r = mulberry32(206);
+  for (let i = 0; i < 4200; i++) {
+    g.fillStyle = r() < 0.5 ? 'rgba(128,120,102,.4)' : 'rgba(190,182,160,.45)';
+    g.fillRect(r() * w, r() * h, 2, 2);
   }
-  g.fillStyle = 'rgba(236,230,209,.5)';
-  for (let y = 10; y < h; y += 36) g.fillRect(w / 2 - 3, y, 6, 20);
-  for (let k = 0; k < 4; k++) { g.fillRect(24 + k * 54, 12, 10, 30); g.fillRect(24 + k * 54, h - 42, 10, 30); }
+  g.fillStyle = 'rgba(250,246,232,.8)';                     // 中线虚线
+  for (let y = 14; y < h; y += 46) g.fillRect(w / 2 - 4, y, 8, 26);
+  g.fillStyle = 'rgba(250,246,232,.72)';                    // 两侧跑道边线
+  g.fillRect(8, 0, 7, h); g.fillRect(w - 15, 0, 7, h);
+  for (let k = 0; k < 6; k++) {                             // 两端入口条纹
+    const px = 22 + k * 36;
+    g.fillRect(px, 10, 16, 46); g.fillRect(px, h - 56, 16, 46);
+  }
 });
-const tinted = (geo, hex) => {
+const apronTex = canvasTexture(256, 256, (g, w, h) => {
+  g.fillStyle = '#a9a292'; g.fillRect(0, 0, w, h);
+  const r = mulberry32(404);
+  for (let i = 0; i < 2600; i++) {
+    g.fillStyle = r() < 0.5 ? 'rgba(140,134,118,.35)' : 'rgba(196,190,172,.35)';
+    g.fillRect(r() * w, r() * h, 2, 2);
+  }
+  g.strokeStyle = 'rgba(120,114,100,.6)'; g.lineWidth = 2;   // 混凝土分格缝
+  for (let i = 0; i <= 4; i++) { g.beginPath(); g.moveTo(i * w / 4, 0); g.lineTo(i * w / 4, h); g.stroke(); }
+  for (let i = 0; i <= 4; i++) { g.beginPath(); g.moveTo(0, i * h / 4); g.lineTo(w, i * h / 4); g.stroke(); }
+});
+/* 函数声明而非 const 箭头：河道桥（文件前部）就要用到它，声明提升才来得及 */
+function tinted(geo, hex) {
   const c = new THREE.Color(hex), n = geo.attributes.position.count;
   const arr = new Float32Array(n * 3);
   for (let i = 0; i < n; i++) { arr[i * 3] = c.r; arr[i * 3 + 1] = c.g; arr[i * 3 + 2] = c.b; }
   geo.setAttribute('color', new THREE.BufferAttribute(arr, 3));
   return geo;
-};
+}
 {
   const parts = [];
   /* 机库：机身 + 桶形屋顶，长轴沿 z，排在小跑道西侧 */
@@ -2228,11 +2447,23 @@ const tinted = (geo, hex) => {
   const airfieldMesh = new THREE.InstancedMesh(
     airfieldGeo, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.92 }), 2);
   airfieldMesh.castShadow = true; airfieldMesh.receiveShadow = true; airfieldMesh.frustumCulled = false;
-  const runwayGeo = new THREE.PlaneGeometry(20, PAD_Z * 2);
+  const runwayGeo = new THREE.PlaneGeometry(26, PAD_Z * 2);
   runwayGeo.rotateX(-Math.PI / 2);
   const runwayMesh = new THREE.InstancedMesh(
-    runwayGeo, new THREE.MeshStandardMaterial({ map: runwayTex, roughness: 1 }), 2);
+    runwayGeo, new THREE.MeshStandardMaterial({
+      map: runwayTex, roughness: 1,
+      polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4
+    }), 2);
   runwayMesh.receiveShadow = true; runwayMesh.frustumCulled = false;
+  /* 停机坪/滑行道：亮混凝土面，把"机场"这个大地块从草地里拔出来 */
+  const apronGeo = new THREE.PlaneGeometry(30, PAD_Z * 2 - 12);
+  apronGeo.rotateX(-Math.PI / 2);
+  const apronMesh = new THREE.InstancedMesh(
+    apronGeo, new THREE.MeshStandardMaterial({
+      map: apronTex, roughness: 1,
+      polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3
+    }), 2);
+  apronMesh.receiveShadow = true; apronMesh.frustumCulled = false;
   const ao = new THREE.Object3D();
   let k = 0;
   for (const key in AIRFIELD) {
@@ -2242,11 +2473,16 @@ const tinted = (geo, hex) => {
     airfieldMesh.setMatrixAt(k, ao.matrix);
     ao.position.set(A.x, by + 0.07, A.z); ao.updateMatrix();
     runwayMesh.setMatrixAt(k, ao.matrix);
+    /* 停机坪在跑道西侧（局部 -x = 机库一侧），随 yaw 一起转 */
+    const ap = afWorld(A, -25, 0);
+    ao.position.set(ap[0], by + 0.06, ap[1]); ao.updateMatrix();
+    apronMesh.setMatrixAt(k, ao.matrix);
     k++;
   }
   airfieldMesh.instanceMatrix.needsUpdate = true;
   runwayMesh.instanceMatrix.needsUpdate = true;
-  scene.add(airfieldMesh, runwayMesh);
+  apronMesh.instanceMatrix.needsUpdate = true;
+  scene.add(airfieldMesh, runwayMesh, apronMesh);
 }
 
 /* 部件的划分原则：同一 material + 同一 dyn 的部件合并成一个（少数 draw call），
@@ -2574,7 +2810,7 @@ for (const side of ['union', 'confederate']) {
     const x = (i - 1) * 150, z = -268 * f;
     ARMOR.tanks.push({
       heavy: false, rig: tankLRig, idx: (side === 'union' ? 0 : 3) + i, side, foe: con,
-      x, y: groundY(x, z), z, yaw: f > 0 ? 0 : Math.PI, wheel: 0,
+      x, y: groundY(x, z), z, yaw: f > 0 ? 0 : Math.PI, wheel: 0, turret: 0,
       hp: 260, maxHp: 260, range: 200, reload: 1.2 + i * 0.4, spd: 5.0, dead: false, state: 'advance'
     });
   }
@@ -2598,6 +2834,164 @@ for (const side of ['union', 'confederate']) {
 for (const t of ARMOR.tanks) t.rig.paint(t.idx, VEH_PAINT[t.side]);
 for (const v of ARMOR.trucks) v.rig.paint(v.idx, VEH_PAINT[v.side]);
 for (const m of ARMOR.motos) m.rig.paint(m.idx, VEH_PAINT[m.side]);
+
+/* ==================== 英雄单位：重型战车（超重型陆地巡洋舰） ====================
+   每方 1 辆，独立 rig（2 个实例）。比菱形重坦大一圈：三炮塔（主炮塔 dyn:'yaw'
+   真的会转向目标）、极厚装甲、超大"装甲恐惧"半径。它是士气的放大器而不是杀器，
+   但吃一次炮兵直击照样掉大血——反制仍然只有火炮/航弹。 */
+const trackLoopBig = trackLoopGeo.clone().scale(1.5, 1.32, 1.52);
+const TANK_HERO_PARTS = [
+  {
+    id: 'hull', mat: 'armor', paint: 'body', pos: [0, 0, 0], geo: mergeGeometries([
+      at(box(3.7, 1.9, 10.6), 0, 2.15, 0),
+      at(box(3.7, 1.35, 4.6).rotateX(-0.26), 0, 1.7, 4.4),
+      at(box(3.7, 1.35, 3.8).rotateX(0.26), 0, 1.7, -4.2),
+      at(box(4.5, 1.1, 5.4), 0, 1.95, 0.2),
+      at(box(2.3, 1.15, 3.6), -2.6, 1.95, 0.4),
+      at(box(2.3, 1.15, 3.6), 2.6, 1.95, 0.4),
+      at(cyl(0.17, 0.20, 2.1, 10).rotateZ(Math.PI / 2), -4.0, 1.95, 0.4),
+      at(cyl(0.17, 0.20, 2.1, 10).rotateZ(Math.PI / 2), 4.0, 1.95, 0.4),
+      at(box(2.3, 0.9, 3.0), 0, 3.45, -1.8),
+      at(box(2.7, 0.35, 3.4), 0, 4.0, -1.8),
+      at(cyl(0.06, 0.06, 3.6, 6), 0, 5.6, -3.0),
+      at(box(1.5, 0.85, 0.06), 0.78, 6.6, -3.0)
+    ])
+  },
+  { id: 'trackL', mat: 'track', pos: [-2.05, 1.05, 0], geo: trackLoopBig },
+  { id: 'trackR', mat: 'track', pos: [2.05, 1.05, 0], geo: trackLoopBig },
+  {
+    id: 'turret', mat: 'armor', paint: 'body', dyn: 'yaw', pos: [0, 4.05, 1.7], geo: mergeGeometries([
+      at(cyl(1.05, 1.15, 0.95, 12), 0, 0.48, 0),
+      at(box(2.1, 1.0, 2.6), 0, 0.5, 0),
+      at(cyl(0.18, 0.21, 3.6, 10).rotateX(Math.PI / 2), 0, 0.55, 2.0)
+    ])
+  }
+];
+const tankHeroRig = new RigPool(TANK_HERO_PARTS, 2, vehMat);
+for (const side of ['union', 'confederate']) {
+  const f = side === 'union' ? 1 : -1;
+  const x = -150 * f, z = -560 * f;
+  ARMOR.tanks.push({
+    hero: true, heavy: true, rig: tankHeroRig, idx: side === 'union' ? 0 : 1, side,
+    foe: side === 'union' ? 'confederate' : 'union',
+    x, y: groundY(x, z), z, yaw: f > 0 ? 0 : Math.PI, wheel: 0, turret: 0,
+    hp: 2000, maxHp: 2000, range: 430, reload: 4, spd: 2.3, dead: false, state: 'advance'
+  });
+  tankHeroRig.paint(side === 'union' ? 0 : 1, VEH_PAINT[side]);
+}
+
+/* ==================== 英雄建筑：重型堡垒（棱堡式炮台） ====================
+   建在双方炮兵线之间的中央空档 z=∓330——该处在内圈平地(|z|<376)，地面严格 y=0，
+   所以整座堡垒不会悬空。一座 1 个 draw call（几何烘焙 + 顶点色）。
+   属性：3 门要塞炮（射程 900 m，可被炮击/航弹摧毁）、给 48 m 内友军方向性掩护。
+   属性必须真的接进模拟，否则"堡垒"就只是布景：炮 → fireShell/explodeGround；
+   掩护 → coverAt；耐久 → damageFort（炮弹与航弹两条伤害路径都接）。 */
+function buildFortressGeo() {
+  const P = [];
+  const stone = 0x948e7e, dark = 0x6f6a5c, roof = 0x5a5347, wood = 0x6b563a, flag = 0xb8483c, iron = 0x3f4347;
+  P.push(tinted(at(box(44, 3.2, 38), 0, -1.4, 0), 0x6a6152));      // 基座（埋入地面，抹平起伏）
+  P.push(tinted(at(box(18, 10, 15), 0, 5.4, 0), stone));            // 主堡
+  P.push(tinted(at(box(12.5, 5, 9.5), 0, 12.9, 0), dark));
+  P.push(tinted(at(cyl(0.1, 7.6, 3.6, 8), 0, 16.6, 0), roof));
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) {            // 四角棱堡
+    P.push(tinted(at(cyl(6.3, 7.3, 7.2, 6), sx * 13, 3.6, sz * 11), stone));
+    P.push(tinted(at(cyl(6.7, 6.7, 0.9, 6), sx * 13, 7.6, sz * 11), dark));
+  }
+  P.push(tinted(at(box(26, 5.2, 2.8), 0, 2.6, 11), stone));        // 幕墙
+  P.push(tinted(at(box(26, 5.2, 2.8), 0, 2.6, -11), stone));
+  P.push(tinted(at(box(2.8, 5.2, 22), 13, 2.6, 0), stone));
+  P.push(tinted(at(box(2.8, 5.2, 22), -13, 2.6, 0), stone));
+  for (let i = -6; i <= 6; i++) {                                 // 雉堞
+    P.push(tinted(at(box(1.5, 1.2, 0.95), i * 1.95, 5.8, 11), dark));
+    P.push(tinted(at(box(1.5, 1.2, 0.95), i * 1.95, 5.8, -11), dark));
+    P.push(tinted(at(box(0.95, 1.2, 1.5), 13, 5.8, i * 1.95), dark));
+    P.push(tinted(at(box(0.95, 1.2, 1.5), -13, 5.8, i * 1.95), dark));
+  }
+  P.push(tinted(at(box(6.4, 6.2, 2.6), 0, 3.1, 12.7), wood));       // 城门
+  P.push(tinted(at(box(7.4, 1.3, 3.2), 0, 6.6, 12.7), dark));
+  for (const gx of [-9, 0, 9]) {                                  // 三座炮眼
+    P.push(tinted(at(box(2.6, 1.1, 2.6), gx, 5.6, 12.0), dark));
+    const b = cyl(0.30, 0.36, 4.4, 10); b.rotateX(Math.PI / 2);
+    P.push(tinted(at(b, gx, 5.9, 13.7), iron));
+  }
+  P.push(tinted(at(cyl(0.13, 0.15, 15, 6), 0, 21, 0), wood));       // 旗杆
+  P.push(tinted(at(box(0.08, 2.6, 3.8), 0, 26, -2.0), flag));
+  return mergeGeometries(P);
+}
+const FORT = [];
+{
+  const fortGeo = buildFortressGeo();
+  for (const side of ['union', 'confederate']) {
+    const site = FORT_SITE[side];
+    const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.95 });
+    const mesh = new THREE.Mesh(fortGeo, mat);
+    mesh.position.set(site.x, terrainH(site.x, site.z), site.z);
+    mesh.rotation.y = site.yaw;
+    mesh.castShadow = true; mesh.receiveShadow = true;
+    mesh.matrixAutoUpdate = false; mesh.updateMatrix();
+    scene.add(mesh);
+    const s = Math.sin(site.yaw), c = Math.cos(site.yaw), guns = [];
+    for (const lx of [-9, 0, 9]) {
+      const lz = 14.4;
+      guns.push({
+        ox: lx, oz: lz, crew: [], tank: null, targetUnit: null,
+        x: site.x + lx * c + lz * s, z: site.z - lx * s + lz * c,
+        muzzleY: mesh.position.y + 5.9, recoil: 0, reload: 4 + Math.abs(lx) * 0.25
+      });
+    }
+    FORT.push({
+      side, foe: side === 'union' ? 'confederate' : 'union', mesh, mat, guns,
+      x: site.x, z: site.z, yaw: site.yaw,
+      hp: 1500, maxHp: 1500, range: 900, dead: false
+    });
+  }
+}
+/* 堡垒掩护：只对友军、位置判定；方向性由 coverAgainst 统一施加 */
+function fortCover(u) {
+  let c = 0;
+  for (const F of FORT) {
+    if (F.dead || F.side !== u.army.key) continue;
+    const d = Math.hypot(u.cx - F.x, u.cz - F.z);
+    if (d < 48) c = Math.max(c, clamp(1 - d / 48, 0, 1) * 0.5);
+  }
+  return c;
+}
+function fortUpdate(dt) {
+  for (const F of FORT) {
+    if (F.dead) continue;
+    const foe = armyOf(F.foe);
+    let best = null, bd = 1e9;
+    for (const u of foe.units) {
+      if (u.kind === 'art' || u.men <= 0 || u.gone || u.state === 'rout') continue;
+      const d = Math.hypot(u.cx - F.x, u.cz - F.z);
+      if (d < F.range && d < bd) { bd = d; best = u; }
+    }
+    const foeFort = FORT.find(o => o.side === F.foe && !o.dead) || null;
+    for (const g of F.guns) {
+      g.army = armyOf(F.side); g.tank = null; g.crew = [];
+      /* 每 4 发里有 1 发打对方堡垒（攻城）：又出戏，又能真的把对手的耐久打下去。
+         没有步兵目标时必须允许打堡垒，否则 seq 不前进会永久卡死（3/4 的发次都不满足条件）。 */
+      g.targetUnit = best;
+      g.fort = foeFort ? (!best || (g.seq || 0) % 4 === 3 ? foeFort : null) : null;
+      g.reload = Math.max(-1, g.reload - dt);
+      if ((best || g.fort) && B.t > 6 && !B.over && g.reload <= 0) {
+        g.reload = 7.5 + rnd() * 3;
+        g.seq = (g.seq || 0) + 1;
+        fireShell(g);
+      }
+    }
+  }
+}
+function damageFort(F, dmg, by) {
+  if (F.dead) return;
+  F.hp -= dmg;
+  if (F.hp <= 0) {
+    F.dead = true;
+    F.mat.color.setHex(0x6a6355);                    // 烧毁：整座压成焦石色（不是纯黑剪影）
+    for (let i = 0; i < 4; i++) explodeGround(F.x + (vrnd() - 0.5) * 16, F.z + (vrnd() - 0.5) * 14, 1.7);
+    blog((F.side === 'union' ? '联邦' : '邦联') + '重型堡垒被' + by + '摧毁！', '#f0a070');
+  }
+}
 
 const enemyOf = a => a === U ? C : U;
 const STEP = 1 / 60;
@@ -3357,6 +3751,10 @@ function bombImpact(b) {
     if (t.dead || t.side === b.side) continue;
     if (Math.hypot(t.x - b.x, t.z - b.z) < BOMB_R * 2 && rnd() < 0.34) damageTank(t, 130 + rnd() * 150, '航弹');
   }
+  for (const F of FORT) {
+    if (F.dead || F.side === b.side) continue;
+    if (Math.hypot(F.x - b.x, F.z - b.z) < 28 && rnd() < 0.3) damageFort(F, 140 + rnd() * 140, '航弹');
+  }
 }
 function airProjectiles(dt) {
   for (const t of tracers) {
@@ -3475,7 +3873,7 @@ function armorUpdate(dt) {
       if (d < bd) { bd = d; best = u; }
     }
     /* 装甲恐惧：附近敌步兵持续掉士气、友军略回升（一战坦克的战术核心） */
-    const terrR = t.heavy ? 78 : 54;
+    const terrR = t.hero ? 132 : t.heavy ? 78 : 54;
     for (const a of [U, C]) {
       const isFoe = a.key !== t.side;
       for (const u of a.units) {
@@ -3491,6 +3889,13 @@ function armorUpdate(dt) {
     while (dy > Math.PI) dy -= TAU;
     while (dy < -Math.PI) dy += TAU;
     t.yaw += clamp(dy, -0.45 * dt, 0.45 * dt);
+    /* 炮塔独立转向（dyn:'yaw'）：轻坦与英雄车有可转塔，菱形重坦是固定侧炮塔 */
+    if (t.turret !== undefined) {
+      let td = Math.atan2(best.cx - t.x, best.cz - t.z) - t.turret;
+      while (td > Math.PI) td -= TAU;
+      while (td < -Math.PI) td += TAU;
+      t.turret += clamp(td, -0.7 * dt, 0.7 * dt);
+    }
     /* 推进：坦克自重能压过胸墙，过壕只减速约 35%（步兵是 72%） */
     const pen = 1 - 0.38 * clamp(workH(t.x, t.z) / 1.3, 0, 1);
     if (bd > t.range * 0.55) {
@@ -3502,18 +3907,19 @@ function armorUpdate(dt) {
     } else t.state = 'engage';
     t.y = groundY(t.x, t.z);
     if (t.reload <= 0 && bd < t.range && B.t > 8) {
-      t.reload = (t.heavy ? 5.4 : 3.6) + rnd() * 1.4;
-      const sx = t.x + Math.sin(t.yaw) * 4.5, sz = t.z + Math.cos(t.yaw) * 4.5;
-      const gY = groundY(t.x, t.z) + 2.2;
+      t.reload = (t.hero ? 7.2 : t.heavy ? 5.4 : 3.6) + rnd() * 1.4;
+      const fwd = t.hero ? 7.2 : 4.5;
+      const sx = t.x + Math.sin(t.yaw) * fwd, sz = t.z + Math.cos(t.yaw) * fwd;
+      const gY = groundY(t.x, t.z) + (t.hero ? 4.4 : 2.2);
       const tx = best.cx + (rnd() - 0.5) * 26, tz = best.cz + (rnd() - 0.5) * 26;
-      flashPool.emit(sx, gY, sz, 2.2, 0.4, 0.08, 1, 0, 0, 0, 0);
+      flashPool.emit(sx, gY, sz, t.hero ? 3.4 : 2.2, 0.4, 0.08, 1, 0, 0, 0, 0);
       for (let i = 0; i < 3; i++) {
         smokePool.emit(sx + (vrnd() - 0.5), gY, sz + (vrnd() - 0.5),
           0.6, 2.4, 1.6, 0.5, 0, 0.3, Math.sin(t.yaw) * 2, Math.cos(t.yaw) * 2);
       }
-      explodeGround(tx, tz, t.heavy ? 1.05 : 0.7);
-      const hits = blastCasualties(foe, tx, tz, 7.5, 5, 0.8);
-      if (hits > 0) blog((t.heavy ? '重坦克' : '轻坦克') + ' 炮击 ' + foe.side.label + ' — ' + hits + ' 人倒下', '#c8a05a');
+      explodeGround(tx, tz, t.hero ? 1.5 : t.heavy ? 1.05 : 0.7);
+      const hits = blastCasualties(foe, tx, tz, t.hero ? 13 : 7.5, t.hero ? 10 : 5, 0.8);
+      if (hits > 0) blog((t.hero ? '重型战车' : t.heavy ? '重坦克' : '轻坦克') + ' 炮击 ' + foe.side.label + ' — ' + hits + ' 人倒下', '#c8a05a');
     }
   }
 }
@@ -3524,7 +3930,7 @@ function damageTank(t, dmg, by) {
     t.dead = true;
     ARMOR.lost[t.side]++;
     t.rig.paint(t.idx, { body: [0.14, 0.12, 0.11] });   // 残骸留场：整车涂黑当烧毁车体
-    explodeGround(t.x, t.z, t.heavy ? 1.9 : 1.4);
+    explodeGround(t.x, t.z, t.hero ? 2.6 : t.heavy ? 1.9 : 1.4);
     for (let i = 0; i < 6; i++) {
       burstPool.emit(t.x + (vrnd() - 0.5) * 3, groundY(t.x, t.z) + 1 + i * 1.3, t.z + (vrnd() - 0.5) * 3,
         2.0, 7.0, 3.0, 0.75, 0, 1.6, (vrnd() - 0.5), (vrnd() - 0.5));
@@ -3592,11 +3998,11 @@ function motorUpdate(dt) {
 function vehSync() {
   for (const t of ARMOR.tanks) {
     if (t.dead) continue;
-    t.rig.write(t.idx, t.x, t.y, t.z, t.yaw, 0, 0, { wheel: t.wheel, yaw: 0, pitch: 0 });
+    t.rig.write(t.idx, t.x, t.y, t.z, t.yaw, 0, 0, { wheel: t.wheel, yaw: t.turret || 0, pitch: 0 });
   }
   for (const v of ARMOR.trucks) v.rig.write(v.idx, v.x, v.y, v.z, v.yaw, 0, 0, { wheel: v.wheel });
   for (const m of ARMOR.motos) m.rig.write(m.idx, m.x, m.y, m.z, m.yaw, 0, 0, { wheel: m.wheel });
-  tankHRig.flush(); tankLRig.flush(); truckRig.flush(); motoRig.flush();
+  tankHRig.flush(); tankLRig.flush(); tankHeroRig.flush(); truckRig.flush(); motoRig.flush();
 }
 
 function simulate(dt) {
@@ -3604,6 +4010,7 @@ function simulate(dt) {
   for (const a of [U, C]) for (const u of a.units) if (u.kind !== 'art') u.cover = coverAt(u);
   aiUpdate(U, dt); aiUpdate(C, dt);
   armorUpdate(dt);
+  fortUpdate(dt);
   motorUpdate(dt);
   airUpdate(dt);
   aaUpdate(dt);
@@ -3675,10 +4082,16 @@ function updateHUD(dt) {
   if (B.phase !== lastPhase) { lastPhase = B.phase; phasePulse(); }   // 阶段切换给一次缩放脉冲
   HUD.clock.textContent = B.t.toFixed(1) + ' s' + (B.paused ? ' · 暂停' : '');
   HUD.speed.textContent = '速度 ×' + B.speed;
-  const airAlive = k => AIR.craft.filter(c => c.side === k && !c.dead).length + '/' + AIR.craft.filter(c => c.side === k).length;
-  const tankAlive = k => ARMOR.tanks.filter(t => t.side === k && !t.dead).length + '/' + ARMOR.tanks.filter(t => t.side === k).length;
+  const aliveOf = list => list.filter(v => !v.dead).length + '/' + list.length;
+  const airAlive = k => aliveOf(AIR.craft.filter(c => c.side === k));
+  const tankAlive = k => aliveOf(ARMOR.tanks.filter(t => t.side === k && !t.hero));
+  const heroAlive = k => aliveOf(ARMOR.tanks.filter(t => t.side === k && t.hero));
+  const fortAlive = k => aliveOf(FORT.filter(f => f.side === k));
   HUD.air.textContent = '航空兵 ' + airAlive('union') + '/' + airAlive('confederate')
-    + ' · 坦克 ' + tankAlive('union') + '/' + tankAlive('confederate') + ' · 高炮 ' + AIR.guns.length;
+    + ' · 坦克 ' + tankAlive('union') + '/' + tankAlive('confederate')
+    + ' · 重战车 ' + heroAlive('union') + '/' + heroAlive('confederate')
+    + ' · 堡垒 ' + fortAlive('union') + '/' + fortAlive('confederate')
+    + ' · 高炮 ' + AIR.guns.length;
 }
 
 function bannersUpdate(dt) {
@@ -3695,6 +4108,9 @@ const VIEWS = [
   { id: 'conf', label: '邦联军视角', pos: [0, 26, 368], tgt: [0, 10, -80], fov: 46 },
   { id: 'art', label: '炮兵阵地', pos: [-216, 30, -496], tgt: [-64, 6, -224], fov: 42 },
   { id: 'air', label: '制空权', pos: [0, 300, 900], tgt: [0, 140, -40], fov: 52 },
+  /* 侧向剖面：河(中)、路、双方壕线、堡垒、机场沿 z 轴一字排开，一眼看清地形 */
+  { id: 'map', label: '战场地形', pos: [1460, 620, 0], tgt: [0, 0, 0], fov: 40 },
+  { id: 'field', label: '机场', pos: [-150, 130, -520], tgt: [0, 0, -740], fov: 42 },
   { id: 'melee', label: '跟拍战斗', follow: true, fov: 44 },
   { id: 'orbit', label: '环绕观赏', auto: true, fov: 50 }
 ];
@@ -3816,6 +4232,10 @@ function loop() {
     updateHUD(dt);
     bannersUpdate(dt);
     fxTime += raw;
+    /* 水面流动：纯视觉、走 UV offset（标准材质 uniform，WebGPU 后端同样成立），
+       不碰 rnd/vrnd，因此不影响战局 */
+    RIVERFX.map.offset.x = (fxTime * 0.012) % 1;
+    RIVERFX.nrm.offset.x = (-fxTime * 0.02) % 1;
   }
   syncArmy(U);
   syncArmy(C);
@@ -3861,7 +4281,7 @@ window.addEventListener('resize', () => {
 
 window.addEventListener('keydown', e => {
   if (e.code === 'Space') { B.paused = !B.paused; pausedBadge(B.paused); e.preventDefault(); }
-  if (e.key >= '1' && e.key <= '7') setView(VIEWS[+e.key - 1]);
+  if (e.key >= '1' && e.key <= '9') setView(VIEWS[+e.key - 1]);
   if (e.key === '[' || e.key === ']') {
     let i = SPEEDS.indexOf(B.speed);
     i = clamp(i + (e.key === ']' ? 1 : -1), 0, SPEEDS.length - 1);
@@ -4084,13 +4504,20 @@ window.__battle = {
   armor() {
     return {
       tanks: ARMOR.tanks.map(t => ({
-        side: t.side, kind: t.heavy ? 'heavy' : 'light', state: t.state, dead: t.dead,
-        hp: Math.round(t.hp), x: Math.round(t.x), z: Math.round(t.z)
+        side: t.side, kind: t.hero ? 'hero' : t.heavy ? 'heavy' : 'light', state: t.state, dead: t.dead,
+        hp: Math.round(t.hp), maxHp: t.maxHp, x: Math.round(t.x), z: Math.round(t.z)
       })),
       trucks: ARMOR.trucks.map(v => ({ side: v.side, state: v.state, x: Math.round(v.x), z: Math.round(v.z), cargo: v.cargo })),
       motos: ARMOR.motos.map(m => ({ side: m.side, x: Math.round(m.x), z: Math.round(m.z) })),
       lost: ARMOR.lost
     };
+  },
+  fort() {
+    return FORT.map(F => ({
+      side: F.side, dead: F.dead, hp: Math.round(F.hp), maxHp: F.maxHp,
+      x: F.x, z: F.z, guns: F.guns.length,
+      nextReload: +F.guns[0].reload.toFixed(2)
+    }));
   },
   ai() {
     const one = a => ({
