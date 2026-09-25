@@ -3390,8 +3390,10 @@ function creepingBarrage(u, tgt) {
   for (let i = 0; i < BARRAGE_LEN; i++) {
     BARRAGE.push({
       side: u.army.key, t: 0.4 + i * 0.62,
+      /* 落点只能从敌军线向纵深走：explodeGround 的压制不分敌我，
+         若弹幕从己方线前起步，前几发会落在自家散兵/工兵头上把它们压住 */
       x: tgt.cx + (rnd() - 0.5) * 44,
-      z: tgt.cz - dir * 120 + dir * i * 22 + (rnd() - 0.5) * 26
+      z: tgt.cz + dir * (10 + i * 24) + (rnd() - 0.5) * 26
     });
   }
   ABIL.barrage++;
