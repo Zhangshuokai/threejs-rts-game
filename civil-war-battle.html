@@ -303,7 +303,19 @@ let SHRAPNEL_FUSE = clamp(parseFloat(FXQ.get('shrap') || '26') || 26, 5, 120);
 const SHRAPNEL_R = 18;        // 空爆杀伤半径（凌空覆盖，掩体可减伤）
 const SHRAPNEL_CAP = 10;      // 一次空爆最多杀伤人数（AP，比 HE 的 cap 高）
 const SHRAPNEL_CHANCE = 0.72; // 空爆命中概率（掩体可减伤）
-const SHELL_FIRED = { he: 0, shrap: 0 };
+const SHELL_FIRED = { he: 0, shrap: 0, wmd: 0 };
+/* 大规模杀伤兵器（WMD，"攻城重炮"）：只有堡垒要塞炮与英雄重战车能发射。
+   刻意做成"伤害小、杀伤范围大、地形改变大"：单兵命中率与总伤亡上限都很低，
+   但半径极大，且落地能挖出一整片"弹坑场"（中心坑 + 环形卫星坑）。
+   验收面见 __battle.ballistics().wmd。 */
+const WMD_POWER = 4.6;          // 地形改变：中心坑口径/坑深（clamp 到 [-3.0, +1.2]）
+const WMD_R = 86;               // 杀伤半径（大）
+const WMD_CAP = 16;             // 单发总伤亡上限（低 = 伤害小）
+const WMD_CHANCE = 0.12;        // 单兵命中率（低）
+const WMD_SUPPRESS_R = 60;      // 大范围压制半径
+const WMD_SATELLITES = 8;       // 环形卫星弹坑数（弹坑场的确定性偏移）
+const WMD_FORT_EVERY = 5;       // 堡垒要塞炮每 5 发里 1 发 WMD
+const WMD_TANK_EVERY = 4;       // 英雄重战车每 4 发里 1 发 WMD
 const FX = {
   enabled: false,
   wanted: MODE === 'webgl' && FXQ.get('fx') !== '0',
@@ -538,6 +550,66 @@ function terrainFlat(x, z) {
   const dz = Math.max(Math.abs(z) - Z_FLAT, 0), dx = Math.max(Math.abs(x) - 152 * S, 0);
   return n * 2.6 * smooth(Math.hypot(dx, dz) / (48 * S));   // 战场内压平，外围按比例起坡
 }
+/* ---- 二叉树地形：分叉的山脊 / 沟谷骨架 ----
+   地形走向由一棵"二叉树"决定：一条主脊在节点处一分为二，每条子脊再一分为二，
+   高度/长度/半径逐级衰减、相邻层级正负交替 —— 于是山脉与山谷成对分叉出现，
+   而不是 sin/cos 那种等距条纹（旧版规则起伏的问题）。两棵树从地图对角向中心
+   生长：树干（高）留在核心战区之外，树梢（矮）伸入战区，核心再用 reliefScale
+   压低到可作战的缓坡。
+   骨架一次性烘焙进 rh（16 m 高程场），运行时只做双线性采样 —— O(1)，逐士兵
+   每步调用也扛得住。随机量走独立流 grnd，不消耗玩法 rnd / 视觉 vrnd。 */
+const RH_RES = 16, RH_HALF = 400 * S;
+const RH_N = Math.round(2 * RH_HALF / RH_RES) + 1;
+const RH_X0 = -RH_HALF, RH_Z0 = -RH_HALF;
+const rh = new Float32Array(RH_N * RH_N);
+{
+  const grnd = mulberry32(0x7E3A11);
+  const stamp = (x1, z1, x2, z2, r, h) => {
+    const i0 = Math.max(0, Math.floor((Math.min(x1, x2) - r - RH_X0) / RH_RES));
+    const i1 = Math.min(RH_N - 1, Math.ceil((Math.max(x1, x2) + r - RH_X0) / RH_RES));
+    const j0 = Math.max(0, Math.floor((Math.min(z1, z2) - r - RH_Z0) / RH_RES));
+    const j1 = Math.min(RH_N - 1, Math.ceil((Math.max(z1, z2) + r - RH_Z0) / RH_RES));
+    const dx = x2 - x1, dz = z2 - z1, L2 = dx * dx + dz * dz || 1;
+    for (let j = j0; j <= j1; j++) {
+      const z = RH_Z0 + j * RH_RES;
+      for (let i = i0; i <= i1; i++) {
+        const x = RH_X0 + i * RH_RES;
+        const t = clamp(((x - x1) * dx + (z - z1) * dz) / L2, 0, 1);
+        const d = Math.hypot(x - (x1 + dx * t), z - (z1 + dz * t));
+        if (d >= r) continue;
+        const w = 1 - d / r;
+        rh[j * RH_N + i] += h * w * w * (3 - 2 * w);
+      }
+    }
+  };
+  const grow = (x, z, ang, len, h, r, depth, sign) => {
+    const x2 = x + Math.cos(ang) * len, z2 = z + Math.sin(ang) * len;
+    stamp(x, z, x2, z2, r, h * sign);
+    if (depth <= 0) return;
+    const sp = 0.42 + grnd() * 0.55;
+    const nl = len * (0.56 + grnd() * 0.14), nh = h * (0.58 + grnd() * 0.14), nr = r * (0.66 + grnd() * 0.12);
+    grow(x2, z2, ang - sp, nl, nh, nr, depth - 1, -sign);
+    grow(x2, z2, ang + sp, nl, nh, nr, depth - 1, -sign);
+  };
+  grow(-1200, -1520, 1.02, 640, 60, 220, 5, 1);
+  grow(1230, 1520, -2.12, 640, 60, 220, 5, 1);
+}
+function treeField(x, z) {
+  const fx = (x - RH_X0) / RH_RES, fz = (z - RH_Z0) / RH_RES;
+  if (fx < 0 || fz < 0 || fx > RH_N - 1 || fz > RH_N - 1) return 0;
+  const i = fx | 0, j = fz | 0, tx = fx - i, tz = fz - j;
+  const i1 = i + 1 < RH_N ? i + 1 : i, j1 = j + 1 < RH_N ? j + 1 : j;
+  const row = j * RH_N, row1 = j1 * RH_N;
+  const a = rh[row + i], b = rh[row + i1], c = rh[row1 + i], d = rh[row1 + i1];
+  const top = a + (b - a) * tx, bot = c + (d - c) * tx;
+  return top + (bot - top) * tz;
+}
+/* 核心战区压低起伏：0.34（可作战的缓坡）→ 1（外围分叉山脉全高） */
+function reliefScale(x, z) {
+  const dz = Math.max(Math.abs(z) - Z_FLAT, 0), dx = Math.max(Math.abs(x) - 152 * S, 0);
+  return 0.34 + 0.66 * smooth(Math.hypot(dx, dz) / (52 * S));
+}
+function terrainRelief(x, z) { return treeField(x, z) * reliefScale(x, z); }
 /* ---- 河道（浅水河，横贯战场）----
    把"下挖"写进 terrainBase：groundY / 贴花 / 士兵 y 全都自动跟着河床走，
    河道于是是个真属性而不是一张贴图。水面单独建 ribbon（比 8 m 地面网格密），
@@ -559,7 +631,7 @@ function riverDepth(x, z) {
   const t = riverCore(x, z);
   return RIVER.depth * t * t * (3 - 2 * t);
 }
-const riverWaterY = x => terrainFlat(x, RIVER.z(x)) - RIVER.drop;
+const riverWaterY = x => terrainFlat(x, RIVER.z(x)) + terrainRelief(x, RIVER.z(x)) - RIVER.drop;
 
 /* ---- 可破坏地形：弹坑高程场（splat heightfield） ----
    方案（联网检索后采用）：three.js 官方 webgl_geometry_terrain / webgl_geometry_terrain_raycast
@@ -610,7 +682,7 @@ function craterAt(x, z) {
   const top = a + (b - a) * tx, bot = c + (d - c) * tx;
   return top + (bot - top) * tz;
 }
-function terrainBase(x, z) { return terrainFlat(x, z) - riverDepth(x, z) + craterAt(x, z); }
+function terrainBase(x, z) { return terrainFlat(x, z) + terrainRelief(x, z) - riverDepth(x, z) + craterAt(x, z); }
 /* ---- 机场：跑道范围先在地形里压平，否则飞机是在起伏草地上滑跑/接地 ---- */
 /* 机场必须整个落在本军后方：跑道不得伸进战线/炮兵阵地，也不能占用观赏机位的空域。
    yaw = 起飞方向（0 朝 +z，π/2 朝 +x）；跑道长轴与它对齐 —— 机场整体转 90° 后
@@ -632,6 +704,9 @@ function afLocal(A, x, z) {
 const FORT_SITE = { union: { x: 300, z: -Z_FORT, yaw: 0 }, confederate: { x: -300, z: Z_FORT, yaw: Math.PI } };
 const PAD_Y = {};
 for (const k in AIRFIELD) PAD_Y[k] = terrainBase(AIRFIELD[k].x, AIRFIELD[k].z);
+/* 堡垒基座压平：交战区加入起伏后，44×38 的基座必须坐落在水平台面上（与机场同一套做法） */
+const FORT_PAD_Y = {};
+for (const k in FORT_SITE) FORT_PAD_Y[k] = terrainBase(FORT_SITE[k].x, FORT_SITE[k].z);
 function onAirfield(x, z) {
   for (const k in AIRFIELD) {
     const A = AIRFIELD[k], l = afLocal(A, x, z);
@@ -647,6 +722,14 @@ function terrainH(x, z) {
     const fz = clamp(1 - (Math.abs(l[1]) - PAD_Z) / PAD_FADE, 0, 1);
     const w = fx * fz;
     if (w > 0) y = lerp(y, PAD_Y[k], w);
+  }
+  /* 堡垒台面：只在基座附近查询，绝大多数调用两次 abs 就早退（逐士兵每步都走这里） */
+  for (const k in FORT_SITE) {
+    const F = FORT_SITE[k];
+    const dx = Math.abs(x - F.x), dz = Math.abs(z - F.z);
+    if (dx > 34 || dz > 30) continue;
+    const w = clamp(1 - Math.max(dx - 22, dz - 18) / 10, 0, 1);
+    if (w > 0) y = lerp(y, FORT_PAD_Y[k], w);
   }
   return y;
 }
@@ -890,7 +973,7 @@ const RIVERFX = { map: waterTex, nrm: waterNrm };
 /* ---- 石拱桥：架在两条侧路与河道的交叉点上（侧路在 x=±620，远离部队行进带，
    单位不会从桥身里穿过去）。桥面/栏板/桥墩共用一套顶点色，一座桥 1 个 draw call。 */
 function buildBridge(x) {
-  const zc = RIVER.z(x), deck = terrainFlat(x, zc) + 1.1, parts = [];
+  const zc = RIVER.z(x), deck = terrainFlat(x, zc) + terrainRelief(x, zc) + 1.1, parts = [];
   parts.push(tinted(at(box(11, 0.7, 34), 0, deck, 0), 0x928d7c));
   for (const s of [-1, 1]) parts.push(tinted(at(box(0.7, 1.05, 34), s * 5.6, deck + 0.9, 0), 0x7d7868));
   for (let k = -2; k <= 2; k++) parts.push(tinted(at(cyl(1.7, 2.0, deck + 1.8, 10), 0, (deck - 1.8) / 2, k * 7.4), 0x6f6a5c));
@@ -962,6 +1045,16 @@ for (let i = 0; i < 26 * S * 2; i++) {
   const x = (-172 + trnd() * 84) * S, z = (-70 - trnd() * 92) * S - ZSH;
   if (onAirfield(x, z)) continue;
   treeSpots.push([x, z, 0.75 + trnd() * 0.7]);
+}
+/* 随机散树：在战场外围环带（含新增山体/谷地坡面）铺一层疏密不均的树，增加地形随机感。
+   仍然避开核心战区（战壕/炮兵线）、机场净空与河道；全部走 trnd，不动玩法 rnd。 */
+for (let i = 0; i < 240 * S; i++) {
+  const a = trnd() * TAU, rad = (200 + Math.pow(trnd(), 0.7) * 175) * S;
+  const x = Math.cos(a) * rad, z = Math.sin(a) * rad * 0.86;
+  if (Math.abs(z) < Z_ART + 100 && Math.abs(x) < 170 * S) continue;
+  if (onAirfield(x, z)) continue;
+  if (riverCore(x, z) > 0.02) continue;
+  treeSpots.push([x, z, 0.7 + trnd() * 0.8]);
 }
 const trunkGeo = new THREE.CylinderGeometry(0.26, 0.42, 5.2, 6);
 trunkGeo.translate(0, 2.6, 0);
@@ -2053,18 +2146,26 @@ function fireShell(gun) {
   sh.x = sx + ux * 2.3; sh.y = gun.muzzleY || 1.7; sh.z = sz + uz * 2.3;
   sh.vx = ux * v * Math.cos(ang); sh.vz = uz * v * Math.cos(ang); sh.vy = v * Math.sin(ang);
   const shrap = !!gun.shrapnel && !!target && !fort;
-  if (shrap) SHELL_FIRED.shrap++; else SHELL_FIRED.he++;
-  sh.active = true; sh.dist = 0.62; sh.trailStep = 1.3;
-  sh.mode = shrap ? 'shrapnel' : 'art';
+  /* WMD 大规模杀伤弹：只有堡垒要塞炮 / 英雄重战车会带 gun.wmd，弹道与榴弹相同，
+     但口径更大、飞行更慢、落地后走 wmdImpact（低伤害 + 大范围 + 大范围地形改变）。 */
+  const wmd = !!gun.wmd && !shrap;
+  if (wmd) SHELL_FIRED.wmd++;
+  else if (shrap) SHELL_FIRED.shrap++;
+  else SHELL_FIRED.he++;
+  sh.active = true; sh.dist = wmd ? 2.4 : 0.62; sh.trailStep = wmd ? 3.2 : 1.3;
+  sh.mode = wmd ? 'wmd' : (shrap ? 'shrapnel' : 'art');
+  sh.power = wmd ? WMD_POWER : 1;
+  sh.label = wmd ? (gun.wmdLabel || '大规模杀伤弹') : null;
   sh.tx = tx; sh.tz = tz;                       // 空爆引信以"瞄准点"为基准
   if (shrap) sh.fuse = SHRAPNEL_FUSE;
   sh.mesh.visible = true; sh.side = gun.army.key;
+  sh.mesh.scale.setScalar(wmd ? 2.6 : 1);
   sh.acc = acc; sh.ox = sx; sh.oz = sz; sh.blind = blind;
   sh.mesh.position.set(sh.x, sh.y, sh.z);
   gun.recoil = 1;
   for (const s of gun.crew) { s.state = 'fire'; s.recoil = 1; }
-  flashPool.emit(sh.x + ux * 1.3, sh.y + 0.22, sh.z + uz * 1.3, 3.0, 0.5, 0.08, 1, 0, 0, ux * 2.4, uz * 2.4);
-  for (let i = 0; i < 7; i++) {
+  flashPool.emit(sh.x + ux * 1.3, sh.y + 0.22, sh.z + uz * 1.3, wmd ? 6.0 : 3.0, wmd ? 1.0 : 0.5, 0.08, 1, 0, 0, ux * 2.4, uz * 2.4);
+  for (let i = 0; i < (wmd ? 12 : 7); i++) {
     smokePool.emit(
       sh.x + ux * (1.2 + i * 1.7) + (vrnd() - 0.5) * 3.2, 1.5 + vrnd() * 2.6,
       sh.z + uz * (1.2 + i * 1.7) + (vrnd() - 0.5) * 3.2,
@@ -2165,6 +2266,50 @@ function shrapnelGround(sh) {
     Math.ceil(SHRAPNEL_CAP * 0.6), SHRAPNEL_CHANCE * 0.7 * sh.acc);
   if (hits > 0) blog('霰弹落地 — ' + foe.side.label + ' ' + hits + ' 人倒下', '#e0b060');
 }
+/* 大规模杀伤弹（WMD）落地：伤害小但范围大、地形改变大。
+   ① 中心爆炸复用统一爆炸（巨型火球 + 土浪 + 破片 + 中心大口径弹坑）；
+   ② 环形卫星弹坑把中心坑扩成一片"弹坑场"（固定偏移 = 纯确定性，不用任何 PRNG）；
+   ③ 蘑菇云烟柱 + 顶部外扩云盖（视觉，走 vrnd）；
+   ④ 大半径、低单兵命中率、低伤亡上限的杀伤 + 大范围压制。 */
+function wmdImpact(sh) {
+  const foe = sh.side === 'union' ? C : U;
+  const x = sh.x, z = sh.z, gY = terrainH(x, z);
+  explodeGround(x, z, WMD_POWER);
+  for (let k = 0; k < WMD_SATELLITES; k++) {
+    const a = k * (TAU / WMD_SATELLITES) + 0.4, rr = 20 + (k % 3) * 14;
+    addTerrainCrater(x + Math.cos(a) * rr, z + Math.sin(a) * rr, 1.4 + (k % 2) * 0.7);
+  }
+  /* 蘑菇云：上升烟柱 + 顶部外扩的云盖 */
+  for (let i = 0; i < 26; i++) {
+    const h = 2 + i * 2.6;
+    smokePool.emit(x + (vrnd() - 0.5) * 5, gY + h, z + (vrnd() - 0.5) * 5,
+      2.4 + h * 0.12, 7 + vrnd() * 3, 1.5, 0.7, 0, 0.25,
+      (vrnd() - 0.5) * 0.6, (vrnd() - 0.5) * 0.6);
+  }
+  for (let i = 0; i < 16; i++) {
+    const a = vrnd() * TAU, rr = vrnd() * 26;
+    smokePool.emit(x + Math.cos(a) * rr, gY + 66 + vrnd() * 12, z + Math.sin(a) * rr,
+      4.5, 8.5, 2.0, 0.62, 0, 0.1 + vrnd() * 0.25, Math.cos(a) * 2.2, Math.sin(a) * 2.2);
+  }
+  /* 低伤害 + 大范围：半径 WMD_R、单兵命中率 WMD_CHANCE、总上限 WMD_CAP */
+  const hits = blastCasualties(foe, x, z, WMD_R, WMD_CAP, WMD_CHANCE * sh.acc);
+  if (hits > 0) blog((sh.label || '大规模杀伤弹') + ' 命中 ' + foe.side.label + ' — ' + hits + ' 人倒下（范围极大）', '#e8b060');
+  /* 大范围压制：两军都吃（范围比普通爆炸更大） */
+  for (const a of [U, C]) for (const u of a.units) {
+    if (u.kind === 'art' || u.gone || u.men <= 0) continue;
+    const d = Math.hypot(u.cx - x, u.cz - z);
+    if (d < WMD_SUPPRESS_R) u.suppress = clamp(u.suppress + 0.5 * (1 - d / WMD_SUPPRESS_R), 0, 1);
+  }
+  /* 伤害刻意小：装甲/工事只是被"震一下"，数值远低于普通炮弹 */
+  for (const t of ARMOR.tanks) {
+    if (t.dead || t.side === sh.side) continue;
+    if (Math.hypot(t.x - x, t.z - z) < WMD_R * 0.5 && rnd() < 0.22) damageTank(t, 30 + rnd() * 40, sh.label || '大规模杀伤弹');
+  }
+  for (const F of FORT) {
+    if (F.dead || F.side === sh.side) continue;
+    if (Math.hypot(F.x - x, F.z - z) < WMD_R && rnd() < 0.25) damageFort(F, 40 + rnd() * 50, sh.label || '大规模杀伤弹');
+  }
+}
 function projectilesUpdate(dt) {
   for (const sh of shells) {
     if (!sh.active) continue;
@@ -2189,7 +2334,10 @@ function projectilesUpdate(dt) {
     if (sh.y <= gY + 0.15) {
       sh.active = false; sh.mesh.visible = false;
       const foe = sh.side === 'union' ? C : U;
-      if (sh.mode === 'tank') {
+      if (sh.mode === 'wmd') {
+        /* 大规模杀伤弹：低伤害 / 大范围 / 大范围地形改变 */
+        wmdImpact(sh);
+      } else if (sh.mode === 'tank') {
         /* 坦克炮弹：低伸弹道落地，单一杀伤半径（数值与原"瞬间结算"一致） */
         explodeGround(sh.x, sh.z, sh.power);
         const hits = blastCasualties(foe, sh.x, sh.z, sh.killR, sh.cap, sh.chance);
@@ -2398,6 +2546,68 @@ const obstacles = [];
     }
   }
 }
+
+/* ---- 城市废墟：沿河道两岸的断壁残垣（与河道共同形成"河畔废城"）----
+   布局用独立流 urnd（不吃玩法 rnd / 视觉 vrnd）。每座残屋拆成四面断墙，
+   沿墙每隔 3.4 m 放一个实体碰撞圆（solid），并随机留出破口——士兵/战车
+   会被墙挡住、沿切线滑开绕行（碰撞 + 躲避），同时断墙提供 0.6 掩体。
+   桥头走廊 |x| < 30 留空，纵队仍能过河；院内瓦砾是非实体障碍（踩得上去、
+   只减速），与随机障碍同一套属性。 */
+const RUINS = [];        // 可视构件（烘焙成一个 mesh）
+const ruinCount = { buildings: 0, walls: 0, rubble: 0 };
+{
+  const urnd = mulberry32(0xC17BE11);
+  const placeBuilding = (bx, bz, w, d, h, rot) => {
+    ruinCount.buildings++;
+    const c = Math.cos(rot), s = Math.sin(rot);
+    const toW = (lx, lz) => [bx + lx * c + lz * s, bz - lx * s + lz * c];
+    /* 四面墙：[局部中心x, 局部中心z, 局部方向x, 局部方向z, 长度, 世界朝向] */
+    const walls = [
+      [0, -d / 2, 1, 0, w, rot + Math.PI / 2],
+      [0, d / 2, 1, 0, w, rot + Math.PI / 2],
+      [-w / 2, 0, 0, 1, d, rot],
+      [w / 2, 0, 0, 1, d, rot]
+    ];
+    const skip = urnd() < 0.35 ? (urnd() * 4 | 0) : -1;   // 整面墙塌掉 = 破屋
+    walls.forEach((wall, wi) => {
+      if (wi === skip) return;
+      const [lx, lz, ex, ez, len, ang] = wall;
+      const n = Math.max(1, Math.round(len / 3.4));
+      for (let i = 0; i < n; i++) {
+        if (urnd() < 0.16) continue;                       // 破口：留出可穿越的缺口
+        const t = (i - (n - 1) / 2) * 3.4;
+        const wx = toW(lx + ex * t, lz + ez * t)[0];
+        const wz = toW(lx + ex * t, lz + ez * t)[1];
+        const hh = h * (0.5 + urnd() * 0.55);
+        RUINS.push({ x: wx, z: wz, w: 3.6, d: 0.7, h: hh, rot: ang - Math.PI / 2, tilt: (urnd() - 0.5) * 0.10, col: 0x8b8370 });
+        if (hh > 1.1) { obstacles.push({ kind: 'ruin', solid: true, x: wx, z: wz, r: 2.0, h: hh, cover: 0.6, rot: ang }); ruinCount.walls++; }
+      }
+    });
+    /* 院内瓦砾：低矮、可踩踏，只减速+给掩护 */
+    const nr = 2 + (urnd() * 3 | 0);
+    for (let k = 0; k < nr; k++) {
+      const rx = toW((urnd() - 0.5) * w * 0.7, (urnd() - 0.5) * d * 0.7)[0];
+      const rz = toW((urnd() - 0.5) * w * 0.7, (urnd() - 0.5) * d * 0.7)[1];
+      const rr = 1.3 + urnd() * 1.3;
+      const rh = 0.45 + urnd() * 0.6;
+      RUINS.push({ x: rx, z: rz, w: 2.0 + urnd() * 2.0, d: 1.6 + urnd() * 1.6, h: rh, rot: urnd() * TAU, tilt: (urnd() - 0.5) * 0.3, col: 0x9a9382, rubble: true });
+      obstacles.push({ kind: 'rubble', x: rx, z: rz, r: rr, h: rh, cover: 0.3, rot: 0 });
+      ruinCount.rubble++;
+    }
+  };
+  for (const side of [-1, 1]) {
+    for (let i = 0; i < 16; i++) {
+      const x = (urnd() * 2 - 1) * 250;
+      if (Math.abs(x) < 30) continue;                       // 桥头走廊
+      const z = RIVER.z(x) + side * (42 + urnd() * 92);
+      placeBuilding(x, z, 7 + urnd() * 5, 5.5 + urnd() * 3, 2.8 + urnd() * 4.4, urnd() * TAU);
+    }
+  }
+  /* 两座地标：断塔与残破烟囱，让"废城"在天际线上一眼可辨 */
+  placeBuilding(-70, RIVER.z(-70) - 54, 9, 9, 11, 0.4);
+  placeBuilding(74, RIVER.z(74) + 58, 8, 8, 9, -0.3);
+}
+
 const OB_CELL = 8;
 const obGrid = new Map();
 const obKey = (ix, iz) => (ix + 64) * 512 + (iz + 64);
@@ -2407,9 +2617,10 @@ for (let i = 0; i < obstacles.length; i++) {
   if (!obGrid.has(k)) obGrid.set(k, []);
   obGrid.get(k).push(i);
 }
-function obNear(x, z, fn) {
+function obNear(x, z, fn, cells) {
+  const c = cells || 1;
   const ix = Math.floor(x / OB_CELL), iz = Math.floor(z / OB_CELL);
-  for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) {
+  for (let a = -c; a <= c; a++) for (let b = -c; b <= c; b++) {
     const cell = obGrid.get(obKey(ix + a, iz + b));
     if (cell) for (const i of cell) fn(obstacles[i]);
   }
@@ -2417,10 +2628,49 @@ function obNear(x, z, fn) {
 function obstacleH(x, z) {
   let h = 0;
   obNear(x, z, o => {
+    if (o.solid) return;            // 实体建筑不"抬人"：由碰撞挡住并绕行，不做可踩踏地形
     const d = Math.hypot(x - o.x, z - o.z);
     if (d < o.r) h = Math.max(h, o.h * clamp(1 - d / o.r, 0, 1));
   });
   return h;
+}
+/* 实体障碍碰撞：把 (x,z) 推出所有 solid 圆并返回新坐标（推不出去返回 null）。
+   maxPush 限制单帧修正量，避免快速冲锋时发生瞬移。士兵与战车共用。 */
+let SOLID_ON = true;              // 调试开关：__battle.solid(false) 关碰撞做 A/B
+function solidResolve(x, z, rad, maxPush) {
+  if (!SOLID_ON) return null;
+  let ox = 0, oz = 0, hit = false;
+  obNear(x, z, o => {
+    if (!o.solid) return;
+    const dx = x - o.x, dz = z - o.z;
+    let d = Math.hypot(dx, dz);
+    const rr = o.r + rad;
+    if (d >= rr) return;
+    if (d < 1e-3) d = 1e-3;
+    ox += dx / d * (rr - d); oz += dz / d * (rr - d); hit = true;
+  });
+  if (!hit) return null;
+  const m = Math.hypot(ox, oz) || 1;
+  const k = Math.min(1, maxPush / m);
+  return { x: x + ox * k, z: z + oz * k };
+}
+/* 前方实体障碍 → 打舵方向（±1）。战车/单位在推进时用作"躲避"转向。 */
+function avoidSolid(x, z, yaw, look) {
+  if (!SOLID_ON) return 0;
+  let steer = 0, bd = 1e9, bx = 0, bz = 0, found = false;
+  obNear(x, z, o => {
+    if (!o.solid) return;
+    const dx = o.x - x, dz = o.z - z;
+    const d = Math.hypot(dx, dz);
+    if (d > o.r + look || d < 0.001) return;
+    if (d < bd) { bd = d; bx = dx; bz = dz; found = true; }
+  }, 3);
+  if (!found) return 0;
+  let a = Math.atan2(bx, bz) - yaw;
+  while (a > Math.PI) a -= TAU;
+  while (a < -Math.PI) a += TAU;
+  if (Math.abs(a) > 0.95) return 0;   // 障碍不在正前方，不打舵
+  return a >= 0 ? -1 : 1;
 }
 function obstacleCover(x, z) {
   let c = 0;
@@ -2776,6 +3026,7 @@ function buildObstacles() {
   const o = new THREE.Object3D(), baked = [];
   for (const ob of obstacles) {
     const D = defs[ob.kind];
+    if (!D) continue;               // 城市废墟另有专属几何（见 buildRuins）
     o.position.set(ob.x, terrainH(ob.x, ob.z) + 0.02, ob.z);
     o.rotation.set(ob.kind === 'log' ? (vr() - 0.5) * 0.1 : 0, ob.rot, ob.kind === 'rock' ? (vr() - 0.5) * 0.3 : 0);
     o.scale.set(ob.sc, ob.sc, ob.sc);
@@ -2786,6 +3037,21 @@ function buildObstacles() {
   mesh.castShadow = true; mesh.receiveShadow = true;
 }
 buildObstacles();
+
+/* 城市废墟可视：全部断墙/瓦砾烘焙成一个顶点色 mesh（1 个 draw call），
+   高度按地形贴合；实体墙的碰撞在 RUINS 生成时就已登记进 obstacles。 */
+function buildRuins() {
+  const parts = [], o = new THREE.Object3D();
+  for (const r of RUINS) {
+    o.position.set(r.x, terrainH(r.x, r.z) + r.h * 0.5 - (r.rubble ? 0.12 : 0), r.z);
+    o.rotation.set(r.tilt || 0, r.rot, (r.tilt || 0) * 0.6);
+    o.scale.set(1, 1, 1); o.updateMatrix();
+    parts.push({ geo: box(r.w, r.h, r.d), col: r.col, m4: o.matrix.clone() });
+  }
+  const mesh = bakedMesh(new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.98 }), parts);
+  mesh.castShadow = true; mesh.receiveShadow = true;
+}
+buildRuins();
 
 /* 工兵胸墙的可视网格：16 个实例的土垄，随 ttl 生长/消退（1 个 draw call） */
 const WORK_COUNT = 16;
@@ -3744,7 +4010,7 @@ for (const side of ['union', 'confederate']) {
     hero: true, heavy: true, rig: tankHeroRig, idx: side === 'union' ? 0 : 1, side,
     foe: side === 'union' ? 'confederate' : 'union',
     x, y: groundY(x, z), z, yaw: f > 0 ? 0 : Math.PI, wheel: 0, turret: 0,
-    hp: 2000, maxHp: 2000, range: 430, reload: 4, spd: 2.3, dead: false, state: 'advance'
+    hp: 2000, maxHp: 2000, range: 240, reload: 4, spd: 2.3, dead: false, state: 'advance'
   });
   tankHeroRig.paint(side === 'union' ? 0 : 1, VEH_PAINT[side]);
 }
@@ -3815,7 +4081,7 @@ const FORT = [];
     FORT.push({
       side, foe: side === 'union' ? 'confederate' : 'union', mesh, mat, guns,
       x: site.x, z: site.z, yaw: site.yaw,
-      hp: 1500, maxHp: 1500, range: 900, dead: false
+      hp: 1500, maxHp: 1500, range: 540, dead: false
     });
   }
 }
@@ -3839,7 +4105,9 @@ function fortUpdate(dt) {
       const d = Math.hypot(u.cx - F.x, u.cz - F.z);
       if (d < F.range && d < bd) { bd = d; best = u; }
     }
-    const foeFort = FORT.find(o => o.side === F.foe && !o.dead) || null;
+    /* 攻城只在射程内：堡垒射程已缩短，跨图互轰不再成立 */
+    let foeFort = FORT.find(o => o.side === F.foe && !o.dead) || null;
+    if (foeFort && Math.hypot(foeFort.x - F.x, foeFort.z - F.z) > F.range) foeFort = null;
     for (const g of F.guns) {
       g.army = armyOf(F.side); g.tank = null; g.crew = [];
       /* 每 4 发里有 1 发打对方堡垒（攻城）：又出戏，又能真的把对手的耐久打下去。
@@ -3848,8 +4116,11 @@ function fortUpdate(dt) {
       g.fort = foeFort ? (!best || (g.seq || 0) % 4 === 3 ? foeFort : null) : null;
       g.reload = Math.max(-1, g.reload - dt);
       if ((best || g.fort) && B.t > 6 && !B.over && g.reload <= 0) {
-        g.reload = 7.5 + rnd() * 3;
         g.seq = (g.seq || 0) + 1;
+        /* 每 WMD_FORT_EVERY 发里 1 发大规模杀伤弹（伤害小、范围大、地形改变大） */
+        g.wmd = g.seq % WMD_FORT_EVERY === 0;
+        g.wmdLabel = '要塞重炮';
+        g.reload = (g.wmd ? 15 : 7.5) + rnd() * 3;
         fireShell(g);
       }
     }
@@ -4591,6 +4862,9 @@ function soldierUpdate(s, dt) {
     s.z += dz / d * step;
     s.spd = step / dt;
   } else s.spd = 0;
+  /* 实体障碍（城市废墟）碰撞：被断墙挡住就推出、沿切线滑开绕行 */
+  const sr = solidResolve(s.x, s.z, 0.42, 0.55);
+  if (sr) { s.x = sr.x; s.z = sr.z; }
   if (s.spd > 0.25) s.yaw = Math.atan2(dx, dz);
   s.y = groundY(s.x, s.z);
   if (u.state === 'charge' && s.spd > 3 && vrnd() < dt * 5) {
@@ -5509,25 +5783,34 @@ function reinforceUpdate(dt) {
 }
 /* 坦克炮：不再是"瞬间落点结算"，而是打出一枚按重力诸元飞行的炮弹（复用 shells 池）。
    命中点由低伸弹道解算给出，飞行途中同样吃重力，落地才结算伤害。 */
-function fireTankShell(t, best) {
+function fireTankShell(t, best, wmd) {
   const sh = shells[shellIdx++ % shells.length];
   const fwd = t.hero ? 7.2 : 4.5;
   const sx = t.x + Math.sin(t.yaw) * fwd, sz = t.z + Math.cos(t.yaw) * fwd;
   const sy = groundY(t.x, t.z) + (t.hero ? 4.4 : 2.2);
   const tx = best.cx + (rnd() - 0.5) * 26, tz = best.cz + (rnd() - 0.5) * 26;
   const ty = groundY(best.cx, best.cz) + 1.0;
-  const b = ballisticVel(sx, sy, sz, tx, ty, tz, 240);
+  const b = ballisticVel(sx, sy, sz, tx, ty, tz, wmd ? 200 : 240);
   sh.x = sx; sh.y = sy; sh.z = sz;
   sh.vx = b.vx; sh.vy = b.vy; sh.vz = b.vz;
-  sh.active = true; sh.dist = 6; sh.trailStep = 6; sh.mode = 'tank';
+  sh.active = true; sh.dist = wmd ? 12 : 6; sh.trailStep = wmd ? 4 : 6;
+  sh.mode = wmd ? 'wmd' : 'tank';
   sh.side = t.side; sh.acc = 1;
-  sh.power = t.hero ? 1.5 : t.heavy ? 1.05 : 0.7;
-  sh.killR = t.hero ? 13 : 7.5; sh.cap = t.hero ? 10 : 5; sh.chance = 0.8;
-  sh.tankDmg = t.hero ? 120 : t.heavy ? 90 : 70;
-  sh.label = t.hero ? '重型战车' : t.heavy ? '重坦克' : '轻坦克';
+  if (wmd) {
+    /* 英雄重战车的"重炮"：低伤害 / 大范围 / 大范围地形改变 */
+    sh.power = WMD_POWER; sh.label = '重型战车·重炮';
+    SHELL_FIRED.wmd++;
+    t.reload = 13 + rnd() * 2;
+  } else {
+    sh.power = t.hero ? 1.5 : t.heavy ? 1.05 : 0.7;
+    sh.killR = t.hero ? 13 : 7.5; sh.cap = t.hero ? 10 : 5; sh.chance = 0.8;
+    sh.tankDmg = t.hero ? 120 : t.heavy ? 90 : 70;
+    sh.label = t.hero ? '重型战车' : t.heavy ? '重坦克' : '轻坦克';
+  }
   sh.mesh.visible = true; sh.mesh.position.set(sh.x, sh.y, sh.z);
-  flashPool.emit(sx, sy, sz, t.hero ? 3.4 : 2.2, 0.4, 0.08, 1, 0, 0, 0, 0);
-  for (let i = 0; i < 3; i++) {
+  sh.mesh.scale.setScalar(wmd ? 2.6 : 1);
+  flashPool.emit(sx, sy, sz, wmd ? 6.0 : t.hero ? 3.4 : 2.2, wmd ? 1.0 : 0.4, 0.08, 1, 0, 0, 0, 0);
+  for (let i = 0; i < (wmd ? 12 : 3); i++) {
     smokePool.emit(sx + (vrnd() - 0.5), sy, sz + (vrnd() - 0.5),
       0.6, 2.4, 1.6, 0.5, 0, 0.3, Math.sin(t.yaw) * 2, Math.cos(t.yaw) * 2);
   }
@@ -5572,16 +5855,24 @@ function armorUpdate(dt) {
     /* 推进：坦克自重能压过胸墙，过壕只减速约 35%（步兵是 72%） */
     const pen = 1 - 0.38 * clamp(workH(t.x, t.z) / 1.3, 0, 1);
     if (bd > t.range * 0.55) {
+      /* 躲避：正前方有实体废墟就打舵绕开；仍撞上则由 solidResolve 推出 */
+      const av = avoidSolid(t.x, t.z, t.yaw, 20);
+      if (av) t.yaw += av * 0.8 * dt;
       const s = t.spd * pen;
       t.x += Math.sin(t.yaw) * s * dt;
       t.z += Math.cos(t.yaw) * s * dt;
       t.wheel += s * dt * 1.6;
+      const sr = solidResolve(t.x, t.z, 3.2, 1.6);
+      if (sr) { t.x = sr.x; t.z = sr.z; }
       t.state = 'advance';
     } else t.state = 'engage';
     t.y = groundY(t.x, t.z);
     if (t.reload <= 0 && bd < t.range && B.t > 8) {
-      t.reload = (t.hero ? 7.2 : t.heavy ? 5.4 : 3.6) + rnd() * 1.4;
-      fireTankShell(t, best);
+      t.shots = (t.shots || 0) + 1;
+      /* 英雄重战车每 WMD_TANK_EVERY 发打一发大规模杀伤弹（fireTankShell 内部设专属装填时间） */
+      const wmd = t.hero && t.shots % WMD_TANK_EVERY === 0;
+      if (!wmd) t.reload = (t.hero ? 7.2 : t.heavy ? 5.4 : 3.6) + rnd() * 1.4;
+      fireTankShell(t, best, wmd);
     }
   }
 }
@@ -5635,6 +5926,8 @@ function motorUpdate(dt) {
     const sp = back ? 7.5 : 9.5;
     v.x += Math.sin(v.yaw) * sp * dt;
     v.z += Math.cos(v.yaw) * sp * dt;
+    const vsr = solidResolve(v.x, v.z, 2.2, 1.2);
+    if (vsr) { v.x = vsr.x; v.z = vsr.z; }
     v.y = groundY(v.x, v.z);
     v.wheel += sp * dt * 2.4;
   }
@@ -5648,6 +5941,8 @@ function motorUpdate(dt) {
     const sp = 13;
     m.x += Math.sin(m.yaw) * sp * dt;
     m.z += Math.cos(m.yaw) * sp * dt;
+    const msr = solidResolve(m.x, m.z, 0.9, 0.8);
+    if (msr) { m.x = msr.x; m.z = msr.z; }
     m.y = groundY(m.x, m.z);
     m.wheel += sp * dt * 3;
     const army = armyOf(m.side);
@@ -6221,6 +6516,35 @@ window.__battle = {
     t.meshDelta = +(groundGeo.attributes.position.getY(vi) - gBaseY[vi]).toFixed(3);
     return t;
   },
+  /* 大规模杀伤弹验收：在镜头目标处（或指定点）直接触发一发，返回同一份地形/弹道读数 */
+  wmd(x, z, side) {
+    wmdImpact({
+      x: x === undefined ? controls.target.x : x,
+      z: z === undefined ? controls.target.z : z,
+      side: side || 'union', acc: 1, label: '大规模杀伤弹'
+    });
+    const t = this.terrain();
+    t.atBlast = +craterAt(x === undefined ? controls.target.x : x, z === undefined ? controls.target.z : z).toFixed(3);
+    return { terrain: t, wmd: this.ballistics().wmd };
+  },
+  /* 地形/废墟验收：二叉树地形网格、城市废墟规模、实体碰撞探针 */
+  ruins() {
+    const sol = obstacles.filter(o => o.solid);
+    return {
+      buildings: ruinCount.buildings, walls: ruinCount.walls, rubble: ruinCount.rubble,
+      solids: sol.length, obstacles: obstacles.length,
+      sample: sol.slice(0, 5).map(o => ({ x: Math.round(o.x), z: Math.round(o.z), r: o.r })),
+      treeCount: treeSpots.length,
+      treeTerrain: { grid: RH_N, res: RH_RES }
+    };
+  },
+  collide(x, z, rad) {
+    const r = solidResolve(x === undefined ? controls.target.x : x,
+      z === undefined ? controls.target.z : z, rad || 2.4, 99);
+    return r ? { x: +r.x.toFixed(2), z: +r.z.toFixed(2), pushed: true } : { pushed: false };
+  },
+  /* A/B 开关：关闭实体碰撞（士兵/战车可穿过废墟），用于证明碰撞真的接入移动积分 */
+  solid(v) { if (v !== undefined) SOLID_ON = !!v; return SOLID_ON; },
   cover: () => [U, C].map(a => a.units.filter(u => u.kind !== 'art').map(u => u.name + ':' + (u.cover || 0).toFixed(2))).flat(),
   /* 可见性普查：列出"本该看见却没被绘制"或"雾里已经很淡"的对象。
      inFrustum 复刻 three 的判定（Frustum.intersectsObject）——对 InstancedMesh
@@ -6258,6 +6582,7 @@ window.__battle = {
       tanks: ARMOR.tanks.map(t => ({
         side: t.side, kind: t.hero ? 'hero' : t.heavy ? 'heavy' : 'light', state: t.state, dead: t.dead,
         hp: Math.round(t.hp), maxHp: t.maxHp, x: Math.round(t.x), z: Math.round(t.z),
+        range: t.range, shots: t.shots || 0,
         turret: t.turret === undefined ? null : +t.turret.toFixed(3)
       })),
       trucks: ARMOR.trucks.map(v => ({ side: v.side, state: v.state, x: Math.round(v.x), z: Math.round(v.z), cargo: v.cargo })),
@@ -6268,7 +6593,7 @@ window.__battle = {
   fort() {
     return FORT.map(F => ({
       side: F.side, dead: F.dead, hp: Math.round(F.hp), maxHp: F.maxHp,
-      x: F.x, z: F.z, guns: F.guns.length,
+      x: F.x, z: F.z, range: F.range, guns: F.guns.length,
       nextReload: +F.guns[0].reload.toFixed(2)
     }));
   },
@@ -6336,6 +6661,14 @@ window.__battle = {
           directDmg: HE_TANK.directDmg, directRnd: HE_TANK.directRnd, directChance: HE_TANK.directChance,
           fragDmg: HE_TANK.fragDmg, fragRnd: HE_TANK.fragRnd, fragChance: HE_TANK.fragChance
         }
+      },
+      /* 大规模杀伤兵器：伤害小 / 范围大 / 地形改变大，仅堡垒与英雄重战车发射 */
+      wmd: {
+        radius: WMD_R, cap: WMD_CAP, chance: WMD_CHANCE, power: WMD_POWER,
+        suppressRadius: WMD_SUPPRESS_R, satellites: WMD_SATELLITES,
+        fortEvery: WMD_FORT_EVERY, tankEvery: WMD_TANK_EVERY,
+        inFlight: shells.filter(s => s.active && s.mode === 'wmd').length,
+        fired: SHELL_FIRED.wmd
       }
     };
   },
