@@ -123,8 +123,18 @@
   }
   function boot(){
     if (navigator.gpu && !forceWebGL) {
-      navigator.gpu.requestAdapter().then(function(a){ start(a ? 'webgpu' : 'webgl'); })
-        .catch(function(){ start('webgl'); });
+      /* 优先独显：powerPreference 只是"偏好"提示，最终由浏览器/系统显卡设置决定；
+         可用 window.__GPU_ADAPTER 查看实际选中的适配器（vendor/architecture/description）。 */
+      navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }).then(function(a){
+        if (a) {
+          try {
+            window.__GPU_ADAPTER = a.info
+              ? { vendor: a.info.vendor, architecture: a.info.architecture, device: a.info.device, description: a.info.description }
+              : null;
+          } catch (e) { window.__GPU_ADAPTER = null; }
+        }
+        start(a ? 'webgpu' : 'webgl');
+      }).catch(function(){ start('webgl'); });
     } else {
       start('webgl');
     }
@@ -160,6 +170,8 @@ const S = 4;
 const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
 const lerp = (a, b, t) => a + (b - a) * t;
 const smooth = t => { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); };
+/* 统一重力加速度：炮弹/航弹/曳光弹/坦克炮弹全部按它下坠，发射诸元也按它做抬高修正 */
+const GRAV = 9.8;
 function mulberry32(a) {
   return function () {
     a |= 0; a = a + 0x6D2B79F5 | 0;
@@ -192,9 +204,9 @@ const HUD = {
 if (NOHUD) document.getElementById('hud').style.display = 'none';
 
 const MODE = window.__RENDERER_MODE || 'webgl';
-const renderer = MODE === 'webgpu'
-  ? new THREE.WebGPURenderer({ antialias: true })
-  : new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+  const renderer = MODE === 'webgpu'
+    ? new THREE.WebGPURenderer({ antialias: true, powerPreference: 'high-performance' })
+    : new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
 if (MODE === 'webgpu' && renderer.init) await renderer.init();
 renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
@@ -259,6 +271,11 @@ const VIS = {
   mgTracers: clamp(parseInt(FXQ.get('mgt') || '3', 10) || 3, 1, 10),
   poolScale: clamp(parseFloat(FXQ.get('cap') || '1') || 1, 0.05, 1)
 };
+/* 霰弹（空爆弹）：引信在「距瞄准点 fuse 米处」起爆，凌空洒出弹丸。
+   空爆距离可设定：?shrap=26（米），或运行时 __battle.shrapnel(40)。 */
+let SHRAPNEL_FUSE = clamp(parseFloat(FXQ.get('shrap') || '26') || 26, 5, 120);
+const SHRAPNEL_R = 18;        // 空爆杀伤半径（凌空覆盖，掩体可减伤）
+const SHELL_FIRED = { he: 0, shrap: 0 };
 const FX = {
   enabled: false,
   wanted: MODE === 'webgl' && FXQ.get('fx') !== '0',
@@ -1772,23 +1789,56 @@ for (let i = 0; i < 26; i++) {
   shells.push({ mesh: m, active: false, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, dist: 0, side: 'union', acc: 1 });
 }
 let shellIdx = 0;
-/* 「弹幕徐进」的待落弹表：{side, x, z, t}，由 projectilesUpdate 定时引爆 */
+/* 「弹幕徐进」的待落弹表：{side, x, z, ox, oz, t}，由 projectilesUpdate 定时引爆 */
 const BARRAGE = [];
+/* 炮兵情报：只有「看得见」才能精确射击。敌人炮阵地靠弹道反推得到坐标（反炮兵），
+   没观察也没反推就只能盲射。{x,z,t} 由 counterBatteryFix 写入，30 s 过期。 */
+const INTEL = { union: [], confederate: [] };
+const CB_OBSERVE = 240;     // 弹着点附近这么多米内有己方部队，才能反推出敌炮位
+function counterBatteryFix(firingSide, ix, iz, ox, oz) {
+  const key = firingSide === 'union' ? 'confederate' : 'union';
+  const foe = firingSide === 'union' ? C : U;
+  for (const u of foe.units) {
+    if (u.kind === 'art' || !u.onField) continue;
+    if (Math.hypot(u.cx - ix, u.cz - iz) > CB_OBSERVE) continue;
+    if (rnd() < 0.55) {
+      /* 反推有误差（声测/闪光定位），不是精确坐标 */
+      INTEL[key].push({ x: ox + (rnd() - 0.5) * 34, z: oz + (rnd() - 0.5) * 34, t: B.t });
+      while (INTEL[key].length > 6) INTEL[key].shift();
+    }
+    break;
+  }
+}
 function fireShell(gun) {
   /* 有坦克目标就优先打坦克——炮兵是唯一能拦住它的兵种；
      英雄建筑（堡垒）也可被炮击：堡垒炮会轮换"攻城"模式互轰，否则伤害路径永不触发 */
   const tank = gun.tank && !gun.tank.dead ? gun.tank : null;
   const fort = gun.fort && !gun.fort.dead ? gun.fort : null;
   const target = gun.targetUnit;
-  if (!tank && !target && !fort) return;
+  const cb = gun.cb || null;
+  const blind = !!gun.blind && !tank && !target && !fort && !cb;
+  if (!tank && !target && !fort && !cb && !blind) return;
   const sh = shells[shellIdx++ % shells.length];
   const sx = gun.x, sz = gun.z;
-  const ax = fort ? fort.x : tank ? tank.x : target.cx;
-  const az = fort ? fort.z : tank ? tank.z : target.cz;
-  /* 协同「散兵引导」：目标被己方散兵标定时，落点散布收窄、命中率提高 */
-  const spotted = !!(target && target.spottedBy === gun.army.key);
-  const spx = fort ? 10 : tank ? 8 : 14 * (spotted ? 0.4 : 1);
-  const spz = fort ? 10 : tank ? 8 : 12 * (spotted ? 0.4 : 1);
+  /* 三种射击诸元：
+     ① 有观察（散兵/侦察机/前哨标定）→ 精确打点，散布最小、命中加成；
+     ② 无观察但有弹道反推的敌炮坐标 → 反炮兵，中等散布；
+     ③ 既无观察也无反推 → 盲射，朝敌线概略区域大散布压制，且会误伤自己人。 */
+  let ax, az, spx, spz, acc;
+  if (fort) { ax = fort.x; az = fort.z; spx = 10; spz = 10; acc = 1; }
+  else if (tank) { ax = tank.x; az = tank.z; spx = 8; spz = 8; acc = 1; }
+  else if (target) {
+    const spotted = target.spottedBy === gun.army.key;
+    ax = target.cx; az = target.cz;
+    spx = 14 * (spotted ? 0.4 : 1.6); spz = 12 * (spotted ? 0.4 : 1.6);
+    acc = spotted ? 1.3 : 0.7;
+  } else if (cb) { ax = cb.x; az = cb.z; spx = 20; spz = 20; acc = 1.0; }
+  else {
+    const dir = gun.army.key === 'union' ? 1 : -1;
+    ax = (rnd() - 0.5) * 700;
+    az = lineZ(gun.army.key) + dir * (rnd() * 80 - 20);
+    spx = 70; spz = 70; acc = 0.6;
+  }
   const tx = ax + (rnd() - 0.5) * spx;
   const tz = az + (rnd() - 0.5) * spz;
   const dx = tx - sx, dz = tz - sz;
@@ -1799,8 +1849,14 @@ function fireShell(gun) {
   const ux = dx / flat, uz = dz / flat;
   sh.x = sx + ux * 2.3; sh.y = gun.muzzleY || 1.7; sh.z = sz + uz * 2.3;
   sh.vx = ux * v * Math.cos(ang); sh.vz = uz * v * Math.cos(ang); sh.vy = v * Math.sin(ang);
-  sh.active = true; sh.dist = 0.62; sh.mesh.visible = true; sh.side = gun.army.key;
-  sh.acc = spotted ? 1.3 : 1;
+  const shrap = !!gun.shrapnel && !!target && !fort;
+  if (shrap) SHELL_FIRED.shrap++; else SHELL_FIRED.he++;
+  sh.active = true; sh.dist = 0.62; sh.trailStep = 1.3;
+  sh.mode = shrap ? 'shrapnel' : 'art';
+  sh.tx = tx; sh.tz = tz;                       // 空爆引信以"瞄准点"为基准
+  if (shrap) sh.fuse = SHRAPNEL_FUSE;
+  sh.mesh.visible = true; sh.side = gun.army.key;
+  sh.acc = acc; sh.ox = sx; sh.oz = sz; sh.blind = blind;
   sh.mesh.position.set(sh.x, sh.y, sh.z);
   gun.recoil = 1;
   for (const s of gun.crew) { s.state = 'fire'; s.recoil = 1; }
@@ -1822,6 +1878,59 @@ function fireShell(gun) {
 }
 const SHELL_KILL_RADIUS = 6.4;
 const SHELL_FRAG_RADIUS = 15.5;   // 破片环：半径更大、命中率更低
+/* 反炮兵命中：耐久归零就炸毁火炮、炮手阵亡（炮兵此前是"打不死"的布景） */
+function damageGun(g, dmg, by) {
+  if (g.dead) return;
+  g.hp -= dmg;
+  if (g.hp > 0) return;
+  g.dead = true;
+  g.group.visible = false;
+  /* 炮手是从 foot 池直接征用的，没进任何 Unit.soldiers，所以不能走 Unit.kill，
+     只能就地走同一个血的收口血函数 */
+  for (const s of g.crew) {
+    if (!s.alive) continue;
+    s.alive = false; s.state = 'down'; s.fallT = 0; s.spd = 0; s.target = null;
+    bloodBurst(s, g.x - s.x, g.z - s.z, 1.2);
+  }
+  explodeGround(g.x, g.z, 0.85);
+  blog((g.army.key === 'union' ? '联邦' : '邦联') + '炮兵被' + by + '摧毁', '#e8865a');
+}
+/* 凌空弹丸对地覆盖：有掩体的部队吃到的概率更低（战壕对空爆有效） */
+function blastCasualtiesCovered(foe, x, z, radius, cap, chance) {
+  let hits = 0;
+  for (const u of foe.units) {
+    if (u.kind === 'art' || u.men <= 0 || u.gone) continue;
+    const c = 1 - 0.6 * clamp(u.cover || 0, 0, 1);
+    for (const s of u.aliveSoldiers()) {
+      if (hits >= cap) break;
+      if (Math.hypot(s.x - x, s.z - z) < radius && rnd() < chance * c) { u.kill(s, s.x - x, s.z - z, 1.2); hits++; }
+    }
+  }
+  return hits;
+}
+/* 霰弹空爆：在弹道上的设定点凌空炸开，弹丸下扫 */
+function shrapnelBurst(sh) {
+  const foe = sh.side === 'union' ? C : U;
+  const gy = terrainH(sh.x, sh.z);
+  burstPool.emit(sh.x, sh.y, sh.z, 1.8, 4.2, 0.16, 1, 0, 0.2, 0, 0);
+  flashPool.emit(sh.x, sh.y, sh.z, 1.5, 0.28, 0.05, 1, 0, 0, 0, 0);
+  for (let k = 0; k < 12; k++) {
+    shardPool.emit(sh.x, sh.y, sh.z, 0.14, 0.045, 0.5, 1, 0, -7 - vrnd() * 5, (vrnd() - 0.5) * 4, (vrnd() - 0.5) * 4);
+  }
+  for (let k = 0; k < 8; k++) {
+    const a = vrnd() * TAU, rr = 2 + vrnd() * SHRAPNEL_R;
+    dustPool.emit(sh.x + Math.cos(a) * rr, gy + 0.2, sh.z + Math.sin(a) * rr,
+      0.35, 1.3 + vrnd() * 0.8, 0.5, 0.4, 0, 1.1, Math.cos(a), Math.sin(a));
+  }
+  counterBatteryFix(sh.side, sh.x, sh.z, sh.ox, sh.oz);
+  const hits = blastCasualtiesCovered(foe, sh.x, sh.z, SHRAPNEL_R, 6, 0.5 * sh.acc);
+  if (hits > 0) blog('霰弹凌空 — ' + foe.side.label + ' ' + hits + ' 人倒下（掩体可减伤）', '#e0b060');
+  for (const a of [U, C]) for (const u of a.units) {
+    if (u.kind === 'art' || u.gone || u.men <= 0) continue;
+    const d = Math.hypot(u.cx - sh.x, u.cz - sh.z);
+    if (d < SHRAPNEL_R + 6) u.suppress = clamp(u.suppress + 0.35 * (1 - d / (SHRAPNEL_R + 6)), 0, 1);
+  }
+}
 function projectilesUpdate(dt) {
   for (const sh of shells) {
     if (!sh.active) continue;
@@ -1831,31 +1940,70 @@ function projectilesUpdate(dt) {
     sh.mesh.rotation.x += dt * 7; sh.mesh.rotation.z += dt * 5;
     sh.dist -= Math.hypot(sh.vx, sh.vy, sh.vz) * dt;
     if (sh.dist <= 0) {
-      sh.dist += 1.3;
+      sh.dist += sh.trailStep || 1.3;
       smokePool.emit(
         sh.x + (vrnd() - 0.5) * 0.3, sh.y + (vrnd() - 0.5) * 0.3, sh.z + (vrnd() - 0.5) * 0.3,
         0.75, 2.7, 1.25, 0.34, 0, 0.16, sh.vx * 0.02, sh.vz * 0.02);
     }
     const gY = terrainH(sh.x, sh.z);
+    /* 霰弹：到达设定的空爆距离（距瞄准点的水平距离）就在空中炸开 */
+    if (sh.mode === 'shrapnel' && Math.hypot(sh.x - sh.tx, sh.z - sh.tz) <= (sh.fuse || SHRAPNEL_FUSE)) {
+      sh.active = false; sh.mesh.visible = false;
+      shrapnelBurst(sh);
+      continue;
+    }
     if (sh.y <= gY + 0.15) {
       sh.active = false; sh.mesh.visible = false;
-      explodeGround(sh.x, sh.z, 1);
       const foe = sh.side === 'union' ? C : U;
-      /* 直接命中 + 外层破片两段结算 */
-      const hits = blastCasualties(foe, sh.x, sh.z, SHELL_KILL_RADIUS, 8, 0.85 * sh.acc)
-        + blastCasualties(foe, sh.x, sh.z, SHELL_FRAG_RADIUS, 4, 0.20 * sh.acc);
-      if (hits > 0) blog('炮弹落入 ' + foe.side.label + ' 队列 — ' + hits + ' 人倒下（含破片）', '#d9a05a');
-      /* 破片也能伤坦克：直接命中重、破片环轻 */
-      for (const t of ARMOR.tanks) {
-        if (t.dead || t.side === sh.side) continue;
-        const td = Math.hypot(t.x - sh.x, t.z - sh.z);
-        if (td < SHELL_KILL_RADIUS && rnd() < 0.55) damageTank(t, 110 + rnd() * 90, '炮兵直击');
-        else if (td < SHELL_FRAG_RADIUS && rnd() < 0.18) damageTank(t, 40 + rnd() * 50, '炮弹破片');
-      }
-      /* 英雄建筑也进同一套伤害结算：堡垒不是布景，会被炮击打掉 */
-      for (const F of FORT) {
-        if (F.dead || F.side === sh.side) continue;
-        if (Math.hypot(F.x - sh.x, F.z - sh.z) < 24 && rnd() < 0.5) damageFort(F, 90 + rnd() * 90, '炮兵直击');
+      if (sh.mode === 'tank') {
+        /* 坦克炮弹：低伸弹道落地，单一杀伤半径（数值与原"瞬间结算"一致） */
+        explodeGround(sh.x, sh.z, sh.power);
+        const hits = blastCasualties(foe, sh.x, sh.z, sh.killR, sh.cap, sh.chance);
+        if (hits > 0) blog(sh.label + ' 炮击 ' + foe.side.label + ' — ' + hits + ' 人倒下', '#c8a05a');
+        for (const t of ARMOR.tanks) {
+          if (t.dead || t.side === sh.side) continue;
+          if (Math.hypot(t.x - sh.x, t.z - sh.z) < sh.killR && rnd() < 0.5) damageTank(t, sh.tankDmg + rnd() * 60, sh.label);
+        }
+        for (const F of FORT) {
+          if (F.dead || F.side === sh.side) continue;
+          if (Math.hypot(F.x - sh.x, F.z - sh.z) < 24 && rnd() < 0.4) damageFort(F, 60 + rnd() * 70, sh.label);
+        }
+      } else {
+        explodeGround(sh.x, sh.z, 1);
+        /* 弹道反推：被炮击一方若有部队在弹着点附近，就能反推出敌炮阵地坐标 */
+        counterBatteryFix(sh.side, sh.x, sh.z, sh.ox, sh.oz);
+        /* 直接命中 + 外层破片两段结算 */
+        const hits = blastCasualties(foe, sh.x, sh.z, SHELL_KILL_RADIUS, 8, 0.85 * sh.acc)
+          + blastCasualties(foe, sh.x, sh.z, SHELL_FRAG_RADIUS, 4, 0.20 * sh.acc);
+        if (hits > 0) blog('炮弹落入 ' + foe.side.label + ' 队列 — ' + hits + ' 人倒下（含破片）', '#d9a05a');
+        /* 盲射没有观察校射，散布大 → 会砸到自己人 */
+        if (sh.blind) {
+          const own = sh.side === 'union' ? U : C;
+          const mis = blastCasualties(own, sh.x, sh.z, SHELL_KILL_RADIUS * 1.2, 6, 0.30 * sh.acc);
+          if (mis > 0) blog('盲射误差 — 炮弹落入本方 ' + own.side.label + ' 队列，' + mis + ' 人伤亡', '#e8b060');
+        }
+        /* 反炮兵：落到敌炮位附近就能摧毁火炮（这是反推坐标的价值所在） */
+        for (const eu of foe.units) {
+          if (eu.kind !== 'art') continue;
+          for (const G of eu.guns) {
+            if (G.dead) continue;
+            const gd = Math.hypot(G.x - sh.x, G.z - sh.z);
+            if (gd < SHELL_KILL_RADIUS && rnd() < 0.5) damageGun(G, 90 + rnd() * 80, '炮兵反制');
+            else if (gd < SHELL_FRAG_RADIUS && rnd() < 0.16) damageGun(G, 40 + rnd() * 40, '炮弹破片');
+          }
+        }
+        /* 破片也能伤坦克：直接命中重、破片环轻 */
+        for (const t of ARMOR.tanks) {
+          if (t.dead || t.side === sh.side) continue;
+          const td = Math.hypot(t.x - sh.x, t.z - sh.z);
+          if (td < SHELL_KILL_RADIUS && rnd() < 0.55) damageTank(t, 110 + rnd() * 90, '炮兵直击');
+          else if (td < SHELL_FRAG_RADIUS && rnd() < 0.18) damageTank(t, 40 + rnd() * 50, '炮弹破片');
+        }
+        /* 英雄建筑也进同一套伤害结算：堡垒不是布景，会被炮击打掉 */
+        for (const F of FORT) {
+          if (F.dead || F.side === sh.side) continue;
+          if (Math.hypot(F.x - sh.x, F.z - sh.z) < 24 && rnd() < 0.5) damageFort(F, 90 + rnd() * 90, '炮兵直击');
+        }
       }
     }
   }
@@ -1866,6 +2014,7 @@ function projectilesUpdate(dt) {
     if (b.t > 0) continue;
     BARRAGE.splice(i, 1);
     explodeGround(b.x, b.z, 1.15);
+    counterBatteryFix(b.side, b.x, b.z, b.ox, b.oz);
     const foe = b.side === 'union' ? C : U;
     const hits = blastCasualties(foe, b.x, b.z, 11, 4, 0.5);
     if (hits > 0) blog('徐进弹幕落入 ' + foe.side.label + ' 队列 — ' + hits + ' 人倒下', '#d9a05a');
@@ -2143,7 +2292,11 @@ function makeArmyUnits(army) {
         s.crew = true;
         crew.push(s);
       }
-      guns.push({ army, group: cannon.group, barrel: cannon.barrel, crew, x: gx, z: c.z, recoil: 0, reload: 3 + rnd() * 5, targetUnit: null });
+      guns.push({
+        army, group: cannon.group, barrel: cannon.barrel, crew, x: gx, z: c.z,
+        recoil: 0, reload: 3 + rnd() * 5, targetUnit: null,
+        hp: 170, maxHp: 170, dead: false, cb: null, blind: false, mode: 'direct'
+      });
       army.guns.push(guns[guns.length - 1]);
     }
     const u = new Unit(army, Object.assign({ kind: 'art', soldiers: [] }, c, { files: 1, ranks: 1, sx: 1, sz: 1 }));
@@ -2446,9 +2599,12 @@ class RigPool {
     this.count = count;
     this.hidden = new THREE.Matrix4().makeScale(0, 0, 0);
     this.parts = [];
+    /* 小于一个阴影纹素的部件（桨叶/桨盘/座舱盖/机徽/桨毂）不投影：
+       太阳贴图 2048 覆盖 ±170 m 已是 0.166 m/texel，这些部件投出来只是一团糊影。 */
+    const noShadow = new Set(['blur', 'blades', 'glass', 'canopy', 'mark', 'spinner', 'propL', 'propR', 'blurL', 'blurR']);
     for (const def of parts) {
       const mesh = new THREE.InstancedMesh(def.geo, mats[def.mat], count);
-      mesh.castShadow = true;
+      mesh.castShadow = !noShadow.has(def.id);
       mesh.frustumCulled = false;
       mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
       for (let i = 0; i < count; i++) {
@@ -2489,6 +2645,8 @@ class RigPool {
     }
   }
   hide(idx) { for (const P of this.parts) P.mesh.setMatrixAt(idx, this.hidden); }
+  /* 只藏一个部件（断翼用）：write() 之后调用，会覆盖该部件的矩阵 */
+  hidePart(idx, id) { for (const P of this.parts) if (P.def.id === id) P.mesh.setMatrixAt(idx, this.hidden); }
   flush() { for (const P of this.parts) P.mesh.instanceMatrix.needsUpdate = true; }
 }
 
@@ -2504,6 +2662,13 @@ const airMat = {
 const AIR_PAINT = {
   union: { body: [0.70, 0.77, 0.92], mark: [0.18, 0.30, 0.70] },
   confederate: { body: [0.95, 0.86, 0.66], mark: [0.66, 0.19, 0.14] }
+};
+/* 机型参数表：转弯/坠机威力/撞地杀伤/机翼尺寸都从这里取，避免机型分支散落各处 */
+const CRAFT_SPEC = {
+  fighter:  { label: '战斗机', turn: 0.62, pitchR: 0.75, span: 4.2, crashPower: 1.1, crashR: 9, crashCap: 3, tankDmg: 60, cruise: 60, vr: 40, hp: 46 },
+  attacker: { label: '攻击机', turn: 0.54, pitchR: 0.55, span: 3.8, crashPower: 1.0, crashR: 11, crashCap: 4, tankDmg: 85, cruise: 52, vr: 36, hp: 58 },
+  bomber:   { label: '轰炸机', turn: 0.52, pitchR: 0.30, span: 8.0, crashPower: 1.7, crashR: 15, crashCap: 6, tankDmg: 150, cruise: 44, vr: 30, hp: 92 },
+  recon:    { label: '侦察机', turn: 0.58, pitchR: 0.6, span: 3.6, crashPower: 0.9, crashR: 8, crashCap: 2, tankDmg: 45, cruise: 72, vr: 44, hp: 34 }
 };
 const zc = g => g.rotateX(Math.PI / 2);
 
@@ -2627,17 +2792,19 @@ function tinted(geo, hex) {
    但"绕自身轴旋转"的部件（螺旋桨/桨盘/炮管）必须各自独立，否则会绕机体中心乱转。 */
 const FIGHTER_PARTS = [
   {
-    /* 机身+机翼+尾翼同材质同涂装且都不动 → 合并为一个部件（偏移烘进几何） */
+    /* 机身+尾翼同材质同涂装且都不动 → 合并为一个部件（偏移烘进几何）。
+       机翼单独成件：坠毁时才能"断翼"，而不是整机一起消失。 */
     id: 'body', mat: 'skin', paint: 'body', pos: [0, 0, 0], geo: mergeGeometries([
       at(zc(cyl(0.32, 0.46, 6.4, 12)), 0, 0, -0.2),
       at(zc(cyl(0.30, 0.32, 0.5, 12)), 0, 0, 3.05),
       at(box(0.66, 0.40, 2.0), 0, -0.34, 1.1),
-      at(box(9.6, 0.17, 1.55), 0, -0.02, 0.55),
       at(box(3.4, 0.13, 0.85), 0, 0.04, -2.75),
       at(box(0.14, 1.35, 0.95), 0, 0.62, -3.35),
       at(box(0.12, 0.5, 0.5), 0, -0.28, -3.0)
     ])
   },
+  { id: 'wingL', mat: 'skin', paint: 'body', pos: [0, 0, 0], geo: at(box(4.8, 0.17, 1.55), -2.55, -0.02, 0.55) },
+  { id: 'wingR', mat: 'skin', paint: 'body', pos: [0, 0, 0], geo: at(box(4.8, 0.17, 1.55), 2.55, -0.02, 0.55) },
   { id: 'canopy', mat: 'glass', pos: [0, 0.42, 0.5], geo: new THREE.SphereGeometry(0.44, 12, 8) },
   { id: 'spinner', mat: 'dark', dyn: 'prop', pos: [0, 0, 3.5], geo: at(zc(cyl(0.06, 0.26, 0.55, 10)), 0, 0, 0.22) },
   { id: 'blades', mat: 'blade', dyn: 'prop', pos: [0, 0, 3.62], geo: mergeGeometries([box(0.16, 3.0, 0.07), box(3.0, 0.16, 0.07)]) },
@@ -2656,12 +2823,14 @@ const BOMBER_PARTS = [
       at(zc(cyl(0.78, 0.95, 12.5, 12)), 0, 0, 0),
       at(new THREE.SphereGeometry(0.92, 12, 8), 0, 0.08, 6.4),
       at(box(1.5, 0.85, 3.0), 0, -0.85, 0.9),
-      at(box(23, 0.42, 3.3), 0, -0.35, 0.6),
       at(box(8.4, 0.26, 1.7), 0, -0.23, -5.8),
       at(box(0.22, 2.0, 1.6), 0, 1.05, -6.6),
       at(box(0.18, 0.8, 0.9), 0, -0.3, -6.1)
     ])
   },
+  /* 机翼左右分开：坠毁时能断翼（整条 23 m 翼展不能作为一个整体被抹掉） */
+  { id: 'wingL', mat: 'skin', paint: 'body', pos: [0, 0, 0], geo: at(box(11.5, 0.42, 3.3), -5.75, -0.35, 0.6) },
+  { id: 'wingR', mat: 'skin', paint: 'body', pos: [0, 0, 0], geo: at(box(11.5, 0.42, 3.3), 5.75, -0.35, 0.6) },
   {
     id: 'nac', mat: 'dark', pos: [0, 0, 0], geo: mergeGeometries([
       at(zc(cyl(0.56, 0.62, 2.8, 10)), -4.7, -0.25, 0.8),
@@ -2679,6 +2848,52 @@ const BOMBER_PARTS = [
       at(cyl(0.85, 0.85, 0.03, 12), 6.2, 0, 0)
     ])
   }
+];
+
+/* 攻击机：低空强击机——厚机身、宽翼、翼下机枪舱（对地扫射） */
+const ATTACKER_PARTS = [
+  {
+    id: 'body', mat: 'skin', paint: 'body', pos: [0, 0, 0], geo: mergeGeometries([
+      at(zc(cyl(0.42, 0.56, 6.8, 12)), 0, 0, -0.1),
+      at(zc(cyl(0.40, 0.42, 0.5, 10)), 0, 0, 3.2),
+      at(box(0.9, 0.55, 2.4), 0, -0.42, 1.2),
+      at(box(3.8, 0.16, 1.0), 0, 0.06, -2.9),
+      at(box(0.16, 1.5, 1.1), 0, 0.68, -3.5),
+      at(box(0.14, 0.6, 0.6), 0, -0.3, -3.2)
+    ])
+  },
+  { id: 'wingL', mat: 'skin', paint: 'body', pos: [0, 0, 0], geo: at(box(4.6, 0.22, 1.9), -2.6, -0.06, 0.6) },
+  { id: 'wingR', mat: 'skin', paint: 'body', pos: [0, 0, 0], geo: at(box(4.6, 0.22, 1.9), 2.6, -0.06, 0.6) },
+  { id: 'canopy', mat: 'glass', pos: [0, 0.52, 0.3], geo: new THREE.SphereGeometry(0.5, 12, 8) },
+  {
+    id: 'pod', mat: 'gun', pos: [0, 0, 0], geo: mergeGeometries([
+      at(zc(cyl(0.16, 0.2, 1.6, 8)), -3.1, -0.55, 1.0),
+      at(zc(cyl(0.16, 0.2, 1.6, 8)), 3.1, -0.55, 1.0)
+    ])
+  },
+  { id: 'spinner', mat: 'dark', dyn: 'prop', pos: [0, 0, 3.65], geo: at(zc(cyl(0.07, 0.28, 0.55, 10)), 0, 0, 0.22) },
+  { id: 'blades', mat: 'blade', dyn: 'prop', pos: [0, 0, 3.78], geo: mergeGeometries([box(0.18, 3.2, 0.08), box(3.2, 0.18, 0.08)]) },
+  { id: 'blur', mat: 'blur', dyn: 'prop', pos: [0, 0, 3.82], geo: zc(cyl(1.6, 1.6, 0.02, 20)) },
+  { id: 'mark', mat: 'skin', paint: 'mark', pos: [0, 0.06, 0.6], geo: mergeGeometries([at(cyl(0.58, 0.58, 0.03, 12), -2.5, 0, 0), at(cyl(0.58, 0.58, 0.03, 12), 2.5, 0, 0)]) }
+];
+/* 侦察机：细长机身、大展弦比机翼、无武装，高空长航时（为炮兵引导） */
+const RECON_PARTS = [
+  {
+    id: 'body', mat: 'skin', paint: 'body', pos: [0, 0, 0], geo: mergeGeometries([
+      at(zc(cyl(0.24, 0.34, 5.6, 10)), 0, 0, -0.1),
+      at(zc(cyl(0.22, 0.24, 0.4, 10)), 0, 0, 2.7),
+      at(box(0.46, 0.32, 1.3), 0, -0.26, 0.8),
+      at(box(3.2, 0.12, 0.8), 0, 0.05, -2.6),
+      at(box(0.11, 1.15, 0.85), 0, 0.56, -3.05)
+    ])
+  },
+  { id: 'wingL', mat: 'skin', paint: 'body', pos: [0, 0, 0], geo: at(box(4.6, 0.12, 1.05), -2.5, 0.02, 0.5) },
+  { id: 'wingR', mat: 'skin', paint: 'body', pos: [0, 0, 0], geo: at(box(4.6, 0.12, 1.05), 2.5, 0.02, 0.5) },
+  { id: 'canopy', mat: 'glass', pos: [0, 0.36, 0.5], geo: new THREE.SphereGeometry(0.34, 10, 8) },
+  { id: 'spinner', mat: 'dark', dyn: 'prop', pos: [0, 0, 3.1], geo: at(zc(cyl(0.05, 0.2, 0.45, 8)), 0, 0, 0.18) },
+  { id: 'blades', mat: 'blade', dyn: 'prop', pos: [0, 0, 3.2], geo: mergeGeometries([box(0.12, 2.4, 0.06), box(2.4, 0.12, 0.06)]) },
+  { id: 'blur', mat: 'blur', dyn: 'prop', pos: [0, 0, 3.24], geo: zc(cyl(1.2, 1.2, 0.02, 18)) },
+  { id: 'mark', mat: 'skin', paint: 'mark', pos: [0, 0.04, 0.5], geo: mergeGeometries([at(cyl(0.44, 0.44, 0.03, 10), -2.0, 0, 0), at(cyl(0.44, 0.44, 0.03, 10), 2.0, 0, 0)]) }
 ];
 
 const AA_PARTS = [
@@ -2868,6 +3083,28 @@ function emitTracer(x, y, z, vx, vy, vz, ttl, hdr) {
   t.on = true; t.x = x; t.y = y; t.z = z; t.vx = vx; t.vy = vy; t.vz = vz;
   t.ttl = t.life = ttl; t.hdr = hdr || 2.4;
 }
+/* 弹道诸元（含重力抬高修正）：给定炮口/目标点与初速，解出低伸弹道的发射速度与飞行时间。
+   曳光弹会下坠、也会打在地面/胸墙上，所以必须真的按抛物线飞：
+   不给这个修正，200 m 外就会明显打短（子弹先落地，弹着点在目标之前）。 */
+function ballisticVel(x, y, z, tx, ty, tz, sp) {
+  const dx = tx - x, dy = ty - y, dz = tz - z;
+  const flat = Math.hypot(dx, dz) || 1;
+  const v2 = sp * sp;
+  const disc = v2 * v2 - GRAV * (GRAV * flat * flat + 2 * dy * v2);
+  /* disc<0 = 该初速打不到：退化为 45°（能打多远算多远） */
+  const ang = disc < 0 ? Math.PI / 4 : Math.atan2(v2 - Math.sqrt(disc), GRAV * flat);
+  const c = Math.cos(ang);
+  return { vx: dx / flat * sp * c, vz: dz / flat * sp * c, vy: sp * Math.sin(ang), t: flat / Math.max(1e-3, sp * c) };
+}
+/* 朝目标点发射一发带重力诸元的曳光弹（spread 是视觉散布，只走 vrnd） */
+function emitTracerAimed(x, y, z, tx, ty, tz, sp, hdr, spread) {
+  const b = ballisticVel(x, y, z, tx, ty, tz, sp);
+  const k = spread || 0;
+  emitTracer(x, y, z,
+    b.vx + (vrnd() - 0.5) * k, b.vy + (vrnd() - 0.5) * k, b.vz + (vrnd() - 0.5) * k,
+    b.t + 0.08, hdr);
+  return b;
+}
 
 const BOMB_COUNT = 40;
 const bombGeo = mergeGeometries([
@@ -2885,13 +3122,71 @@ const bombs = [];
 for (let i = 0; i < BOMB_COUNT; i++) bombs.push({ on: false, drawn: false, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, side: 'union' });
 let bombIdx = 0;
 
+/* ---------- 残骸（断翼/机身碎块）：带重力与自旋，落地留痕 ---------- */
+const DEBRIS_COUNT = 30;
+const debrisMesh = new THREE.InstancedMesh(box(1, 1, 1),
+  new THREE.MeshStandardMaterial({ color: 0x676d74, roughness: 0.68, metalness: 0.34 }), DEBRIS_COUNT);
+debrisMesh.castShadow = true; debrisMesh.frustumCulled = false;
+debrisMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+for (let i = 0; i < DEBRIS_COUNT; i++) debrisMesh.setMatrixAt(i, _pm.makeScale(0, 0, 0));
+debrisMesh.instanceMatrix.needsUpdate = true;
+scene.add(debrisMesh);
+const debris = [];
+for (let i = 0; i < DEBRIS_COUNT; i++) {
+  debris.push({ on: false, drawn: false, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, rx: 0, ry: 0, rz: 0, sr: 0, sy: 0, sz: 0, ax: 1, ay: 1, az: 1, ttl: 0, grounded: false });
+}
+let debrisIdx = 0;
+const _dq = new THREE.Quaternion(), _de = new THREE.Euler();
+function spawnDebris(x, y, z, vx, vy, vz, ax, ay, az) {
+  const d = debris[debrisIdx++ % DEBRIS_COUNT];
+  d.on = true; d.grounded = false;
+  d.x = x; d.y = y; d.z = z; d.vx = vx; d.vy = vy; d.vz = vz;
+  d.rx = 0; d.ry = 0; d.rz = 0;
+  d.sr = (vrnd() - 0.5) * 10; d.sy = (vrnd() - 0.5) * 10; d.sz = (vrnd() - 0.5) * 10;
+  d.ax = ax; d.ay = ay; d.az = az;
+  d.ttl = 4.5 + vrnd() * 3;
+}
+function debrisUpdate(dt) {
+  for (const d of debris) {
+    if (!d.on) continue;
+    if (d.grounded) { d.ttl -= dt; if (d.ttl <= 0) d.on = false; continue; }
+    d.vy -= GRAV * dt;
+    d.x += d.vx * dt; d.y += d.vy * dt; d.z += d.vz * dt;
+    d.rx += d.sr * dt; d.ry += d.sy * dt; d.rz += d.sz * dt;
+    const gY = groundY(d.x, d.z);
+    if (d.y <= gY + 0.12) {
+      d.y = gY + 0.12; d.grounded = true; d.ttl = 1.4 + vrnd() * 1.4;
+      d.vx *= 0.18; d.vz *= 0.18; d.sr *= 0.2; d.sy *= 0.2; d.sz *= 0.2;
+      dustPool.emit(d.x, d.y + 0.2, d.z, 0.3, 1.0 + vrnd() * 0.6, 0.4, 0.42, 0, 0.9,
+        (vrnd() - 0.5), (vrnd() - 0.5));
+    }
+  }
+}
+function debrisSync() {
+  let touched = false;
+  for (let i = 0; i < DEBRIS_COUNT; i++) {
+    const d = debris[i];
+    if (d.on) {
+      _de.set(d.rx, d.ry, d.rz); _dq.setFromEuler(_de);
+      debrisMesh.setMatrixAt(i, _pm.compose(_pp.set(d.x, d.y, d.z), _dq, _ps.set(d.ax, d.ay, d.az)));
+      d.drawn = true; touched = true;
+    } else if (d.drawn) {
+      debrisMesh.setMatrixAt(i, _pm.makeScale(0, 0, 0));
+      d.drawn = false; touched = true;
+    }
+  }
+  if (touched) debrisMesh.instanceMatrix.needsUpdate = true;
+}
+
 /* ---------- 航空兵系统 ---------- */
-const FIGHTERS_PER = 4, BOMBERS_PER = 3, AA_PER = 8;
+const FIGHTERS_PER = 4, ATTACKERS_PER = 2, BOMBERS_PER = 3, RECONS_PER = 2, AA_PER = 3;
 const BOMB_RUN = 900;          // 轰炸航线单程长度（需 >> 弹道横抛，留出对准余量）
 const fighterRig = new RigPool(FIGHTER_PARTS, FIGHTERS_PER * 2, airMat);
+const attackerRig = new RigPool(ATTACKER_PARTS, ATTACKERS_PER * 2, airMat);
 const bomberRig = new RigPool(BOMBER_PARTS, BOMBERS_PER * 2, airMat);
+const reconRig = new RigPool(RECON_PARTS, RECONS_PER * 2, airMat);
 const aaRig = new RigPool(AA_PARTS, AA_PER * 2, airMat);
-const AIR = { craft: [], guns: [], flak: [], lost: { union: 0, confederate: 0 }, dropped: 0 };
+const AIR = { craft: [], guns: [], flak: [], lost: { union: 0, confederate: 0 }, dropped: 0, collisions: 0 };
 
 function armyOf(side) { return side === 'union' ? U : C; }
 function foeSideOf(side) { return side === 'union' ? 'confederate' : 'union'; }
@@ -2932,6 +3227,37 @@ for (const side of ['union', 'confederate']) {
       orbit: i * 1.7, alt: 76 + i * 14,
       lane: (i - (BOMBERS_PER - 1) / 2) * 260, run: BOMB_RUN, lat: 520, leg: 0,
       launchAt: 2.4 + i * 3.4, state: 'parked', dropT: 0, stick: 0, smokeT: 0, dead: false
+    });
+  }
+  /* 攻击机：低空强击，沿敌线来回扫射地面部队 */
+  for (let i = 0; i < ATTACKERS_PER; i++) {
+    const p = park(-30, 8 + i * 16);
+    AIR.craft.push({
+      side, kind: 'attacker', rig: attackerRig,
+      idx: (side === 'union' ? 0 : ATTACKERS_PER) + i,
+      x: p.x, y: PY + GND, z: p.z, parkX: p.x, parkZ: p.z,
+      yaw: A.yaw, pitch: 0, roll: 0,
+      spd: 0, cruise: CRAFT_SPEC.attacker.cruise, vr: CRAFT_SPEC.attacker.vr,
+      hp: CRAFT_SPEC.attacker.hp, maxHp: CRAFT_SPEC.attacker.hp, prop: 0, fireT: 0,
+      orbit: i * 1.4, alt: 30 + i * 8,
+      lane: (i - (ATTACKERS_PER - 1) / 2) * 230, run: 700, lat: 440, leg: 0,
+      launchAt: 3.2 + i * 3.0, state: 'parked', smokeT: 0, dead: false,
+      wingSpan: CRAFT_SPEC.attacker.span, severed: [], breakT: 0, breakDone: 0, breakTotal: 0, tumble: null
+    });
+  }
+  /* 侦察机：高空长航时，为炮兵标定敌军 */
+  for (let i = 0; i < RECONS_PER; i++) {
+    const p = park(32, -30 + i * 18);
+    AIR.craft.push({
+      side, kind: 'recon', rig: reconRig,
+      idx: (side === 'union' ? 0 : RECONS_PER) + i,
+      x: p.x, y: PY + GND, z: p.z, parkX: p.x, parkZ: p.z,
+      yaw: A.yaw, pitch: 0, roll: 0,
+      spd: 0, cruise: CRAFT_SPEC.recon.cruise, vr: CRAFT_SPEC.recon.vr,
+      hp: CRAFT_SPEC.recon.hp, maxHp: CRAFT_SPEC.recon.hp, prop: 0, fireT: 0,
+      orbit: i * 2.1 + (side === 'union' ? 0 : 1.0), rad: 560 + i * 90, alt: 100 + i * 8,
+      launchAt: 2.0 + i * 4.0, state: 'parked', smokeT: 0, dead: false,
+      wingSpan: CRAFT_SPEC.recon.span, severed: [], breakT: 0, breakDone: 0, breakTotal: 0, tumble: null
     });
   }
   for (let i = 0; i < AA_PER; i++) {
@@ -3226,14 +3552,14 @@ function aiUpdate(army, dt) {
   /* 4) 攻守模式：己方整体士气过低 → 固守（不再前压，原地射击） */
   const myMorale = mine.reduce((s, u) => s + u.morale, 0) / mine.length;
   ai.mode = myMorale < 0.34 ? 'hold' : 'engage';
-  /* 5) 逐队下令：交替"压制/跃进"形成火力与机动（用名册序号取奇偶，避免来回抖动） */
+  /* 5) 逐队下令：全线统一推进（齐头并进），不再按奇偶分"压制/跃进"；
+        集中火力的两队也只是"打同一个目标"，移动命令与全线一致。 */
   for (const u of mine) {
-    const odd = (army.units.indexOf(u) % 2) === 1;
     u.order = ai.mode === 'hold' ? 'hold'
       : ai.reserve === u ? 'reserve'
         : ai.flanker === u ? 'flank'
-          : ai.focusUnits.includes(u) ? (odd ? 'focusFire' : 'focusClose')
-            : (odd ? 'fire' : 'advance');
+          : ai.focusUnits.includes(u) ? 'focusFire'
+            : 'advance';
   }
 }
 
@@ -3284,15 +3610,35 @@ function routTick(u, dt) {
 /* 配合系统：每 tick 重算一次，纯确定性评分（不取随机数），故不会挪动 rnd 流 */
 function synergyUpdate(dt) {
   for (let i = FIELDWORKS.length - 1; i >= 0; i--) if ((FIELDWORKS[i].ttl -= dt) <= 0) FIELDWORKS.splice(i, 1);
+  /* 弹道反推的情报 30 s 过期：久不校射就不能一直拿旧坐标反炮兵 */
+  INTEL.union = INTEL.union.filter(f => B.t - f.t < 30);
+  INTEL.confederate = INTEL.confederate.filter(f => B.t - f.t < 30);
   const pairs = [[U, C], [C, U]];
   for (const [a] of pairs) for (const u of a.units) { u.spottedBy = null; u.tankSup = false; u.engBreach = false; }
   for (const [a, foe] of pairs) {
-    /* 1) 散兵引导：己方散兵 280 m 内的敌单位被标定 → 炮兵落点收窄、命中 +30% */
+    /* 1) 散兵引导（侦察兵）：150 m 内的敌单位被标定 → 炮兵落点收窄、命中 +30%。
+       侦察半径已调小，开局两线相距 280 m，所以开战初期只能盲射/反推。 */
     const spotters = a.units.filter(u => u.kind === 'skirm' && u.onField);
     if (spotters.length) for (const e of foe.units) {
       if (e.kind === 'art' || e.gone || e.men <= 0) continue;
-      for (const s of spotters) if (Math.hypot(s.cx - e.cx, s.cz - e.cz) < 280) { e.spottedBy = a.key; break; }
+      for (const s of spotters) if (Math.hypot(s.cx - e.cx, s.cz - e.cz) < 150) { e.spottedBy = a.key; break; }
     }
+    /* 1b) 侦察机引导：在上空的侦察机把下方敌军标定给炮兵（比散兵看得更远） */
+    const recons = AIR.craft.filter(c => c.side === a.key && c.kind === 'recon'
+      && !c.dead && c.state !== 'falling' && c.state !== 'parked');
+    if (recons.length) for (const e of foe.units) {
+      if (e.kind === 'art' || e.gone || e.men <= 0) continue;
+      for (const r of recons) if (Math.hypot(r.x - e.cx, r.z - e.cz) < 190) { e.spottedBy = a.key; break; }
+    }
+    /* 1c) 其余非侦察单位（步兵/骑兵/机枪/工兵）：只有贴到 80 m 才发现敌军。
+       所以"精确打击"依赖侦察资产——普通部队只在近战距离提供末段观察 */
+    const others = a.units.filter(u => u.kind !== 'art' && u.kind !== 'skirm' && u.onField);
+    if (others.length) for (const e of foe.units) {
+      if (e.kind === 'art' || e.gone || e.men <= 0 || e.spottedBy === a.key) continue;
+      for (const s of others) if (Math.hypot(s.cx - e.cx, s.cz - e.cz) < 80) { e.spottedBy = a.key; break; }
+    }
+    /* 观察来源：散兵 150 m / 侦察机 190 m（侦察资产）+ 其他单位 80 m（末段目视）。
+       普通部队只在贴身距离提供观察，所以"精确攻击"仍然依赖侦察。 */
     /* 2) 工兵破障：随行工兵 36 m 内的友军行军时视工事为已开路（通行代价 ×1.35，封顶 1） */
     const engs = a.units.filter(u => u.kind === 'eng' && u.onField);
     if (engs.length) for (const u of a.units) {
@@ -3355,15 +3701,9 @@ function snipe(u) {
 function pinFire(u) {
   const tgt = u.target; if (!tgt || tgt.men <= 0) return;
   const my = groundY(u.cx, u.cz) + 0.95;
-  const dx = tgt.cx - u.cx, dz = tgt.cz - u.cz;
-  const dy = groundY(tgt.cx, tgt.cz) + 1.15 - my;
-  const dl = Math.hypot(dx, dy, dz) || 1;
+  const ty = groundY(tgt.cx, tgt.cz) + 1.15;
   const mx = u.cx + Math.sin(u.yaw) * 2.2, mz = u.cz + Math.cos(u.yaw) * 2.2;
-  for (let i = 0; i < 16; i++) {
-    emitTracer(mx, my, mz,
-      (dx / dl + (vrnd() - 0.5) * 0.05) * 280, (dy / dl + (vrnd() - 0.5) * 0.05) * 280, (dz / dl + (vrnd() - 0.5) * 0.05) * 280,
-      0.32 + Math.hypot(dx, dz) / 280, 2.2);
-  }
+  for (let i = 0; i < 16; i++) emitTracerAimed(mx, my, mz, tgt.cx, ty, tgt.cz, 280, 2.2, 12);
   flashPool.emit(mx, my, mz, 1.4, 0.3, 0.06, 1, 0, 0, 0, 0);
   for (let i = 0; i < 3; i++) smokePool.emit(mx, my + 0.1, mz, 0.5, 2.0, 1.3, 0.5, 0, 0.4, Math.sin(u.yaw) * 1.6, Math.cos(u.yaw) * 1.6);
   tgt.suppress = clamp(tgt.suppress + 0.7, 0, 1);
@@ -3399,11 +3739,13 @@ function creepingBarrage(u, tgt) {
     ex += e.cx; n++;
   }
   const cx = n ? ex / n : tgt.cx;
+  const o0 = u.guns && u.guns[0] ? u.guns[0] : { x: u.cx, z: u.cz };
   for (let i = 0; i < BARRAGE_LEN; i++) {
     BARRAGE.push({
       side: u.army.key, t: 0.4 + i * 0.62,
       x: cx + (rnd() - 0.5) * 44,
-      z: L + dir * (i * 24) + (rnd() - 0.5) * 26
+      z: L + dir * (i * 24) + (rnd() - 0.5) * 26,
+      ox: o0.x, oz: o0.z
     });
   }
   ABIL.barrage++;
@@ -3440,14 +3782,9 @@ function mgFire(u, dt) {
   u.mgYaw = Math.atan2(tgt.cx - u.cx, tgt.cz - u.cz) - u.yaw;
   const mx = u.cx + Math.sin(u.yaw) * 2.2, mz = u.cz + Math.cos(u.yaw) * 2.2;
   const my = groundY(u.cx, u.cz) + 0.95;
-  const dx = tgt.cx - mx, dz = tgt.cz - mz, dy = groundY(tgt.cx, tgt.cz) + 1.15 - my;
-  const dl = Math.hypot(dx, dy, dz) || 1;
-  for (let k = 0; k < VIS.mgTracers; k++) {
-    const sp = 0.03;
-    emitTracer(mx, my, mz,
-      (dx / dl + (vrnd() - 0.5) * sp) * 300, (dy / dl + (vrnd() - 0.5) * sp) * 300, (dz / dl + (vrnd() - 0.5) * sp) * 300,
-      d / 300 + 0.06, 2.0);
-  }
+  const dx = tgt.cx - mx, dz = tgt.cz - mz;
+  const ty = groundY(tgt.cx, tgt.cz) + 1.15;
+  for (let k = 0; k < VIS.mgTracers; k++) emitTracerAimed(mx, my, mz, tgt.cx, ty, tgt.cz, 300, 2.0, 9);
   flashPool.emit(mx, my, mz, 0.8, 0.14, 0.045, 1, 0, 0, 0, 0);
   if (vrnd() < 0.5) smokePool.emit(mx, my + 0.05, mz, 0.35, 1.6, 1.0, 0.4, 0, 0.4, Math.sin(u.yaw) * 1.2, Math.cos(u.yaw) * 1.2);
   if (rnd() < 0.30 * eff) {
@@ -3499,33 +3836,67 @@ function orderAdvance(u) {
 
 function unitUpdate(u, dt) {
   if (u.kind === 'art') {
+    const artFoe = enemyOf(u.army), artKey = u.army.key;
+    /* 「有无侦察视野」：己方是否有任何敌军被标定（散兵/侦察机/前哨）。没有就只能盲射/反推。 */
+    let observed = false;
+    for (const e of artFoe.units) if (e.kind !== 'art' && e.onField && e.spottedBy === artKey) { observed = true; break; }
+    /* 坦克目标也要"看得见"：有观察，或己方部队已和它打到 220 m 内（前哨目视） */
+    const visTanks = ARMOR.tanks.filter(t => {
+      if (t.dead || t.side === artKey) return false;
+      if (observed) return true;
+      return u.army.units.some(x => x.kind !== 'art' && x.onField && Math.hypot(x.cx - t.x, x.cz - t.z) < 220);
+    });
     for (const gun of u.guns) {
-      const foe = enemyOf(u.army);
-      /* 炮兵 AI：按价值选靶——队伍越大、越动摇越值得打，骑兵目标价值最低 */
+      if (gun.dead) continue;
+      let crewAlive = 0;
+      for (const s of gun.crew) if (s.alive) crewAlive++;
+      if (crewAlive < 2) continue;                    // 炮手被打光，炮位停火
+      /* ① 有观察才精确打点：只挑被己方标定的敌军 */
       let best = null, bs = -1e9;
-      for (const e of foe.units) {
+      if (observed) for (const e of artFoe.units) {
         if (e.kind === 'art' || e.men <= 0 || e.gone || e.state === 'rout') continue;
+        if (e.spottedBy !== artKey) continue;
         const d = Math.hypot(e.cx - gun.x, e.cz - gun.z);
         if (d > 340 * S) continue;
         const score = e.men * 0.55 + (1 - clamp(e.morale, 0, 1)) * 42 - d * 0.10 + (e.kind === 'cav' ? -14 : 0);
         if (score > bs) { bs = score; best = e; }
       }
       gun.targetUnit = best;
-      /* 就近选取敌方坦克作为优先目标 */
       let tank = null, td = 1e9;
-      for (const t of ARMOR.tanks) {
-        if (t.dead || t.side === u.army.key) continue;
+      for (const t of visTanks) {
         const d = Math.hypot(t.x - gun.x, t.z - gun.z);
         if (d < td && d < 340 * S) { td = d; tank = t; }
       }
       gun.tank = tank;
+      /* ② 无观察但有弹道反推的敌炮坐标 → 反炮兵 */
+      gun.cb = (!best && !tank && INTEL[artKey].length) ? INTEL[artKey][INTEL[artKey].length - 1] : null;
+      /* ③ 既无观察也无可反推 → 盲射 */
+      gun.blind = !best && !tank && !gun.cb;
+      const mode = gun.blind ? 'blind' : gun.cb ? 'cb' : 'direct';
+      if (mode !== gun.mode) {
+        gun.mode = mode;
+        if (mode === 'blind') blog(u.army.side.label + '炮兵失去侦察视野 — 转入盲射', '#c8a05a');
+        else if (mode === 'cb') blog(u.army.side.label + '炮兵由弹道反推敌方炮位 — 反炮兵射击', '#c8a05a');
+        else blog(u.army.side.label + '炮兵恢复观察校射', u.army.side.css);
+      }
       gun.recoil = Math.max(0, gun.recoil - dt * 1.9);
       gun.barrel.position.z = 0.1 - 0.42 * gun.recoil;
       for (const s of gun.crew) s.recoil = Math.max(0, s.recoil - dt * 3.4);
-      if (gun.targetUnit && B.t > 3 && !B.over) {
+      const aimed = gun.targetUnit || gun.tank || gun.cb;
+      if ((aimed || gun.blind) && B.t > 3 && !B.over) {
         gun.reload -= dt;
-        if (gun.reload <= 0) { gun.reload = 8.5 + rnd() * 2.5; fireShell(gun); }
-        const ty = Math.atan2(gun.targetUnit.cx - gun.x, gun.targetUnit.cz - gun.z);
+        if (gun.reload <= 0) {
+          gun.reload = gun.blind ? 9.5 + rnd() * 3.5 : 8.5 + rnd() * 2.5;
+          /* 隔发装填霰弹：软目标（步兵/骑兵/散兵/工兵/机枪）才用空爆 */
+          gun.ammoT = (gun.ammoT || 0) + 1;
+          const tk = gun.targetUnit ? gun.targetUnit.kind : null;
+          gun.shrapnel = (gun.ammoT % 2 === 0) && !!tk
+            && (tk === 'inf' || tk === 'cav' || tk === 'skirm' || tk === 'eng' || tk === 'mg');
+          fireShell(gun);
+        }
+        const ax = gun.targetUnit ? gun.targetUnit.cx : gun.tank ? gun.tank.x : gun.cb ? gun.cb.x : 0;
+        const az = gun.targetUnit ? gun.targetUnit.cz : gun.tank ? gun.tank.z : gun.cb ? gun.cb.z : lineZ(artKey);
+        const ty = Math.atan2(ax - gun.x, az - gun.z);
         gun.group.rotation.y = lerp(gun.group.rotation.y, ty, 1 - Math.exp(-dt * 0.8));
         for (const s of gun.crew) {
           s.yaw = gun.group.rotation.y + Math.PI;
@@ -3535,13 +3906,14 @@ function unitUpdate(u, dt) {
         for (const s of gun.crew) if (s.state === 'fire' && s.recoil <= 0) s.state = 'work';
       }
     }
-    /* 炮兵技能「弹幕徐进」：战局进入中段后，对 140 m 外的敌步兵线铺一条向前延伸的弹幕 */
+    /* 炮兵技能「弹幕徐进」：同样要求有观察——没校射就没有徐进弹幕 */
     u.abilityCd = (u.abilityCd || 0) - dt;
-    if (!B.over && u.abilityCd <= 0 && B.t > 45) {
+    if (!B.over && u.abilityCd <= 0 && B.t > 45 && observed) {
       const foe = enemyOf(u.army);
       let t = null, bd = 1e9;
       for (const e of foe.units) {
         if (e.kind === 'art' || e.men <= 0 || e.gone || e.state === 'rout') continue;
+        if (e.spottedBy !== artKey) continue;
         const d = Math.hypot(e.cx - u.cx, e.cz - u.cz);
         if (d < bd && d > 140) { bd = d; t = e; }
       }
@@ -3580,13 +3952,18 @@ function unitUpdate(u, dt) {
       /* 压制减速 + 步坦协同加速：两个"配合/反制"属性都进移动积分 */
       u.spd = 4.2 * trav * (1 - 0.40 * u.suppress) * (u.tankSup ? 1.12 : 1);
       if (tgt) u.yaw = Math.atan2(tgt.cx - u.cx, tgt.cz - u.cz);
+      /* 齐头并进：谁突出战线平均位置 80 m 以上就停下来等齐（若已在射程内则原地继续射击） */
+      const ahead = u.army.frontZ !== undefined ? toward * (u.cz - u.army.frontZ) : 0;
+      const waiting = ahead > 80 && u.order !== 'flank';
+      if (waiting) u.spd = 0;
       if (u.order === 'flank' && u.army.ai) {   // 侧翼迂回：先横向靠拢，再压上
         u.cx += clamp(u.army.ai.flankX - u.cx, -1, 1) * 1.6 * trav * dt;
       }
-      u.cz += toward * u.spd * dt;
+      if (!waiting) u.cz += toward * u.spd * dt;
       if (u.kind === 'cav') {
         if (dist < 96) u.state = 'hold';
-      } else if (dist < (u.kind === 'skirm' ? 168 : u.order === 'fire' ? 98 : 62) || u.cz * toward > 6) {
+      } else if (dist < (u.kind === 'skirm' ? 168 : (u.kind === 'inf' || u.kind === 'eng') ? 150 : 120) || u.cz * toward > 6) {
+        /* 线列步兵在 150 m 就停下齐射（原来半队 98、半队 62，是跃进不是齐头并进） */
         u.state = 'fire'; u.volleys = 0; u.volleyT = 0.5;
         blog(u.name + ' 停止前进，列队齐射', u.army.side.css);
       }
@@ -3610,12 +3987,13 @@ function unitUpdate(u, dt) {
       if (u.volleyT <= 0) {
         u.volleys++;
         volley(u);
-        /* 固守命令下持续射击，不自动转入冲锋；散兵线不上刺刀（保持远距离对射） */
-        if (u.volleys >= 3) {
-          if (u.order === 'hold') u.volleyT = 1.9;
-          else if (u.kind === 'skirm') u.volleyT = 2.6;
-          else startCharge(u);
-        } else u.volleyT = 1.7;
+        /* 更倾向远程射击：至少打满 6 轮、且敌军已经动摇/被压制/减员严重，才上刺刀。
+           散兵线永不上刺刀（保持远距离对射）。 */
+        const broken = tgt && (tgt.morale < 0.5 || tgt.suppress > 0.4 || tgt.men / tgt.maxMen < 0.45);
+        if (u.kind !== 'skirm' && u.volleys >= 6 && broken) startCharge(u);
+        else if (u.order === 'hold') u.volleyT = 1.9;
+        else if (u.kind === 'skirm') u.volleyT = 2.6;
+        else u.volleyT = 1.7;
       }
       break;
     case 'charge': {
@@ -3857,8 +4235,7 @@ function steerTo(a, tx, ty, tz, dt) {
   while (want > Math.PI) want -= TAU;
   while (want < -Math.PI) want += TAU;
   /* 转弯半径 = 速度/角速率：轰炸机 50/0.52 ≈ 96 m，才跟得上 175 m 的航线 */
-  const aR = a.kind === 'fighter' ? 0.62 : 0.52;
-  const pR = a.kind === 'fighter' ? 0.75 : 0.30;
+  const aR = CRAFT_SPEC[a.kind].turn, pR = CRAFT_SPEC[a.kind].pitchR;
   const wantPitch = clamp(Math.atan2(dy, dh), -0.55, 0.55);
   a.yaw += clamp(want, -aR * dt, aR * dt);
   a.pitch += clamp(wantPitch - a.pitch, -pR * dt, pR * dt);
@@ -3878,13 +4255,45 @@ function moveCraft(a, dt, free) {
   if (a.y < ALT_MIN) { a.y = ALT_MIN; a.pitch = Math.max(a.pitch, 0.1); }
   else if (a.y > ALT_MAX) { a.y = ALT_MAX; a.pitch = Math.min(a.pitch, -0.1); }
 }
+function craftLabel(a) { return (a.side === 'union' ? '联邦' : '邦联') + CRAFT_SPEC[a.kind].label; }
+function craftVel(a) {
+  const cp = Math.cos(a.pitch);
+  return { vx: Math.sin(a.yaw) * cp * a.spd, vy: Math.sin(a.pitch) * a.spd, vz: Math.cos(a.yaw) * cp * a.spd };
+}
+/* 断翼：把一侧机翼从机体上摘掉（hidePart），同时把整片翼当残骸抛出去 */
+function severWing(a) {
+  if (!a.severed) a.severed = [];
+  const side = a.severed.indexOf('wingL') < 0 ? 'wingL' : a.severed.indexOf('wingR') < 0 ? 'wingR' : null;
+  if (!side) return false;
+  a.severed.push(side);
+  const s = CRAFT_SPEC[a.kind], dirSign = side === 'wingL' ? -1 : 1;
+  const v = craftVel(a), cs = Math.cos(a.yaw), sn = Math.sin(a.yaw);
+  const off = dirSign * s.span * 0.55;
+  const wx = a.x + cs * off, wz = a.z - sn * off;
+  spawnDebris(wx, a.y, wz,
+    v.vx + dirSign * 6 + (vrnd() - 0.5) * 3, v.vy - 2 - vrnd() * 2, v.vz + (vrnd() - 0.5) * 3,
+    s.span * 0.5, 0.16, 1.4);
+  burstPool.emit(wx, a.y, wz, 1.1, 3.4, 1.6, 0.7, 0, -0.6, dirSign * 2, 0);
+  shardPool.emit(wx, a.y, wz, 0.3, 0.12, 0.5, 1, 0, 2.6, dirSign * 3, 0);
+  return true;
+}
 function damageCraft(a, dmg, by) {
   if (a.dead || a.state === 'falling') return;
   a.hp -= dmg;
   if (a.hp <= 0) {
     a.state = 'falling'; a.stick = 0;
     AIR.lost[a.side]++;
-    blog((a.side === 'union' ? '联邦' : '邦联') + (a.kind === 'bomber' ? '轰炸机' : '战斗机') + '被' + by + '击落', '#f0a070');
+    /* 坠机参数（翻滚角速度、断裂时序）必须用「按机身+损失次数定种」的独立 PRNG，
+       不能用 vrnd：坠落姿态会决定撞地点，而撞地点决定地面伤亡——若它走 vrnd，
+       改一次烟池容量（视觉旋钮）就会挪动撞击点，进而改变战局。 */
+    const dr = mulberry32((a.idx * 2654435761 ^ (AIR.lost[a.side] * 40503) ^ 0x9E3779B9) >>> 0);
+    a.dr = dr;                       // 整个坠落过程都用这条种子流，绝不再碰 vrnd
+    a.tumble = { r: 0.6 + dr() * 3.4, y: 0.2 + dr() * 1.6, dir: dr() < 0.5 ? -1 : 1 };
+    a.severed = [];
+    a.breakDone = 0;
+    a.breakTotal = 1 + (dr() < 0.7 ? 1 : 0);
+    a.breakT = 0.2 + dr() * 0.5;
+    blog(craftLabel(a) + '被' + by + '击落', '#f0a070');
   }
 }
 function fighterUpdate(a, dt) {
@@ -3911,15 +4320,12 @@ function fighterUpdate(a, dt) {
     if (!B.over && bd < 320 * 2 && dot > 0.93 && a.fireT <= 0) {
       a.fireT = 0.30;
       const ox = a.x + fx * 3.6, oy = a.y + fy * 3.6, oz = a.z + fz * 3.6;
-      const dev = 0.012 + bd / 9000, sp = 300;
-      const ttl = clamp(bd / sp + 0.12, 0.2, 1.6);
-      for (let k = 0; k < 3; k++) {
-        /* 曳光弹偏差是纯视觉的：必须走 vrnd，否则改一次弹幕数量就会挪动战局随机流 */
-        emitTracer(ox, oy, oz,
-          (dx / dd + (vrnd() - 0.5) * dev) * sp,
-          (dy / dd + (vrnd() - 0.5) * dev) * sp,
-          (dz / dd + (vrnd() - 0.5) * dev) * sp, ttl, 2.6);
-      }
+      const dev = (0.012 + bd / 9000) * 300;
+      /* 瞄准提前点并带重力抬高：曳光弹偏差是纯视觉的，走 vrnd */
+      const ax = tgt.x + Math.sin(tgt.yaw) * cp * tgt.spd * tt;
+      const ay = clamp(tgt.y + Math.sin(tgt.pitch) * tgt.spd * tt, a.y - 30, a.y + 30);
+      const az = tgt.z + Math.cos(tgt.yaw) * cp * tgt.spd * tt;
+      for (let k = 0; k < 3; k++) emitTracerAimed(ox, oy, oz, ax, ay, az, 300, 2.6, dev);
       flashPool.emit(ox, oy, oz, 1.1, 0.16, 0.045, 1, 0, 0, 0, 0);
       if (rnd() < 0.16) damageCraft(tgt, 4 + rnd() * 6, '战斗机');
     }
@@ -3984,6 +4390,49 @@ function bomberUpdate(a, dt) {
     }
   }
 }
+/* 强击机：贴敌线低空来回，对最近敌军步兵点射（杀伤 + 压制），不投弹 */
+function attackerUpdate(a, dt) {
+  const tz = lineZ(a.side);
+  const sgn = a.side === 'union' ? 1 : -1;
+  const dir = a.leg ? -1 : 1;
+  const wx = a.lane + (a.leg ? sgn * a.lat : 0);
+  steerTo(a, wx, a.alt + Math.sin(a.orbit * 2.1) * 4, tz + dir * sgn * a.run, dt);
+  a.orbit += dt * 0.13;
+  if (!a.leg && sgn * (a.z - tz) > a.run - 40) a.leg = 1;
+  else if (a.leg && sgn * (a.z - tz) < -(a.run - 40)) a.leg = 0;
+  const foe = armyOf(foeSideOf(a.side));
+  let best = null, bd = 1e9;
+  for (const u of foe.units) {
+    if (u.kind === 'art' || u.men <= 0 || u.gone || u.state === 'rout') continue;
+    const d = Math.hypot(u.cx - a.x, u.cz - a.z);
+    if (d < bd) { bd = d; best = u; }
+  }
+  if (best && bd < 210 && !B.over && a.fireT <= 0) {
+    const fx = Math.sin(a.yaw) * Math.cos(a.pitch), fy = Math.sin(a.pitch), fz = Math.cos(a.yaw) * Math.cos(a.pitch);
+    const dx = best.cx - a.x, dy = (groundY(best.cx, best.cz) + 1.0) - a.y, dz = best.cz - a.z;
+    const dl = Math.max(1, Math.hypot(dx, dy, dz));
+    if ((fx * dx + fy * dy + fz * dz) / dl > 0.90) {
+      a.fireT = 0.20;
+      const ox = a.x + fx * 3.4, oy = a.y + fy * 3.4, oz = a.z + fz * 3.4;
+      for (let k = 0; k < 4; k++) {
+        emitTracerAimed(ox, oy, oz, best.cx + (vrnd() - 0.5) * 9, groundY(best.cx, best.cz) + 1.0,
+          best.cz + (vrnd() - 0.5) * 9, 320, 2.2, 12);
+      }
+      flashPool.emit(ox, oy, oz, 1.0, 0.14, 0.04, 1, 0, 0, 0, 0);
+      if (rnd() < 0.5) {
+        const pool = best.aliveSoldiers();
+        if (pool.length) best.kill(pool.splice(Math.floor(rnd() * pool.length), 1)[0], dx, dz, 1);
+      }
+      best.suppress = clamp(best.suppress + 0.06, 0, 1);
+    }
+  }
+}
+/* 侦察机：高空大半径盘旋，无武装；标定交给 synergyUpdate */
+function reconUpdate(a, dt) {
+  a.orbit += dt * (a.spd / a.rad);
+  steerTo(a, Math.cos(a.orbit) * a.rad, a.alt, Math.sin(a.orbit) * a.rad, dt);
+}
+
 /* ---------- 起飞与返场着陆（机场是战术循环的一部分，不只是起点） ---------- */
 function takeoffUpdate(a, dt) {
   const key = a.side, A = AIRFIELD[key], PY = PAD_Y[key];
@@ -4015,7 +4464,7 @@ function takeoffUpdate(a, dt) {
   /* 爬够 30 m 就转入任务航向：否则会沿跑道方向一直飞出地形边缘（跑道转 90° 后尤其明显） */
   if (a.y >= Math.min(30, a.alt - 3)) {
     a.pitch = 0;
-    a.state = a.kind === 'fighter' ? 'patrol' : 'bomb';
+    a.state = a.kind === 'fighter' ? 'patrol' : a.kind === 'attacker' ? 'strafe' : a.kind === 'recon' ? 'recon' : 'bomb';
   }
 }
 function landingUpdate(a, dt) {
@@ -4076,30 +4525,41 @@ function airUpdate(dt) {
       continue;
     }
     if (a.state === 'falling') {
-      a.spd = Math.max(14, a.spd - 16 * dt);
-      a.pitch = Math.max(a.pitch - 2.4 * dt, -1.4);
-      a.roll += dt * 1.4;
-      a.yaw += dt * 0.4;
+      /* 坠机：机头下压、带自旋翻滚、先掉翼再撞地。旧的固定 `roll += 1.4` 只会让每架飞机
+         以同一种姿势笔直坠落，读不出"被打下来"还是"自己掉下来"。 */
+      if (!a.tumble) {
+        a.tumble = { r: 2, y: 0.6, dir: 1 };
+        a.severed = a.severed || []; a.breakDone = a.breakDone || 0;
+        a.breakTotal = a.breakTotal || 1; a.breakT = a.breakT || 0.3;
+      }
+      a.spd = Math.max(12, a.spd - 14 * dt);
+      a.pitch = Math.max(a.pitch - 2.2 * dt, -1.5);
+      a.roll += dt * a.tumble.r * a.tumble.dir;
+      a.yaw += dt * a.tumble.y * a.tumble.dir;
       const fcp = Math.cos(a.pitch);
       a.x += Math.sin(a.yaw) * fcp * a.spd * dt;
       a.z += Math.cos(a.yaw) * fcp * a.spd * dt;
-      a.y += Math.sin(a.pitch) * a.spd * dt - 9 * dt;
+      a.y += Math.sin(a.pitch) * a.spd * dt - 9.4 * dt;
       a.prop += (a.spd * 2.2 + 9) * dt;
+      /* 断裂时序：先断一片翼，再断另一片（机身碎块在撞地时抛出） */
+      a.breakT -= dt;
+      if (a.breakT <= 0 && a.breakDone < a.breakTotal) {
+        if (severWing(a)) a.breakDone++; else a.breakDone = a.breakTotal;
+        a.breakT = 0.5 + (a.dr ? a.dr() : 0.3) * 0.6;
+      }
+      /* 拖黑烟 + 间或爆出火团 */
       a.smokeT -= dt;
       if (a.smokeT <= 0) {
-        a.smokeT = 0.05;
-        burstPool.emit(a.x + (vrnd() - 0.5) * 1.4, a.y + (vrnd() - 0.5) * 1.4, a.z + (vrnd() - 0.5) * 1.4,
-          1.3, 5.2 + vrnd() * 1.6, 2.6 + vrnd(), 0.7, 0, -1.4, 0, 0);
+        a.smokeT = 0.045;
+        burstPool.emit(a.x + (vrnd() - 0.5) * 1.5, a.y + (vrnd() - 0.5) * 1.5, a.z + (vrnd() - 0.5) * 1.5,
+          1.4, 5.4 + vrnd() * 1.8, 2.8 + vrnd(), 0.72, 0, -1.6, 0, 0);
+        if (vrnd() < 0.5) flashPool.emit(a.x + (vrnd() - 0.5), a.y + (vrnd() - 0.5), a.z + (vrnd() - 0.5),
+          1.6, 0.3, 0.06, 1, 0, 0, 0, 0);
       }
       if (a.y <= terrainH(a.x, a.z) + 0.7) {
         a.dead = true;
         a.rig.hide(a.idx);
-        explodeGround(a.x, a.z, a.kind === 'bomber' ? 1.6 : 1.1);
-        blog((a.side === 'union' ? '联邦' : '邦联') + (a.kind === 'bomber' ? '轰炸机' : '战斗机') + '坠毁', '#e08a60');
-        for (let i = 0; i < 4; i++) {
-          smokePool.emit(a.x + (vrnd() - 0.5) * 3, terrainH(a.x, a.z) + 1.4 + i * 1.6, a.z + (vrnd() - 0.5) * 3,
-            2.2, 7.4, 3.4, 0.7, 0, 1.5, (vrnd() - 0.5), (vrnd() - 0.5));
-        }
+        crashImpact(a);
       }
       continue;
     }
@@ -4113,13 +4573,88 @@ function airUpdate(dt) {
           0.9, 3.6 + vrnd(), 1.7 + vrnd() * 0.6, 0.5, 0, -0.4, 0, 0);
       }
     }
-    if (a.kind === 'fighter') fighterUpdate(a, dt); else bomberUpdate(a, dt);
+    if (a.kind === 'fighter') fighterUpdate(a, dt);
+    else if (a.kind === 'attacker') attackerUpdate(a, dt);
+    else if (a.kind === 'recon') reconUpdate(a, dt);
+    else bomberUpdate(a, dt);
     moveCraft(a, dt);
   }
+  airCollisions();
+}
+/* 空中相撞：两架敌对飞机距离小于 2 倍机长就算撞上——双方重创/击落 + 半空火球 */
+const COLLIDE_R = 5.5, COLLIDE_R2 = COLLIDE_R * COLLIDE_R;
+function midairBlast(x, y, z) {
+  boomPool.emit(x, y, z, 2.6, 3.0, 0.14, 1, 0, 0.4, 0, 0);
+  flashPool.emit(x, y, z, 3.4, 0.5, 0.07, 1, 0, 0, 0, 0);
+  for (let i = 0; i < 14; i++) {
+    const ang = vrnd() * TAU, sp = 4 + vrnd() * 12;
+    shardPool.emit(x, y, z, 0.5, 0.16, 0.7, 1, 0, 3.4 + vrnd() * 5, Math.cos(ang) * sp, Math.sin(ang) * sp);
+  }
+  for (let i = 0; i < 4; i++) {
+    spawnDebris(x + (vrnd() - 0.5) * 1.6, y + (vrnd() - 0.5) * 1.6, z + (vrnd() - 0.5) * 1.6,
+      (vrnd() - 0.5) * 10, (vrnd() - 0.5) * 6, (vrnd() - 0.5) * 10, 0.8 + vrnd(), 0.3 + vrnd() * 0.5, 1.0 + vrnd());
+  }
+}
+function airCollisions() {
+  const n = AIR.craft.length;
+  for (let i = 0; i < n; i++) {
+    const a = AIR.craft[i];
+    if (a.dead || a.state === 'falling' || a.state === 'parked' || a.state === 'taxi' || a.state === 'roll' || a.state === 'rollout') continue;
+    for (let j = i + 1; j < n; j++) {
+      const b = AIR.craft[j];
+      if (b.dead || b.state === 'falling' || b.state === 'parked' || b.state === 'taxi' || b.state === 'roll' || b.state === 'rollout') continue;
+      if (b.side === a.side) continue;
+      const dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+      if (dx * dx + dy * dy + dz * dz > COLLIDE_R2) continue;
+      const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2, mz = (a.z + b.z) / 2;
+      midairBlast(mx, my, mz);
+      AIR.collisions++;
+      blog('空中相撞 — ' + craftLabel(a) + ' / ' + craftLabel(b), '#ffd27a');
+      damageCraft(a, 999, '空中相撞');
+      damageCraft(b, 999, '空中相撞');
+    }
+  }
+}
+/* 坠机撞击：残骸范围内的步兵/坦克/堡垒都会被波及，机身碎裂成碎块抛向四周 */
+function crashImpact(a) {
+  const s = CRAFT_SPEC[a.kind];
+  const x = a.x, z = a.z;
+  const v = craftVel(a);
+  explodeGround(x, z, s.crashPower);
+  for (const army of [U, C]) {
+    const own = army.key === a.side;
+    const hits = blastCasualties(army, x, z, s.crashR, s.crashCap, own ? 0.35 : 0.7);
+    if (hits > 0) blog(craftLabel(a) + '坠毁 — ' + army.side.label + ' ' + hits + ' 人被残骸击中', '#e08a60');
+  }
+  for (const t of ARMOR.tanks) {
+    if (t.dead) continue;
+    if (Math.hypot(t.x - x, t.z - z) < s.crashR && rnd() < (t.side === a.side ? 0.25 : 0.6)) {
+      damageTank(t, s.tankDmg + rnd() * 60, s.label + '坠机');
+    }
+  }
+  for (const F of FORT) {
+    if (F.dead || F.side === a.side) continue;
+    if (Math.hypot(F.x - x, F.z - z) < 26 && rnd() < 0.4) damageFort(F, 80 + rnd() * 100, '坠机');
+  }
+  /* 机身碎裂：碎块向外抛，落地留痕 */
+  for (let i = 0; i < 6; i++) {
+    const ang = vrnd() * TAU, sp = 3 + vrnd() * 8;
+    spawnDebris(x + (vrnd() - 0.5) * 2, terrainH(x, z) + 0.6 + vrnd() * 1.2, z + (vrnd() - 0.5) * 2,
+      v.vx * 0.4 + Math.cos(ang) * sp, 3 + vrnd() * 5, v.vz * 0.4 + Math.sin(ang) * sp,
+      0.7 + vrnd() * 1.4, 0.5 + vrnd() * 0.9, 0.7 + vrnd() * 1.4);
+  }
+  boomPool.emit(x, terrainH(x, z) + 1.2 * s.crashPower, z, 1.4 * s.crashPower, 3.6 * s.crashPower, 0.18, 1, 0, 0.7 * s.crashPower, 0, 0);
+  for (let i = 0; i < 5; i++) {
+    smokePool.emit(x + (vrnd() - 0.5) * 3.4, terrainH(x, z) + 1.2 + i * 1.8, z + (vrnd() - 0.5) * 3.4,
+      2.4, 8.0, 3.6, 0.72, 0, 1.6, (vrnd() - 0.5), (vrnd() - 0.5));
+  }
+  blog(craftLabel(a) + '坠毁', '#e08a60');
 }
 
 /* ---------- 高射炮：提前量解算 + 定时引信 ---------- */
 const FLAK_R = 10;
+const AA_RANGE = 380;          // 交战半径（原 ~940：砍到只覆盖本方阵地正上方空域）
+const AA_MIN_PITCH = 0.17;     // 最小仰角 ≈ 10°：禁止平射，只对空
 function flakBurst(x, y, z, side) {
   for (let i = 0; i < 5; i++) {
     burstPool.emit(x + (vrnd() - 0.5) * 3.6, y + (vrnd() - 0.5) * 3.2, z + (vrnd() - 0.5) * 3.6,
@@ -4136,7 +4671,7 @@ function aaUpdate(dt) {
   for (const g of AIR.guns) {
     g.reload -= dt;
     const gy = g.y + 1.72;
-    let best = null, bd = 470 * 2;
+    let best = null, bd = AA_RANGE;
     for (const a of AIR.craft) {
       if (a.dead || a.state === 'falling' || a.side === g.side) continue;
       const d = Math.hypot(a.x - g.x, a.y - gy, a.z - g.z);
@@ -4155,7 +4690,8 @@ function aaUpdate(dt) {
     let dy = Math.atan2(dx, dz) - g.yaw;
     while (dy > Math.PI) dy -= TAU;
     while (dy < -Math.PI) dy += TAU;
-    const dp = clamp(Math.atan2(py - gy, dh), -0.12, 1.3) - g.pitch;
+    /* 最小仰角钳制：禁止平射——炮口只能对空抬高，不能压到水平去打地面 */
+    const dp = clamp(Math.atan2(py - gy, dh), AA_MIN_PITCH, 1.3) - g.pitch;
     g.yaw += clamp(dy, -1.9 * dt, 1.9 * dt);
     g.pitch += clamp(dp, -1.5 * dt, 1.5 * dt);
     if (!B.over && g.reload <= 0 && Math.abs(dy) < 0.09 && Math.abs(dp) < 0.07) {
@@ -4163,7 +4699,7 @@ function aaUpdate(dt) {
       const c2 = Math.cos(g.pitch);
       const ux = Math.sin(g.yaw) * c2, uy = Math.sin(g.pitch), uz = Math.cos(g.yaw) * c2;
       const ox = g.x + ux * 3.6, oy = gy + uy * 3.6, oz = g.z + uz * 3.6;
-      emitTracer(ox, oy, oz, ux * TR, uy * TR, uz * TR, tf, 2.0);
+      emitTracerAimed(ox, oy, oz, px, py, pz, TR, 2.0, 0);   // 引信点也是弹道诸元解出的提前点
       flashPool.emit(ox, oy, oz, 1.6, 0.3, 0.05, 1, 0, 0, 0, 0);
       smokePool.emit(ox + (vrnd() - 0.5), oy + 0.1, oz + (vrnd() - 0.5),
         0.5, 2.0, 1.1, 0.5, 0, 0.5, ux * 2, uz * 2);
@@ -4195,7 +4731,7 @@ function airProjectiles(dt) {
     t.life -= dt;
     if (t.life <= 0) { t.on = false; continue; }
     t.x += t.vx * dt; t.y += t.vy * dt; t.z += t.vz * dt;
-    t.vy -= 4.5 * dt;
+    t.vy -= GRAV * dt;      // 所有弹药统一重力加速度（发射诸元已做抬高修正）
     /* 曳光弹打在地上/胸墙上要留弹着点：一层扬尘 + 几点跳弹火星。
        顺带把"打空了的曳光弹"从空中抹掉，弹幕才不会凭空消失在天上。 */
     if (t.y <= groundY(t.x, t.z) + 0.1) {
@@ -4226,9 +4762,12 @@ function airSync() {
   for (const a of AIR.craft) {
     if (a.dead) continue;
     a.rig.write(a.idx, a.x, a.y, a.z, a.yaw, a.pitch, a.roll, { prop: a.prop });
+    /* 断翼：write() 写完全部件后用 hidePart 覆盖已断裂的部件 */
+    if (a.severed && a.severed.length) for (const id of a.severed) a.rig.hidePart(a.idx, id);
   }
   for (const g of AIR.guns) g.rig.write(g.idx, g.x, g.y, g.z, 0, 0, 0, { yaw: g.yaw, pitch: g.pitch });
-  fighterRig.flush(); bomberRig.flush(); aaRig.flush();
+  fighterRig.flush(); attackerRig.flush(); bomberRig.flush(); reconRig.flush(); aaRig.flush();
+  debrisSync();
 
   /* 只在有活动实例或该槽位需要清除时才写，并据此决定是否置 needsUpdate（空闲池零开销） */
   let tTouched = false;
@@ -4294,6 +4833,31 @@ function neediest(army) {
   }
   return best;
 }
+/* 坦克炮：不再是"瞬间落点结算"，而是打出一枚按重力诸元飞行的炮弹（复用 shells 池）。
+   命中点由低伸弹道解算给出，飞行途中同样吃重力，落地才结算伤害。 */
+function fireTankShell(t, best) {
+  const sh = shells[shellIdx++ % shells.length];
+  const fwd = t.hero ? 7.2 : 4.5;
+  const sx = t.x + Math.sin(t.yaw) * fwd, sz = t.z + Math.cos(t.yaw) * fwd;
+  const sy = groundY(t.x, t.z) + (t.hero ? 4.4 : 2.2);
+  const tx = best.cx + (rnd() - 0.5) * 26, tz = best.cz + (rnd() - 0.5) * 26;
+  const ty = groundY(best.cx, best.cz) + 1.0;
+  const b = ballisticVel(sx, sy, sz, tx, ty, tz, 240);
+  sh.x = sx; sh.y = sy; sh.z = sz;
+  sh.vx = b.vx; sh.vy = b.vy; sh.vz = b.vz;
+  sh.active = true; sh.dist = 6; sh.trailStep = 6; sh.mode = 'tank';
+  sh.side = t.side; sh.acc = 1;
+  sh.power = t.hero ? 1.5 : t.heavy ? 1.05 : 0.7;
+  sh.killR = t.hero ? 13 : 7.5; sh.cap = t.hero ? 10 : 5; sh.chance = 0.8;
+  sh.tankDmg = t.hero ? 120 : t.heavy ? 90 : 70;
+  sh.label = t.hero ? '重型战车' : t.heavy ? '重坦克' : '轻坦克';
+  sh.mesh.visible = true; sh.mesh.position.set(sh.x, sh.y, sh.z);
+  flashPool.emit(sx, sy, sz, t.hero ? 3.4 : 2.2, 0.4, 0.08, 1, 0, 0, 0, 0);
+  for (let i = 0; i < 3; i++) {
+    smokePool.emit(sx + (vrnd() - 0.5), sy, sz + (vrnd() - 0.5),
+      0.6, 2.4, 1.6, 0.5, 0, 0.3, Math.sin(t.yaw) * 2, Math.cos(t.yaw) * 2);
+  }
+}
 function armorUpdate(dt) {
   for (const t of ARMOR.tanks) {
     if (t.dead) continue;
@@ -4343,18 +4907,7 @@ function armorUpdate(dt) {
     t.y = groundY(t.x, t.z);
     if (t.reload <= 0 && bd < t.range && B.t > 8) {
       t.reload = (t.hero ? 7.2 : t.heavy ? 5.4 : 3.6) + rnd() * 1.4;
-      const fwd = t.hero ? 7.2 : 4.5;
-      const sx = t.x + Math.sin(t.yaw) * fwd, sz = t.z + Math.cos(t.yaw) * fwd;
-      const gY = groundY(t.x, t.z) + (t.hero ? 4.4 : 2.2);
-      const tx = best.cx + (rnd() - 0.5) * 26, tz = best.cz + (rnd() - 0.5) * 26;
-      flashPool.emit(sx, gY, sz, t.hero ? 3.4 : 2.2, 0.4, 0.08, 1, 0, 0, 0, 0);
-      for (let i = 0; i < 3; i++) {
-        smokePool.emit(sx + (vrnd() - 0.5), gY, sz + (vrnd() - 0.5),
-          0.6, 2.4, 1.6, 0.5, 0, 0.3, Math.sin(t.yaw) * 2, Math.cos(t.yaw) * 2);
-      }
-      explodeGround(tx, tz, t.hero ? 1.5 : t.heavy ? 1.05 : 0.7);
-      const hits = blastCasualties(foe, tx, tz, t.hero ? 13 : 7.5, t.hero ? 10 : 5, 0.8);
-      if (hits > 0) blog((t.hero ? '重型战车' : t.heavy ? '重坦克' : '轻坦克') + ' 炮击 ' + foe.side.label + ' — ' + hits + ' 人倒下', '#c8a05a');
+      fireTankShell(t, best);
     }
   }
 }
@@ -4451,6 +5004,12 @@ function mgSync() {
 function simulate(dt) {
   windUpdate();
   for (const a of [U, C]) for (const u of a.units) if (u.kind !== 'art') u.cover = coverAt(u);
+  /* 战线平均位置：给"齐头并进"用——突出太多的单位要停下来等齐 */
+  for (const a of [U, C]) {
+    let fs = 0, fn = 0;
+    for (const u of a.units) if (u.kind !== 'art' && u.onField) { fs += u.cz; fn++; }
+    a.frontZ = fn ? fs / fn : 0;
+  }
   aiUpdate(U, dt); aiUpdate(C, dt);
   synergyUpdate(dt);
   armorUpdate(dt);
@@ -4467,6 +5026,7 @@ function simulate(dt) {
   for (const s of U.mount) soldierUpdate(s, dt);
   for (const s of C.mount) soldierUpdate(s, dt);
   projectilesUpdate(dt);
+  debrisUpdate(dt);
   flashPool.update(dt); smokePool.update(dt); burstPool.update(dt);
   dustPool.update(dt); boomPool.update(dt); motePool.update(dt); shardPool.update(dt);
   bloodPool.update(dt); dropPool.update(dt);
@@ -4485,7 +5045,8 @@ function simulate(dt) {
 
 function syncArmy(army) {
   for (const s of army.foot) {
-    if (s.state === 'gone') hideSoldier(army.footPool, s.idx);
+    /* 炮手不走 Unit 的倒地动画（不在任何 Unit.soldiers 里），阵亡后直接隐藏，避免"站着的尸体" */
+    if (s.state === 'gone' || (s.crew && !s.alive)) hideSoldier(army.footPool, s.idx);
     else writeSoldier(army.footPool, s.idx, s);
   }
   army.footPool.flush();
@@ -4528,10 +5089,15 @@ function updateHUD(dt) {
   HUD.speed.textContent = '速度 ×' + B.speed;
   const aliveOf = list => list.filter(v => !v.dead).length + '/' + list.length;
   const airAlive = k => aliveOf(AIR.craft.filter(c => c.side === k));
+  const typeAlive = (k, kind) => aliveOf(AIR.craft.filter(c => c.side === k && c.kind === kind));
   const tankAlive = k => aliveOf(ARMOR.tanks.filter(t => t.side === k && !t.hero));
   const heroAlive = k => aliveOf(ARMOR.tanks.filter(t => t.side === k && t.hero));
   const fortAlive = k => aliveOf(FORT.filter(f => f.side === k));
   HUD.air.textContent = '航空兵 ' + airAlive('union') + '/' + airAlive('confederate')
+    + '（战' + typeAlive('union', 'fighter') + '/' + typeAlive('confederate', 'fighter')
+    + '·攻' + typeAlive('union', 'attacker') + '/' + typeAlive('confederate', 'attacker')
+    + '·轰' + typeAlive('union', 'bomber') + '/' + typeAlive('confederate', 'bomber')
+    + '·侦' + typeAlive('union', 'recon') + '/' + typeAlive('confederate', 'recon') + '）'
     + ' · 坦克 ' + tankAlive('union') + '/' + tankAlive('confederate')
     + ' · 重战车 ' + heroAlive('union') + '/' + heroAlive('confederate')
     + ' · 堡垒 ' + fortAlive('union') + '/' + fortAlive('confederate')
@@ -4545,8 +5111,14 @@ function updateHUD(dt) {
   const spot = a => enemyOf(a).units.filter(u => u.kind !== 'art' && u.onField && u.spottedBy === a.key).length;
   const tan = a => a.units.filter(u => u.kind !== 'art' && u.onField && u.tankSup).length;
   const brc = a => a.units.filter(u => u.kind !== 'art' && u.onField && u.engBreach).length;
+  /* 炮兵观瞄：直瞄（有观察）/ 反炮兵（弹道反推）/ 盲射，按门数统计 + 情报条数 */
+  const gmode = (a, m) => { let n = 0; for (const u of a.units) { if (u.kind !== 'art') continue; for (const g of u.guns) if (!g.dead && g.mode === m) n++; } return n; };
   HUD.syn.textContent = '压制 ' + sup(U) + '/' + sup(C) + ' · 引导 ' + spot(U) + '/' + spot(C)
     + ' · 步坦 ' + tan(U) + '/' + tan(C) + ' · 破障 ' + brc(U) + '/' + brc(C)
+    + ' · 炮观 直' + gmode(U, 'direct') + '/' + gmode(C, 'direct')
+    + ' 反' + gmode(U, 'cb') + '/' + gmode(C, 'cb')
+    + ' 盲' + gmode(U, 'blind') + '/' + gmode(C, 'blind')
+    + ' 情报' + INTEL.union.length + '/' + INTEL.confederate.length
     + ' · 技能 ' + (ABIL.aimed + ABIL.snipe + ABIL.pin + ABIL.dig + ABIL.barrage + ABIL.wedge);
 }
 
@@ -4919,10 +5491,13 @@ window.__battle = {
       craft: AIR.craft.map(c => ({
         side: c.side, kind: c.kind, state: c.state, dead: c.dead,
         x: +c.x.toFixed(1), y: +c.y.toFixed(1), z: +c.z.toFixed(1),
-        yaw: +c.yaw.toFixed(3), hp: Math.round(c.hp)
+        yaw: +c.yaw.toFixed(3), hp: Math.round(c.hp), severed: c.severed ? c.severed.length : 0
       })),
       guns: AIR.guns.map(g => ({ side: g.side, yaw: +g.yaw.toFixed(2), pitch: +g.pitch.toFixed(2), reload: +g.reload.toFixed(2) })),
-      lost: AIR.lost, bombsDropped: AIR.dropped,
+      lost: AIR.lost, collisions: AIR.collisions, debris: debris.filter(d => d.on).length,
+      falling: AIR.craft.filter(c => c.state === 'falling').length,
+      byKind: AIR.craft.reduce((o, c) => { o[c.kind] = (o[c.kind] || 0) + 1; return o; }, {}),
+      bombsDropped: AIR.dropped,
       tracers: tracers.filter(t => t.on).length,
       bombs: bombs.filter(b => b.on).length,
       flakInFlight: AIR.flak.length,
@@ -4999,6 +5574,44 @@ window.__battle = {
     }
     return out;
   },
+  /* 弹药/弹道自检：炮弹按类型在飞数、曳光弹重力、高炮数量与射界 */
+  ballistics() {
+    let art = 0, tank = 0;
+    for (const s of shells) if (s.active) (s.mode === 'tank' ? tank++ : art++);
+    const pitches = AIR.guns.map(g => +g.pitch.toFixed(3));
+    /* 炮兵观瞄自检：每个炮组当前是直瞄/反炮兵/盲射，以及两边的反推情报条数 */
+    const gunModes = a => {
+      const o = { direct: 0, cb: 0, blind: 0, dead: 0, crewless: 0 };
+      for (const u of a.units) {
+        if (u.kind !== 'art') continue;
+        for (const g of u.guns) {
+          if (g.dead) { o.dead++; continue; }
+          let ca = 0; for (const s of g.crew) if (s.alive) ca++;
+          if (ca < 2) o.crewless++; else o[g.mode] = (o[g.mode] || 0) + 1;
+        }
+      }
+      return o;
+    };
+    const observed = (a, foe) => foe.units.filter(e => e.kind !== 'art' && e.onField && e.spottedBy === a.key).length;
+    return {
+      shells: { art, tank }, tracersInFlight: tracers.filter(t => t.on).length, tracerGrav: GRAV,
+      aa: { perSide: AA_PER, count: AIR.guns.length, range: AA_RANGE, minPitch: AA_MIN_PITCH, minPitchNow: Math.min.apply(null, pitches), maxPitchNow: Math.max.apply(null, pitches) },
+      observation: {
+        union: gunModes(U), confederate: gunModes(C),
+        intelUnion: INTEL.union.length, intelConf: INTEL.confederate.length,
+        observedUnion: observed(U, C), observedConf: observed(C, U)
+      },
+      shrapnel: {
+        fuse: SHRAPNEL_FUSE, radius: SHRAPNEL_R,
+        inFlight: shells.filter(s => s.active && s.mode === 'shrapnel').length,
+        fired: { he: SHELL_FIRED.he, shrap: SHELL_FIRED.shrap },
+        live: shells.filter(s => s.active && s.mode === 'shrapnel')
+          .map(s => ({ x: +s.x.toFixed(1), y: +s.y.toFixed(1), z: +s.z.toFixed(1) }))
+      }
+    };
+  },
+  /* 空爆距离可设定：__battle.shrapnel(40) */
+  shrapnel(m) { if (m !== undefined) SHRAPNEL_FUSE = clamp(+m || 26, 5, 120); return SHRAPNEL_FUSE; },
   /* 兵种/配合/技能自检：逐单位的压制、被引导、突击、步坦、破障与技能冷却 */
   synergy() {
     const one = a => a.units.filter(u => u.kind !== 'art').map(u => ({
