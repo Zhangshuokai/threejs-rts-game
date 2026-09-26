@@ -314,8 +314,42 @@ const WMD_CAP = 16;             // 单发总伤亡上限（低 = 伤害小）
 const WMD_CHANCE = 0.12;        // 单兵命中率（低）
 const WMD_SUPPRESS_R = 60;      // 大范围压制半径
 const WMD_SATELLITES = 8;       // 环形卫星弹坑数（弹坑场的确定性偏移）
-const WMD_FORT_EVERY = 5;       // 堡垒要塞炮每 5 发里 1 发 WMD
-const WMD_TANK_EVERY = 4;       // 英雄重战车每 4 发里 1 发 WMD
+const WMD_FORT_EVERY = 5;       // 堡垒要塞炮每 5 发里 1 发 WMD（升级后变密）
+const WMD_TANK_EVERY = 4;       // 英雄重战车每 4 发里 1 发 WMD（升级后变密）
+/* ---- 战局升级 → 重炮饱和 ----
+   会战越到后期，双方的堡垒与英雄重战车打出的"地形改造弹"越密、单次齐射发数越多、
+   散布越大。升级量是纯确定性评分（累计阵亡比 + 时间 + 阶段），不取任何随机数；
+   每发的升级快照存在 sh.esc 上，所以同一发弹的弹坑场大小可复现。
+   验收面：__battle.ballistics().wmd.escal / salvo / every。 */
+function battleEscalation() {
+  let loss = 0, cap = 0;
+  for (const a of [U, C]) for (const u of a.units) if (u.kind !== 'art') { loss += u.casualties; cap += u.maxMen; }
+  const frac = cap ? clamp(loss / cap * 4.2, 0, 1) : 0;   // 累计阵亡占编制的比例
+  const timeF = clamp((B.t - 40) / 200, 0, 1);
+  const phaseF = { DEPLOY: 0, ADVANCE: 0.15, FIREPREP: 0.35, FIREFIGHT: 0.55, ASSAULT: 0.8, MELEE: 1, PURSUIT: 1, END: 1 }[B.phase] || 0;
+  return clamp(0.45 * frac + 0.25 * timeF + 0.30 * phaseF, 0, 1);
+}
+const wmdSalvo = e => 1 + Math.floor(e * 3);                 // 单次触发连打 1..4 发
+const wmdEvery = (base, e) => Math.max(2, Math.round(base - (base - 2) * e));
+const wmdSpreadMul = e => 1 + 1.6 * e;                       // 散布放大倍数（1 → 2.6）
+const wmdRadius = e => WMD_R * (1 + 0.5 * e);
+const wmdCap = e => WMD_CAP + Math.floor(10 * e);
+const wmdSats = e => WMD_SATELLITES + Math.floor(6 * e);
+const wmdPower = e => WMD_POWER * (1 + 0.35 * e);
+const wmdSuppressR = e => WMD_SUPPRESS_R * (1 + 0.5 * e);
+/* ---- 轰炸机 vs 战局升级 ----
+   每轮挂弹更多（单次投弹数随升级 8 → 18）、单发威力更大、横向散布更广；
+   升级超过 0.55 后开始混挂集束炸弹 —— 一枚母弹低空开舱，撒出一片子弹药
+   （确定性的不均匀散布 + 各自的小弹坑），所以晚期的轰炸是"整片区域被翻一遍"。
+   集束弹的散布半径、子弹药数都随升级继续放大。 */
+const BOMB_STICK_BASE = 8, BOMB_STICK_MAX = 18;
+const BOMB_CLUSTER_ES = 0.55;        // 升级超过此值开始混挂集束弹
+const CLUSTER_SUB = 10, CLUSTER_R = 30;
+const bombStick = e => Math.round(BOMB_STICK_BASE + (BOMB_STICK_MAX - BOMB_STICK_BASE) * e);
+const bombSpread = e => 1 + 1.4 * e;                 // 投弹横向散布倍数
+const bombPowerUp = e => 1.4 * (1 + 0.55 * e);       // 单发威力（explodeGround 的 power）
+const bombRadiusUp = e => 1 + 0.6 * e;               // 单发杀伤半径倍数
+const clusterChance = e => clamp((e - BOMB_CLUSTER_ES) / 0.35, 0, 0.75);
 const FX = {
   enabled: false,
   wanted: MODE === 'webgl' && FXQ.get('fx') !== '0',
@@ -553,32 +587,81 @@ function terrainFlat(x, z) {
 /* ---- 二叉树地形：分叉的山脊 / 沟谷骨架 ----
    地形走向由一棵"二叉树"决定：一条主脊在节点处一分为二，每条子脊再一分为二，
    高度/长度/半径逐级衰减、相邻层级正负交替 —— 于是山脉与山谷成对分叉出现，
-   而不是 sin/cos 那种等距条纹（旧版规则起伏的问题）。两棵树从地图对角向中心
-   生长：树干（高）留在核心战区之外，树梢（矮）伸入战区，核心再用 reliefScale
-   压低到可作战的缓坡。
-   骨架一次性烘焙进 rh（16 m 高程场），运行时只做双线性采样 —— O(1)，逐士兵
-   每步调用也扛得住。随机量走独立流 grnd，不消耗玩法 rnd / 视觉 vrnd。 */
-const RH_RES = 16, RH_HALF = 400 * S;
-const RH_N = Math.round(2 * RH_HALF / RH_RES) + 1;
-const RH_X0 = -RH_HALF, RH_Z0 = -RH_HALF;
-const rh = new Float32Array(RH_N * RH_N);
-{
-  const grnd = mulberry32(0x7E3A11);
+   而不是 sin/cos 那种等距条纹（旧版规则起伏的问题），也不是同心圆一样的"馒头包"。
+   骨架一次性烘焙进高程场，运行时只做双线性采样 —— O(1)，逐士兵每步调用也扛得住。
+   随机量走独立流，不消耗玩法 rnd / 视觉 vrnd。
+   外围山脉与中央高地共用这一个工厂 ridgeField()，所以轮廓语言完全一致。 */
+/* ---- 改进的山脉生成算法：Perlin 梯度噪声 + 脊状多重分形 + 域扭曲 ----
+   算法参考公开实现 AmanPriyanshu/The-Mountains-of-Madness 的 ridged-multifractal 与
+   domain-warping 两例（README 第 4、6 节）：
+     1) 脊状变换  r = (offset − |perlin|)²  —— 把噪声的零交叉线变成尖锐山脊；
+     2) 多重分形谱权重  weight = clamp(r·1.5)^0.8，逐倍频传递 —— 细节只长在山脊上，
+        山脊会分叉、收敛、在沟谷处自然断开；
+     3) 域扭曲：先用两层低频噪声把采样坐标推开，山脊因此弯曲、不再有网格/同心圆感。
+   相比"半径衰减的圆锥/包"，它给出的是真实山地的脊—谷结构，而不是均匀的圆馒头。
+   纯置换表噪声（mulberry32 定种），不消耗玩法 rnd / 视觉 vrnd。 */
+function makePerlin(seed) {
+  const r = mulberry32(seed), order = [];
+  for (let i = 0; i < 256; i++) order[i] = i;
+  for (let i = 255; i > 0; i--) { const j = (r() * (i + 1)) | 0; const t = order[i]; order[i] = order[j]; order[j] = t; }
+  const p = new Uint8Array(512);
+  for (let i = 0; i < 512; i++) p[i] = order[i & 255];
+  const fade = t => t * t * t * (t * (t * 6 - 15) + 10);
+  const grad = (h, x, y) => {
+    const g = h & 7, u = (g & 4) ? x : y, v = (g & 4) ? y : x;
+    return ((g & 1) ? -u : u) + ((g & 2) ? -v : v);
+  };
+  return function (x, y) {
+    const X = Math.floor(x) & 255, Y = Math.floor(y) & 255;
+    const fx = x - Math.floor(x), fy = y - Math.floor(y);
+    const u = fade(fx), v = fade(fy);
+    const A = p[X] + Y, B = p[X + 1] + Y;
+    return lerp(
+      lerp(grad(p[A], fx, fy), grad(p[B], fx - 1, fy), u),
+      lerp(grad(p[A + 1], fx, fy - 1), grad(p[B + 1], fx - 1, fy - 1), u), v);
+  };
+}
+const PN = makePerlin(0x51A7CE);
+function ridgedMF(x, z) {
+  /* 域扭曲：低频噪声把采样坐标推开，山脊弯曲、打破网格感 */
+  const wx = PN(x * 0.00085 + 13.7, z * 0.00085 + 7.3);
+  const wy = PN(x * 0.00085 + 41.1, z * 0.00085 + 29.9);
+  const X = x * 0.0014 + wx * 26, Z = z * 0.0014 + wy * 26;
+  let sum = 0, freq = 1, amp = 1, weight = 1, norm = 0;
+  for (let o = 0; o < 5; o++) {
+    const n = PN(X * freq + o * 3.1, Z * freq + o * 5.7);
+    let rr = 1.05 - Math.abs(n);
+    rr *= rr;                                  // 锐化出山脊
+    rr *= weight;                              // 谱权重：上一倍频控制本倍频
+    sum += rr * amp; norm += amp * 1.15;
+    weight = Math.pow(clamp(rr * 1.5, 0, 1), 0.8);
+    freq *= 2.0; amp *= 0.5;
+  }
+  return clamp(sum / norm, 0, 1);
+}
+function ridgeField(half, res, seed, growers, caps, decay, detail, target) {
+  const N = Math.round(2 * half / res) + 1, X0 = -half, Z0 = -half;
+  const f = new Float32Array(N * N);
+  const rng = mulberry32(seed);
+  /* 衰减系数：子脊相对父脊的长度/高度/半径，以及分叉张角。默认值即外围山脉
+     （衰减快 → 主脊高、支脊短）；中央高地传一组更慢的衰减，山体因此更舒展、
+     支脊更长，轮廓更像真山而不是一个包。 */
+  const D = decay || { ls: 0.56, lr: 0.14, hs: 0.58, hr: 0.14, rs: 0.66, rr: 0.12, sp: 0.42, spr: 0.55 };
   const stamp = (x1, z1, x2, z2, r, h) => {
-    const i0 = Math.max(0, Math.floor((Math.min(x1, x2) - r - RH_X0) / RH_RES));
-    const i1 = Math.min(RH_N - 1, Math.ceil((Math.max(x1, x2) + r - RH_X0) / RH_RES));
-    const j0 = Math.max(0, Math.floor((Math.min(z1, z2) - r - RH_Z0) / RH_RES));
-    const j1 = Math.min(RH_N - 1, Math.ceil((Math.max(z1, z2) + r - RH_Z0) / RH_RES));
+    const i0 = Math.max(0, Math.floor((Math.min(x1, x2) - r - X0) / res));
+    const i1 = Math.min(N - 1, Math.ceil((Math.max(x1, x2) + r - X0) / res));
+    const j0 = Math.max(0, Math.floor((Math.min(z1, z2) - r - Z0) / res));
+    const j1 = Math.min(N - 1, Math.ceil((Math.max(z1, z2) + r - Z0) / res));
     const dx = x2 - x1, dz = z2 - z1, L2 = dx * dx + dz * dz || 1;
     for (let j = j0; j <= j1; j++) {
-      const z = RH_Z0 + j * RH_RES;
+      const z = Z0 + j * res;
       for (let i = i0; i <= i1; i++) {
-        const x = RH_X0 + i * RH_RES;
+        const x = X0 + i * res;
         const t = clamp(((x - x1) * dx + (z - z1) * dz) / L2, 0, 1);
         const d = Math.hypot(x - (x1 + dx * t), z - (z1 + dz * t));
         if (d >= r) continue;
         const w = 1 - d / r;
-        rh[j * RH_N + i] += h * w * w * (3 - 2 * w);
+        f[j * N + i] += h * w * w * (3 - 2 * w);
       }
     }
   };
@@ -586,24 +669,64 @@ const rh = new Float32Array(RH_N * RH_N);
     const x2 = x + Math.cos(ang) * len, z2 = z + Math.sin(ang) * len;
     stamp(x, z, x2, z2, r, h * sign);
     if (depth <= 0) return;
-    const sp = 0.42 + grnd() * 0.55;
-    const nl = len * (0.56 + grnd() * 0.14), nh = h * (0.58 + grnd() * 0.14), nr = r * (0.66 + grnd() * 0.12);
+    const sp = D.sp + rng() * D.spr;
+    const nl = len * (D.ls + rng() * D.lr), nh = h * (D.hs + rng() * D.hr), nr = r * (D.rs + rng() * D.rr);
     grow(x2, z2, ang - sp, nl, nh, nr, depth - 1, -sign);
     grow(x2, z2, ang + sp, nl, nh, nr, depth - 1, -sign);
   };
-  grow(-1200, -1520, 1.02, 640, 60, 220, 5, 1);
-  grow(1230, 1520, -2.12, 640, 60, 220, 5, 1);
+  for (const g of growers) grow(g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7]);
+  /* 软包络：离包络中心 r0→r1 由 1 衰减到 0。用来把支脊收在规定范围内，
+     不让它爬到河道/公路上把水面和大路抬起来（不是硬切，支脊末端自然变矮）。
+     支持椭圆（sx/sz 为归一化尺度），于是山体可以沿某一轴伸展、另一轴收紧。 */
+  if (caps) for (const cp of caps) {
+    const sx = cp.sx || 1, sz = cp.sz || 1;
+    for (let j = 0; j < N; j++) {
+      const z = Z0 + j * res;
+      for (let i = 0; i < N; i++) {
+        const k = j * N + i;
+        if (f[k] === 0) continue;
+        const d = Math.hypot((X0 + i * res - cp.x) * sx, (z - cp.z) * sz);
+        f[k] *= clamp(1 - (d - cp.r0) / (cp.r1 - cp.r0), 0, 1);
+      }
+    }
+  }
+  /* 山体细节：ridged multifractal 只作用在有起伏的地方（高度掩膜），
+     平地（f=0）保持平地，不会在战场上凭空长出随机土包。 */
+  if (detail) for (let j = 0; j < N; j++) {
+    const z = Z0 + j * res;
+    for (let i = 0; i < N; i++) {
+      const k = j * N + i, s = f[k];
+      if (s === 0) continue;
+      const mo = Math.min(1, Math.abs(s) / 12);
+      f[k] = s * (1 + (ridgedMF(X0 + i * res, z) - 0.42) * detail * mo);
+    }
+  }
+  /* 统一缩放到目标峰高（保持形状）：保证"最高峰"可预期，也保证不越过飞机的净空上限 */
+  if (target) {
+    let mx = 0;
+    for (let i = 0; i < f.length; i++) if (f[i] > mx) mx = f[i];
+    if (mx > 0) { const k = target / mx; for (let i = 0; i < f.length; i++) f[i] *= k; }
+  }
+  return { f, N, X0, Z0, res };
 }
-function treeField(x, z) {
-  const fx = (x - RH_X0) / RH_RES, fz = (z - RH_Z0) / RH_RES;
-  if (fx < 0 || fz < 0 || fx > RH_N - 1 || fz > RH_N - 1) return 0;
+function sampleField(F, x, z) {
+  const fx = (x - F.X0) / F.res, fz = (z - F.Z0) / F.res;
+  if (fx < 0 || fz < 0 || fx > F.N - 1 || fz > F.N - 1) return 0;
   const i = fx | 0, j = fz | 0, tx = fx - i, tz = fz - j;
-  const i1 = i + 1 < RH_N ? i + 1 : i, j1 = j + 1 < RH_N ? j + 1 : j;
-  const row = j * RH_N, row1 = j1 * RH_N;
-  const a = rh[row + i], b = rh[row + i1], c = rh[row1 + i], d = rh[row1 + i1];
+  const i1 = i + 1 < F.N ? i + 1 : i, j1 = j + 1 < F.N ? j + 1 : j;
+  const row = j * F.N, row1 = j1 * F.N;
+  const a = F.f[row + i], b = F.f[row + i1], c = F.f[row1 + i], d = F.f[row1 + i1];
   const top = a + (b - a) * tx, bot = c + (d - c) * tx;
   return top + (bot - top) * tz;
 }
+/* 外围两棵大树从地图对角向中心生长：树干（高）留在核心战区之外，树梢（矮）伸入
+   战区，核心再用 reliefScale 压低到可作战的缓坡。本轮把树干 60 → 88 m（背景更高），
+   再叠 ridged multifractal 细节（0.42）让山脊分叉、沟谷断开 —— 背景山脉不再是平滑包。 */
+const RH = ridgeField(400 * S, 16, 0x7E3A11, [
+  [-1200, -1520, 1.02, 760, 88, 262, 5, 1],
+  [1230, 1520, -2.12, 760, 88, 262, 5, 1]
+], null, null, 0.42, 86);
+function treeField(x, z) { return sampleField(RH, x, z); }
 /* 核心战区压低起伏：0.34（可作战的缓坡）→ 1（外围分叉山脉全高） */
 function reliefScale(x, z) {
   const dz = Math.max(Math.abs(z) - Z_FLAT, 0), dx = Math.max(Math.abs(x) - 152 * S, 0);
@@ -682,7 +805,31 @@ function craterAt(x, z) {
   const top = a + (b - a) * tx, bot = c + (d - c) * tx;
   return top + (bot - top) * tz;
 }
-function terrainBase(x, z) { return terrainFlat(x, z) + terrainRelief(x, z) - riverDepth(x, z) + craterAt(x, z); }
+/* ---- 中央高地：二叉树骨架 + ridged multifractal 细节 + 域扭曲 ----
+   峰顶 (300, -300)：在战线正面（|x|<368）之内，同时避开河道（z∈[-58,52]）与
+   东西大路（z≈60）。两条主脊大致沿河道走向反向伸出（东 / 西）—— 汇合处叠加成
+   峰顶，再叠 0.55 的脊状多重分形细节（域扭曲），于是轮廓是分叉、收敛的山脊与
+   沟谷，而不是同心圆"馒头包"。整场归一化到 104 m，确保它是全图最高点、
+   且低于飞机净空上限（ALT_MAX=150，飞机由 steerTo 的地形跟随越过）。
+   椭圆软包络：沿 x 放到 275 m（山体沿走向舒展），沿 z 收到 205 m，
+   于是北/南坡不会爬到河道上把水面抬起来，也不碰两侧公路与机场。
+   高程只改地形，不动任何杀伤/射程常量。 */
+const CH = ridgeField(950, 8, 0x2B7C1E, [
+  [300, -300, 0.14, 190, 52, 130, 5, 1],     // 主脊：向东
+  [300, -300, 3.02, 178, 50, 126, 5, 1]      // 次脊：向西（与主脊反向，汇合处成峰）
+], [{ x: 300, z: -300, sx: 1 / 275, sz: 1 / 205, r0: 0.55, r1: 1.0 }],
+  { ls: 0.74, lr: 0.10, hs: 0.66, hr: 0.12, rs: 0.72, rr: 0.10, sp: 0.50, spr: 0.60 },
+  0.55, 104);
+/* 两条主脊的种子参数（供 __battle.peakScan 报告用） */
+const PEAKS = [
+  { x: 300, z: -300, h: 52, r: 130, ang: 0.14 },
+  { x: 300, z: -300, h: 50, r: 126, ang: 3.02 }
+];
+function peakRelief(x, z) {
+  if (x < -40 || x > 640 || z < -520 || z > -80) return 0;   // 中央高地包围盒
+  return sampleField(CH, x, z);
+}
+function terrainBase(x, z) { return terrainFlat(x, z) + terrainRelief(x, z) + peakRelief(x, z) - riverDepth(x, z) + craterAt(x, z); }
 /* ---- 机场：跑道范围先在地形里压平，否则飞机是在起伏草地上滑跑/接地 ---- */
 /* 机场必须整个落在本军后方：跑道不得伸进战线/炮兵阵地，也不能占用观赏机位的空域。
    yaw = 起飞方向（0 朝 +z，π/2 朝 +x）；跑道长轴与它对齐 —— 机场整体转 90° 后
@@ -761,12 +908,18 @@ const gBaseY = new Float32Array(groundGeo.attributes.position.count);   // 未�
   const pos = groundGeo.attributes.position;
   const colors = new Float32Array(pos.count * 3);
   const cA = new THREE.Color(0x76854a), cB = new THREE.Color(0xa79c62), cC = new THREE.Color(0xb6a473);
+  /* 高处压一层偏冷的岩屑色：山脊不再是"绿草馒头"，远看能读出裸岩/碎石。
+     注意这里必须是同一个 rnd() 调用（只是拆成变量）——地面烘焙的随机数消耗顺序
+     一旦改变，整场会战的玩法流都会跟着变，确定性探针会红。 */
+  const cRock = new THREE.Color(0x7c766a);
   const tmp = new THREE.Color();
   for (let i = 0; i < pos.count; i++) {
     const x = pos.getX(i), z = pos.getZ(i);
     const y = terrainH(x, z);
     pos.setY(i, y); gBaseY[i] = y;
-    tmp.copy(cA).lerp(cB, clamp((y + 2.6) / 5.4, 0, 1)).lerp(cC, rnd() * 0.3);
+    const jit = rnd() * 0.3;
+    tmp.copy(cA).lerp(cB, clamp((y + 2.6) / 5.4, 0, 1)).lerp(cC, jit);
+    tmp.lerp(cRock, clamp((y - 20) / 62, 0, 0.55));
     colors[i * 3] = tmp.r; colors[i * 3 + 1] = tmp.g; colors[i * 3 + 2] = tmp.b;
   }
   groundGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
@@ -1413,6 +1566,15 @@ class Unit {
     this.ammoMax = cfg.kind === 'mg' ? 200 : cfg.kind === 'art' ? 999 : 20;
     this.ammo = this.ammoMax;
     this.ammoOut = false;
+    /* —— 步兵梯队（批次）与换装 ——
+       第 1 梯队：步枪线列；第 2 梯队：冲锋枪 + 轻防空；第 3 梯队：火箭筒 + 冲锋枪 + 轻防空。
+       编制、士气、装备逐批增强，且由 aiUpdate 的批次闸门按 WAVE_T 逐批投入。 */
+    this.wave = cfg.wave || 1;
+    this.weapon = cfg.weapon || 'rifle';
+    this.aa = !!cfg.aa;
+    this.rocketAmmo = this.weapon === 'rocket' ? 8 : 0;   // 火箭筒备弹
+    this.rocketT = 1.5;                                    // 火箭筒冷却
+    this.aaT = 0;                                          // 轻防空冷却
     this.impact = false;
     this.meleeT = 0;
     this.gone = false;
@@ -1425,6 +1587,14 @@ class Unit {
     this.engBreach = false;   // 随行工兵已开路 → 工事通行代价降低
     this.wedge = 0;           // 骑兵楔形冲锋的额外冲击
     this.falling = false;     // 散兵"且战且退"标记（不影响状态机，只改步幅/动画）
+    /* —— 实兵条令状态（见 §步兵战术）—— */
+    this.bounding = false;    // 跃进掩护：本建制处于"跃进段"(true)还是"掩护段"(false)
+    this.boundT = 0;          // 本段剩余时间
+    this.boundPhase = 0;      // 名册错相（0/1），相邻建制反相
+    this.pinned = false;      // 被火力钉住 → 就地卧倒，暂停推进
+    this.perch = null;        // 散兵/狙击自行抢占的制高点 {x,z,h}
+    this.perchT = 0;          // 行军承诺剩余时间（未到位时）
+    this.perchHold = 0;       // 到位后占住高地的剩余时间
     this.abilityCd = 0;       // 技能冷却
     this.mgT = 0;             // 机枪点射间隔
     this.mgYaw = 0;           // 机枪相对单位的回旋角
@@ -1499,6 +1669,7 @@ function unitStance(u) {
   if (u.state === 'rout') return '溃退';
   if (u.state === 'charge') return '冲锋';
   if (u.state === 'melee') return '白刃';
+  if (u.pinned) return '卧倒';
   if (u.order === 'reserve') return '预备';
   if (u.order === 'flank') return '迂回';
   if (u.state === 'hold' || u.order === 'hold') return '据守';
@@ -2077,7 +2248,12 @@ function makeCannon(army) {
 
 const shells = [];
 const shellGeo = new THREE.SphereGeometry(0.17, 8, 6);
-const shellMat = new THREE.MeshStandardMaterial({ color: 0x24242a, roughness: 0.5, metalness: 0.6 });
+/* 弹丸自发光：所有炮弹（榴弹/霰弹/坦克弹/WMD）在飞行中都带一道橙色亮光，
+   配合尾烟就是"光亮 + 轨迹"，远看不会只剩一个看不见的暗点。 */
+const shellMat = new THREE.MeshStandardMaterial({
+  color: 0x24242a, roughness: 0.5, metalness: 0.6,
+  emissive: 0xff5a1e, emissiveIntensity: 1.5
+});
 for (let i = 0; i < 26; i++) {
   const m = new THREE.Mesh(shellGeo, shellMat);
   m.visible = false; m.castShadow = true;
@@ -2135,6 +2311,13 @@ function fireShell(gun) {
     az = lineZ(gun.army.key) + dir * (rnd() * 80 - 20);
     spx = 70; spz = 70; acc = 0.6;
   }
+  const shrap = !!gun.shrapnel && !!target && !fort;
+  /* WMD 大规模杀伤弹：只有堡垒要塞炮 / 英雄重战车会带 gun.wmd，弹道与榴弹相同，
+     但口径更大、飞行更慢、落地后走 wmdImpact（低伤害 + 大范围 + 大范围地形改变）。
+     战局升级快照 es 决定这一发的散布（wmdSpreadMul）、口径与弹坑场规模。 */
+  const wmd = !!gun.wmd && !shrap;
+  const es = wmd ? battleEscalation() : 0;
+  if (wmd) { const ws = wmdSpreadMul(es); spx *= ws; spz *= ws; }
   const tx = ax + (rnd() - 0.5) * spx;
   const tz = az + (rnd() - 0.5) * spz;
   const dx = tx - sx, dz = tz - sz;
@@ -2145,16 +2328,13 @@ function fireShell(gun) {
   const ux = dx / flat, uz = dz / flat;
   sh.x = sx + ux * 2.3; sh.y = gun.muzzleY || 1.7; sh.z = sz + uz * 2.3;
   sh.vx = ux * v * Math.cos(ang); sh.vz = uz * v * Math.cos(ang); sh.vy = v * Math.sin(ang);
-  const shrap = !!gun.shrapnel && !!target && !fort;
-  /* WMD 大规模杀伤弹：只有堡垒要塞炮 / 英雄重战车会带 gun.wmd，弹道与榴弹相同，
-     但口径更大、飞行更慢、落地后走 wmdImpact（低伤害 + 大范围 + 大范围地形改变）。 */
-  const wmd = !!gun.wmd && !shrap;
   if (wmd) SHELL_FIRED.wmd++;
   else if (shrap) SHELL_FIRED.shrap++;
   else SHELL_FIRED.he++;
   sh.active = true; sh.dist = wmd ? 2.4 : 0.62; sh.trailStep = wmd ? 3.2 : 1.3;
   sh.mode = wmd ? 'wmd' : (shrap ? 'shrapnel' : 'art');
-  sh.power = wmd ? WMD_POWER : 1;
+  sh.power = wmd ? wmdPower(es) : 1;
+  sh.esc = es;
   sh.label = wmd ? (gun.wmdLabel || '大规模杀伤弹') : null;
   sh.tx = tx; sh.tz = tz;                       // 空爆引信以"瞄准点"为基准
   if (shrap) sh.fuse = SHRAPNEL_FUSE;
@@ -2273,41 +2453,47 @@ function shrapnelGround(sh) {
    ④ 大半径、低单兵命中率、低伤亡上限的杀伤 + 大范围压制。 */
 function wmdImpact(sh) {
   const foe = sh.side === 'union' ? C : U;
+  const es = sh.esc || 0;                    // 发射时的战局升级快照（0..1）
+  const power = wmdPower(es), radius = wmdRadius(es), cap = wmdCap(es);
+  const sats = wmdSats(es), suppR = wmdSuppressR(es);
   const x = sh.x, z = sh.z, gY = terrainH(x, z);
-  explodeGround(x, z, WMD_POWER);
-  for (let k = 0; k < WMD_SATELLITES; k++) {
-    const a = k * (TAU / WMD_SATELLITES) + 0.4, rr = 20 + (k % 3) * 14;
-    addTerrainCrater(x + Math.cos(a) * rr, z + Math.sin(a) * rr, 1.4 + (k % 2) * 0.7);
+  explodeGround(x, z, power);
+  /* 环形卫星弹坑把中心坑扩成一片"弹坑场"：升级越快、坑越多、范围越大 */
+  for (let k = 0; k < sats; k++) {
+    const a = k * (TAU / sats) + 0.4, rr = (20 + (k % 3) * 14) * (1 + 0.7 * es);
+    addTerrainCrater(x + Math.cos(a) * rr, z + Math.sin(a) * rr, 1.4 + (k % 2) * 0.7 + es * 0.8);
   }
-  /* 蘑菇云：上升烟柱 + 顶部外扩的云盖 */
-  for (let i = 0; i < 26; i++) {
-    const h = 2 + i * 2.6;
+  /* 蘑菇云：上升烟柱 + 顶部外扩的云盖（升级后烟柱更高、云盖更宽） */
+  const stem = 26 + Math.round(es * 14), hUp = 2.6 + es * 1.2;
+  for (let i = 0; i < stem; i++) {
+    const h = 2 + i * hUp;
     smokePool.emit(x + (vrnd() - 0.5) * 5, gY + h, z + (vrnd() - 0.5) * 5,
       2.4 + h * 0.12, 7 + vrnd() * 3, 1.5, 0.7, 0, 0.25,
       (vrnd() - 0.5) * 0.6, (vrnd() - 0.5) * 0.6);
   }
-  for (let i = 0; i < 16; i++) {
-    const a = vrnd() * TAU, rr = vrnd() * 26;
-    smokePool.emit(x + Math.cos(a) * rr, gY + 66 + vrnd() * 12, z + Math.sin(a) * rr,
+  const capN = 16 + Math.round(es * 10), capR = 26 * (1 + 0.6 * es);
+  for (let i = 0; i < capN; i++) {
+    const a = vrnd() * TAU, rr = vrnd() * capR;
+    smokePool.emit(x + Math.cos(a) * rr, gY + 66 + es * 20 + vrnd() * 12, z + Math.sin(a) * rr,
       4.5, 8.5, 2.0, 0.62, 0, 0.1 + vrnd() * 0.25, Math.cos(a) * 2.2, Math.sin(a) * 2.2);
   }
-  /* 低伤害 + 大范围：半径 WMD_R、单兵命中率 WMD_CHANCE、总上限 WMD_CAP */
-  const hits = blastCasualties(foe, x, z, WMD_R, WMD_CAP, WMD_CHANCE * sh.acc);
-  if (hits > 0) blog((sh.label || '大规模杀伤弹') + ' 命中 ' + foe.side.label + ' — ' + hits + ' 人倒下（范围极大）', '#e8b060');
-  /* 大范围压制：两军都吃（范围比普通爆炸更大） */
+  /* 低伤害 + 大范围：半径/上限/命中率都随升级放大，但单兵命中率仍然很低 */
+  const hits = blastCasualties(foe, x, z, radius, cap, WMD_CHANCE * sh.acc);
+  if (hits > 0) blog((sh.label || '大规模杀伤弹') + ' 命中 ' + foe.side.label + ' — ' + hits + ' 人倒下（范围 ' + Math.round(radius) + ' m）', '#e8b060');
+  /* 大范围压制：两军都吃（升级后压制范围更大） */
   for (const a of [U, C]) for (const u of a.units) {
     if (u.kind === 'art' || u.gone || u.men <= 0) continue;
     const d = Math.hypot(u.cx - x, u.cz - z);
-    if (d < WMD_SUPPRESS_R) u.suppress = clamp(u.suppress + 0.5 * (1 - d / WMD_SUPPRESS_R), 0, 1);
+    if (d < suppR) u.suppress = clamp(u.suppress + 0.5 * (1 - d / suppR), 0, 1);
   }
   /* 伤害刻意小：装甲/工事只是被"震一下"，数值远低于普通炮弹 */
   for (const t of ARMOR.tanks) {
     if (t.dead || t.side === sh.side) continue;
-    if (Math.hypot(t.x - x, t.z - z) < WMD_R * 0.5 && rnd() < 0.22) damageTank(t, 30 + rnd() * 40, sh.label || '大规模杀伤弹');
+    if (Math.hypot(t.x - x, t.z - z) < radius * 0.5 && rnd() < 0.22) damageTank(t, 30 + rnd() * 40, sh.label || '大规模杀伤弹');
   }
   for (const F of FORT) {
     if (F.dead || F.side === sh.side) continue;
-    if (Math.hypot(F.x - x, F.z - z) < WMD_R && rnd() < 0.25) damageFort(F, 40 + rnd() * 50, sh.label || '大规模杀伤弹');
+    if (Math.hypot(F.x - x, F.z - z) < radius && rnd() < 0.25) damageFort(F, 40 + rnd() * 50, sh.label || '大规模杀伤弹');
   }
 }
 function projectilesUpdate(dt) {
@@ -2397,6 +2583,13 @@ function projectilesUpdate(dt) {
   for (let i = BARRAGE.length - 1; i >= 0; i--) {
     const b = BARRAGE[i];
     b.t -= dt;
+    /* 落弹前 1 s 给一条自天而降的明亮弹迹 + 一点尾烟：弹幕不再是"凭空的爆炸" */
+    if (!b.shown && b.t <= 1.0) {
+      b.shown = true;
+      const y0 = groundY(b.x, b.z) + 72;
+      emitTracerAimed(b.x - 30, y0, b.z - 30, b.x, groundY(b.x, b.z) + 0.6, b.z, 215, 2.9, 3);
+      smokePool.emit(b.x - 30, y0, b.z - 30, 0.85, 3.0, 1.15, 0.42, 0, 0.2, 1.3, 1.3);
+    }
     if (b.t > 0) continue;
     BARRAGE.splice(i, 1);
     explodeGround(b.x, b.z, 1.15);
@@ -2685,10 +2878,31 @@ function obstacleCover(x, z) {
 /* 阵容：每方 8 个步兵团沿放大后的正面展开（间距 97 m），两翼各 1 个骑兵团，
    后方 2 个炮兵连；双方步兵互相错开 24 m（对着对方的间隙），接触更有咬合感。
    步兵的 z 只需名义值——makeArmyUnits 会用 trenchDitchZ 把整队放进壕沟。 */
-const INF_NAMES = {
-  union: ['第 20 缅因团', '第 69 纽约团', '第 1 明尼苏达团', '爱尔兰旅', '第 2 威斯康星团', '第 19 印第安纳团', '第 5 新罕布什尔团', '第 8 俄亥俄团'],
-  confederate: ['第 1 弗吉尼亚团', '第 4 阿拉巴马团', '第 2 密西西比团', '石墙旅', '第 3 田纳西团', '第 6 北卡罗来纳团', '第 7 佐治亚团', '第 5 德克萨斯团']
+const INF_WAVES = {
+  union: [
+    ['第 20 缅因团', '第 69 纽约团', '第 1 明尼苏达团', '爱尔兰旅', '第 2 威斯康星团', '第 19 印第安纳团', '第 5 新罕布什尔团', '第 8 俄亥俄团'],
+    ['第 3 佛蒙特团', '第 12 新泽西团'],
+    ['铁旅', '第 7 密歇根团']
+  ],
+  confederate: [
+    ['第 1 弗吉尼亚团', '第 4 阿拉巴马团', '第 2 密西西比团', '石墙旅', '第 3 田纳西团', '第 6 北卡罗来纳团', '第 7 佐治亚团', '第 5 德克萨斯团'],
+    ['第 8 阿拉巴马团', '第 4 佐治亚团'],
+    ['德克萨斯旅', '第 12 弗吉尼亚团']
+  ]
 };
+/* 三个步兵梯队（批次）的编制与装备，强度逐批上升：42 → 48 → 54 人，
+   士气加成 +0 / +0.05 / +0.10，装备 步枪 → 冲锋枪 → 火箭筒+冲锋枪，
+   后两批带轻度防空（对低空敌机有少量火力）。back = 该批起始位置在己方战线
+   之后再退多少米（作为战役预备队，按 WAVE_T 逐批投入）。 */
+const WAVE_CFG = [
+  { files: 14, ranks: 3, add: 0.00, weapon: 'rifle',  aa: false, back: 0,   x0: 0 },
+  { files: 16, ranks: 3, add: 0.05, weapon: 'smg',    aa: true,  back: 95,  x0: 150 },
+  { files: 18, ranks: 3, add: 0.10, weapon: 'rocket', aa: true,  back: 205, x0: 150 }
+];
+const WAVE_T = [0, 0, 52, 104];                  // 各梯队投入时刻（s）；第 1 梯队 0 = 开战即在位
+const WEAPON_LABEL = { rifle: '步枪', smg: '冲锋枪', rocket: '火箭筒' };
+/* 步兵"轻度防空"（第 2/3 梯队）：只打低空、射程近、命中低——是自卫火力，不是高炮 */
+const INF_AA_R = 260, INF_AA_ALT = 72, INF_AA_EVERY = 3.0, INF_AA_HIT = 0.10;
 const ROSTER = {
   union: { infantry: [], cavalry: [], artillery: [], skirmishers: [], engineers: [], mg: [] },
   confederate: { infantry: [], cavalry: [], artillery: [], skirmishers: [], engineers: [], mg: [] }
@@ -2696,10 +2910,19 @@ const ROSTER = {
 for (const key of ['union', 'confederate']) {
   const f = key === 'union' ? 1 : -1;                    // 朝敌方向
   const yaw = f > 0 ? 0 : Math.PI, res = f > 0 ? 0.06 : -0.01;
-  INF_NAMES[key].forEach((n, i) => ROSTER[key].infantry.push({
-    resolve: res, name: n, title: n.replace(/\s/g, ''), x: (i - 3.5) * 97 + f * 12,
-    z: -FRONT * f, files: 14, ranks: 3, yaw
-  }));
+  /* 步兵分三个梯队（批次）投入：编制/士气/装备逐批增强。第 1 梯队进壕沟
+     （在 makeArmyUnits 里落位），第 2/3 梯队作为战役预备队停在战线之后，
+     到 WAVE_T 才投入（闸门在 aiUpdate）。 */
+  INF_WAVES[key].forEach((names, w) => {
+    const W = WAVE_CFG[w];
+    names.forEach((n, i) => ROSTER[key].infantry.push({
+      resolve: res + W.add, name: n, title: n.replace(/\s/g, ''),
+      x: W.x0 ? (i === 0 ? -W.x0 : W.x0) : (i - 3.5) * 97 + f * 12,
+      z: -(FRONT * S + W.back) * f,
+      files: W.files, ranks: W.ranks, yaw,
+      wave: w + 1, weapon: W.weapon, aa: W.aa
+    }));
+  });
   /* 散兵线（狙击兵）：稀疏横队、射程远、杀伤少但"斩首"动摇大；
      前进到 165 m 就据枪，不自动上刺刀——被逼近就是被白刃吃掉 */
   const SK = key === 'union'
@@ -2829,10 +3052,18 @@ function makeArmyUnits(army) {
     u.mgT = 0.25;
     army.units.push(u);
   }
+  /* 跃进掩护的名册错相：相邻建制（名册奇偶）起手相反，整条战线于是分波次推进，
+     而不是齐步走——实兵条令里的 bounding overwatch 在"建制级"的对应物。 */
+  army.units.forEach((u, i) => {
+    u.boundPhase = i & 1;
+    u.bounding = (i & 1) === 0;
+    u.boundT = 0.5 + (i & 1) * 1.1;
+  });
   for (const u of army.units) {
     if (u.kind === 'art') continue;
-    /* 步兵开局站在己方壕沟底（工程中心线带蛇形），否则"战壕"里没人、掩护无从谈起 */
-    if (u.kind === 'inf') u.cz = trenchDitchZ(army.key, u.cx);
+    /* 步兵开局站在己方壕沟底（工程中心线带蛇形），否则"战壕"里没人、掩护无从谈起。
+       第 2/3 梯队是战役预备队，停在自己的集结点（cfg.z），不进壕沟。 */
+    if (u.kind === 'inf' && u.wave === 1) u.cz = trenchDitchZ(army.key, u.cx);
     for (let k = 0; k < u.soldiers.length; k++) {
       const s = u.soldiers[k];
       u.slotWorld(u.soldierSlot[k], s);
@@ -2849,7 +3080,9 @@ makeArmyUnits(C);
 
 const B = {
   t: 0, phase: 'DEPLOY', speed: 1, paused: /[?&]pause=1/.test(QUERY), over: false, winner: null,
-  meleeStarted: -1, cavCommitted: false, entries: []
+  meleeStarted: -1, cavCommitted: false, entries: [],
+  face: { union: '—', confederate: '—' },       // 双方各自的实测战斗状态（见 battlePhase）
+  escal: 0                                       // 战局升级 0..1（见 battleEscalation）
 };
 function blog(text, color) {
   const d = document.createElement('div');
@@ -3661,8 +3894,12 @@ const rocketGeo = mergeGeometries([
   at(box(0.05, 0.44, 0.30), 0, 0, -0.78),
   at(box(0.44, 0.05, 0.30), 0, 0, -0.78)
 ]);
+/* 火箭弹弹体也带自发光（发动机在工作），加上尾烟就是一条明亮弹道 */
 const rocketMesh = new THREE.InstancedMesh(rocketGeo,
-  new THREE.MeshStandardMaterial({ color: 0x4a4d52, roughness: 0.5, metalness: 0.55 }), ROCKET_COUNT);
+  new THREE.MeshStandardMaterial({
+    color: 0x4a4d52, roughness: 0.5, metalness: 0.55,
+    emissive: 0xff7a2a, emissiveIntensity: 1.25
+  }), ROCKET_COUNT);
 rocketMesh.castShadow = true; rocketMesh.frustumCulled = false;
 rocketMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
 for (let i = 0; i < ROCKET_COUNT; i++) rocketMesh.setMatrixAt(i, _pm.makeScale(0, 0, 0));
@@ -3671,13 +3908,15 @@ scene.add(rocketMesh);
 const rockets = [];
 for (let i = 0; i < ROCKET_COUNT; i++) rockets.push({ on: false, drawn: false, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, ttl: 0, thrust: 0, side: 'union', label: '火箭弹' });
 let rocketIdx = 0;
-function fireRocket(a, tx, ty, tz) {
+function fireRocket(a, tx, ty, tz, label) {
   if (a.rockets <= 0) return false;
   a.rockets--; AIR.rocketFired++;
   const r = rockets[rocketIdx++ % ROCKET_COUNT];
   const cp = Math.cos(a.pitch), fwd = 4.2;
   const ux = Math.sin(a.yaw) * cp, uy = Math.sin(a.pitch), uz = Math.cos(a.yaw) * cp;
-  r.on = true; r.side = a.side; r.label = CRAFT_SPEC[a.kind].label + '火箭弹';
+  r.on = true; r.side = a.side;
+  /* label 可覆盖（步兵火箭筒不是机载武器，不能去查 CRAFT_SPEC） */
+  r.label = label || (CRAFT_SPEC[a.kind] ? CRAFT_SPEC[a.kind].label + '火箭弹' : '火箭弹');
   r.x = a.x + ux * fwd; r.y = a.y + uy * fwd - 0.6; r.z = a.z + uz * fwd;
   const b = ballisticVel(r.x, r.y, r.z, tx, ty, tz, 150);
   r.vx = b.vx + (rnd() - 0.5) * 3.0; r.vy = b.vy + (rnd() - 0.5) * 3.0; r.vz = b.vz + (rnd() - 0.5) * 3.0;
@@ -3811,11 +4050,14 @@ const reconRig = new RigPool(RECON_PARTS, RECONS_PER * 2, airMat);
 const aaRig = new RigPool(AA_PARTS, AA_PER * 2, airMat);
 const AIR = {
   craft: [], guns: [], flak: [], lost: { union: 0, confederate: 0 }, dropped: 0, collisions: 0, rocketFired: 0,
+  clusterDropped: 0, escortFired: 0,      // 集束弹投掷数 / 护航僚机速射轮数
+  infantryRockets: 0, infantryAA: 0, infantryAAHits: 0,   // 步兵火箭筒发数 / 轻防空次数与命中
   /* 机场整备 + 缓慢重建战损机：reinfT 倒计时，produced 为累计出厂数 */
   reinfT: { union: 34, confederate: 44 }, produced: { union: 0, confederate: 0 }
 };
 const AIR_REINF_EVERY = 42;      // 每方机场重建一架的间隔（秒）——"缓慢产生增援"
-const AIR_REPAIR_RATE = 6;       // 停在己方机场时每秒恢复的 hp（92 hp 的轰炸机约 15 s 修满）
+const AIR_REPAIR_RATE = 18;      // 停在己方机场时每秒恢复的 hp（本轮 ×3：92 hp 的轰炸机约 5 s 修满）
+const BOMBER_RTB_SPEED = 1.5;    // 轰炸机返航巡航倍率（1.5× 巡航速度赶回机场）
 /* 每方各机种的建制数（重建时按缺口补齐，名单与建场循环共用同一批常量） */
 const AIR_PER_KIND = { fighter: FIGHTERS_PER, attacker: ATTACKERS_PER, bomber: BOMBERS_PER, recon: RECONS_PER };
 
@@ -4117,10 +4359,15 @@ function fortUpdate(dt) {
       g.reload = Math.max(-1, g.reload - dt);
       if ((best || g.fort) && B.t > 6 && !B.over && g.reload <= 0) {
         g.seq = (g.seq || 0) + 1;
-        /* 每 WMD_FORT_EVERY 发里 1 发大规模杀伤弹（伤害小、范围大、地形改变大） */
-        g.wmd = g.seq % WMD_FORT_EVERY === 0;
-        g.wmdLabel = '要塞重炮';
-        g.reload = (g.wmd ? 15 : 7.5) + rnd() * 3;
+        /* 地形改造弹随战局升级：每 wmdEvery 发里 1 发，一次触发连打 wmdSalvo 发
+           （salvo 递减，后续数发继续按 WMD 结算），装填也随之加快。 */
+        const es = battleEscalation();
+        const every = wmdEvery(WMD_FORT_EVERY, es);
+        if (g.salvo > 0) { g.wmd = true; g.salvo--; }
+        else if (g.seq % every === 0) { g.wmd = true; g.salvo = wmdSalvo(es) - 1; }
+        else g.wmd = false;
+        g.wmdLabel = es > 0.6 ? '要塞重炮·饱和' : '要塞重炮';
+        g.reload = Math.max(2.5, (g.wmd ? 13 : 7.5) * (1 - 0.4 * es) + rnd() * 3);
         fireShell(g);
       }
     }
@@ -4145,6 +4392,17 @@ const _v = { x: 0, z: 0 };
    每 AI_TICK 秒"思考"一次，给每个单位下 order；unitUpdate 只负责执行。
    决策全部是确定性评分（不用 PRNG），因此不会挪动 rnd 流。 */
 const AI_TICK = 2.4;
+/* ---- 实兵条令参数（联网检索 bounding overwatch / suppress-then-assault 后落地）----
+   1) 跃进掩护：接近到 BOUND_START 内，半部跃进、半部掩护，逐次交替；
+      相邻建制（名册奇偶）错相，整条战线因此呈波浪式推进而不是齐步走。
+   2) 被钉住就卧倒：被压制度 > PIN_HI 时停止推进、就地卧倒；衰减到 PIN_LO 再起身。
+   3) 压制后突击：目标被压制/动摇、或己方有局部兵力优势、或弹药打光，才上刺刀。
+   4) 火力组不冲击：机枪是 base of fire，只据位压制，不参加白刃。
+   5) 逐次利用地形：进入 45% 以上掩体且已到射程即停火射击，而不是继续走到裸露的最近距离。 */
+const BOUND_START = 320;     // 米：进入此距离开始跃进掩护
+const BOUND_MOVE = 2.4;      // 跃进段时长（s）
+const BOUND_WATCH = 1.9;     // 掩护/观察段时长（s）
+const PIN_HI = 0.55, PIN_LO = 0.22;   // 被压制到 HI 卧倒，衰减到 LO 再起身
 function aiUpdate(army, dt) {
   const ai = army.ai || (army.ai = { t: 0, mode: 'assault', focus: null, focusUnits: [], flanker: null, reserve: null, committed: false, flankX: 0 });
   ai.t -= dt;
@@ -4208,13 +4466,23 @@ function aiUpdate(army, dt) {
     blog(army.side.label + (posture === 'defend' ? '转入守势 — 据壕射击' : '转入攻势 — 全线推进'), army.side.css);
   }
   /* 5) 逐队下令：守势全线据壕（order 'hold'），攻势全线推进（齐头并进）；
-        预备/迂回/集中火力只改"打谁/去哪"，不改攻守。 */
+        预备/迂回/集中火力只改"打谁/去哪"，不改攻守。
+        批次闸门优先级最高：未到 WAVE_T 的梯队一律按预备队压住（逐批次投入），
+        到点后一次性放行并记一条战报——这才是"两个梯队逐批增援"的开关。 */
+  army.waveDone = army.waveDone || {};
   for (const u of mine) {
-    u.order = ai.mode === 'defend' ? 'hold'
-      : ai.reserve === u ? 'reserve'
-        : ai.flanker === u ? 'flank'
-          : ai.focusUnits.includes(u) ? 'focusFire'
-            : 'advance';
+    const held = u.wave > 1 && B.t < WAVE_T[u.wave];
+    if (!held && u.wave > 1 && !army.waveDone[u.wave]) {
+      army.waveDone[u.wave] = true;
+      const n = mine.filter(x => x.wave === u.wave).length;
+      blog(army.side.label + ' 第 ' + u.wave + ' 梯队投入战场 — ' + n + ' 个团加入战线', army.side.css);
+    }
+    u.order = held ? 'reserve'
+      : ai.mode === 'defend' ? 'hold'
+        : ai.reserve === u ? 'reserve'
+          : ai.flanker === u ? 'flank'
+            : ai.focusUnits.includes(u) ? 'focusFire'
+              : 'advance';
   }
 }
 
@@ -4266,6 +4534,48 @@ function routTick(u, dt) {
   }
 }
 
+/* 高地的观察加成（OCOKA 的 O：Observation and fields of fire；FM 3-21.8 亦强调进攻性
+   近战的目的就是"夺取地形"）。基准取战场等高线（≈0 m），站得越高看得越远：
+   每高出 1 m 观察半径 +1.1 m，封顶 +70 m。纯确定性评分，不取随机数，不挪动 rnd 流。 */
+function highGroundBonus(x, z) {
+  return clamp(terrainH(x, z) * 1.1, 0, 70);
+}
+/* 制高点抢占（散兵/狙击）：每 3 s 在"本建制前方（朝敌一侧）、横向 ±150 m"的格点上
+   找一处高度减去行军代价后最高的地形；只有比脚下高出 ≥6 m 才值得专门去占。
+   纯确定性评分（不取随机数），所以狙击部队会自行爬上高地设射击阵地，而不是
+   一律平推——狙击手抢占俯瞰点本来就是 OCOKA 里"夺取地形"的直接应用。 */
+function keyTerrainUpdate(dt) {
+  for (const a of [U, C]) for (const u of a.units) {
+    if (u.kind !== 'skirm' || !u.onField || u.gone) { u.perch = null; u.perchT = 0; continue; }
+    if (u.perch) {
+      const pd = Math.hypot(u.cx - u.perch.x, u.cz - u.perch.z);
+      /* 已到位：占住高地（最多 45 s，避免整场钉在山上）；否则在行军承诺期内不重算，
+         否则"高点"会随脚下的前进不断向前滑动，部队永远追着它走下坡。 */
+      if (pd < 14) {
+        u.perchHold -= dt;
+        if (u.perchHold > 0) continue;
+        u.perch = null; u.perchT = 0; continue;
+      }
+      u.perchT -= dt;
+      if (u.perchT > 0) continue;
+    }
+    u.perchT = 22; u.perchHold = 45;
+    const toward = a.key === 'union' ? 1 : -1;
+    const cur = terrainH(u.cx, u.cz);
+    let best = null;
+    for (let dx = -150; dx <= 150; dx += 30) {
+      for (let dz = 60; dz <= 300; dz += 30) {
+        const x = u.cx + dx, z = u.cz + toward * dz;
+        if (Math.abs(x) > HALF_TRENCH + 60) continue;
+        const h = terrainH(x, z);
+        /* 代价按行军距离算，避免为了 2 m 的土包横穿半个正面 */
+        const score = h - Math.hypot(dx, dz) * 0.06;
+        if (!best || score > best.score) best = { x, z, h, score };
+      }
+    }
+    u.perch = (best && best.h > cur + 6) ? best : null;
+  }
+}
 /* 配合系统：每 tick 重算一次，纯确定性评分（不取随机数），故不会挪动 rnd 流 */
 function synergyUpdate(dt) {
   for (let i = FIELDWORKS.length - 1; i >= 0; i--) if ((FIELDWORKS[i].ttl -= dt) <= 0) FIELDWORKS.splice(i, 1);
@@ -4280,7 +4590,7 @@ function synergyUpdate(dt) {
     const spotters = a.units.filter(u => u.kind === 'skirm' && u.onField);
     if (spotters.length) for (const e of foe.units) {
       if (e.kind === 'art' || e.gone || e.men <= 0) continue;
-      for (const s of spotters) if (Math.hypot(s.cx - e.cx, s.cz - e.cz) < 150) { e.spottedBy = a.key; break; }
+      for (const s of spotters) if (Math.hypot(s.cx - e.cx, s.cz - e.cz) < 150 + highGroundBonus(s.cx, s.cz)) { e.spottedBy = a.key; break; }
     }
     /* 1b) 侦察机引导：在上空的侦察机把下方敌军标定给炮兵（比散兵看得更远） */
     const recons = AIR.craft.filter(c => c.side === a.key && c.kind === 'recon'
@@ -4294,7 +4604,7 @@ function synergyUpdate(dt) {
     const others = a.units.filter(u => u.kind !== 'art' && u.kind !== 'skirm' && u.onField);
     if (others.length) for (const e of foe.units) {
       if (e.kind === 'art' || e.gone || e.men <= 0 || e.spottedBy === a.key) continue;
-      for (const s of others) if (Math.hypot(s.cx - e.cx, s.cz - e.cz) < 80) { e.spottedBy = a.key; break; }
+      for (const s of others) if (Math.hypot(s.cx - e.cx, s.cz - e.cz) < 80 + highGroundBonus(s.cx, s.cz)) { e.spottedBy = a.key; break; }
     }
     /* 观察来源：散兵 150 m / 侦察机 190 m（侦察资产）+ 其他单位 80 m（末段目视）。
        普通部队只在贴身距离提供观察，所以"精确攻击"仍然依赖侦察。 */
@@ -4342,6 +4652,14 @@ function aimedVolley(u) {
     if (shots % 3 === 0) smokePool.emit(mx + fx * 0.5, my + 0.1, mz + fz * 0.5, 0.45, 2.2, 1.7, 0.6, 0, 0.45, fx * 0.6, fz * 0.6);
     s.recoil = 1; shots++;
   }
+  /* 瞄准齐射的弹迹：与普通齐射一致，抽 3 发曳光弹飞向目标（全部走 vrnd） */
+  if (shots > 0) for (let i = 0; i < 3; i++) {
+    const s = u.soldiers[Math.floor(vrnd() * u.soldiers.length) % u.soldiers.length];
+    const alive = s && s.alive;
+    emitTracerAimed(alive ? s.x : u.cx, (alive ? s.y : groundY(u.cx, u.cz)) + 1.3, alive ? s.z : u.cz,
+      tgt.cx + (vrnd() - 0.5) * 10, groundY(tgt.cx, tgt.cz) + 1.0, tgt.cz + (vrnd() - 0.5) * 7,
+      300, 2.4, 2.0);
+  }
   const kills = Math.max(0, Math.round((0.5 + rnd() * 1.1) * eff * (1 - 0.55 * coverAgainst(tgt, u.cz))));
   const pool = tgt.aliveSoldiers();
   const bdx = tgt.cx - u.cx, bdz = tgt.cz - u.cz;
@@ -4362,6 +4680,9 @@ function snipe(u) {
   const fx = Math.sin(u.yaw), fz = Math.cos(u.yaw);
   flashPool.emit(sx + fx * 1.1, sy + 1.35, sz + fz * 1.1, 0.42, 0.12, 0.05, 1, 0, 0, fx, fz);
   smokePool.emit(sx + fx * 0.9, sy + 1.4, sz + fz * 0.9, 0.4, 2.0, 1.5, 0.55, 0, 0.5, fx * 1.2, fz * 1.2);
+  /* 狙击弹迹：一发高速曳光弹从射手飞向目标——"定点清除"必须有可见弹道（散布走 vrnd） */
+  emitTracerAimed(sx + fx * 1.1, sy + 1.35, sz + fz * 1.1,
+    tgt.cx, groundY(tgt.cx, tgt.cz) + 1.1, tgt.cz, 320, 2.6, 1.2);
   abil(u, 'snipe');
   blog(u.name + ' 定点清除 — ' + tgt.name + ' 军官被击倒，阵线动摇', u.army.side.css);
 }
@@ -4409,7 +4730,7 @@ function creepingBarrage(u, tgt) {
   const o0 = u.guns && u.guns[0] ? u.guns[0] : { x: u.cx, z: u.cz };
   for (let i = 0; i < BARRAGE_LEN; i++) {
     BARRAGE.push({
-      side: u.army.key, t: 0.4 + i * 0.62,
+      side: u.army.key, t: 0.4 + i * 0.62, shown: false,
       x: cx + (rnd() - 0.5) * 44,
       z: L + dir * (i * 24) + (rnd() - 0.5) * 26,
       ox: o0.x, oz: o0.z
@@ -4621,29 +4942,70 @@ function unitUpdate(u, dt) {
   const dist = tgt ? Math.hypot(tgt.cx - u.cx, tgt.cz - u.cz) : 9999;
   const toward = u.army.key === 'union' ? 1 : -1;
   u.falling = false;
+  /* 火箭筒不绑定射击姿态：据壕/推进/冲锋都能抬手打装甲（见 infRocketUpdate） */
+  infRocketUpdate(u, dt);
 
   switch (u.state) {
     case 'idle':
       u.spd = 0;
       if (B.t > 2.5) { u.state = 'advance'; orderAdvance(u); }
       break;
-    case 'advance':
+    case 'advance': {
       /* 集团 AI：预备队未投入前只守在自己的壕沟里；固守模式不推进到中线 */
       if (u.order === 'reserve' && Math.abs(u.cz) > (FRONT - 8) * S) { u.state = 'hold'; break; }
       if (u.order === 'hold' && Math.abs(u.cz) > (FRONT - 22) * S) { u.state = 'hold'; break; }
       /* 弹尽的步兵不再"无脑推进"到 150 m 放空枪：距离一够就直接上刺刀 */
       if (u.kind === 'inf' && u.ammo <= 0 && tgt && dist < 260) { startCharge(u); break; }
+      /* 被钉住就卧倒：被压制度高时停止推进，衰减到 PIN_LO 以下才起身（迟滞）。
+         长期被钉会由 moraleTick 的"压制→溃退"通道接手，不会无限期卡住。 */
+      u.pinned = u.pinned ? (u.suppress > PIN_LO) : (u.suppress > PIN_HI);
+      /* 制高点抢占（散兵/狙击）：前方有值得占的高地就自己爬上去，从能俯瞰敌军处射击。
+         抢占途中不套用下面的"齐头并进/150 m 停火"逻辑，否则会被战线拖住上不去。 */
+      if (u.kind === 'skirm' && u.perch && !u.pinned) {
+        const pdx = u.perch.x - u.cx, pdz = u.perch.z - u.cz, pd = Math.hypot(pdx, pdz);
+        const ps = 4.6 * trav * (1 - 0.40 * u.suppress);
+        if (pd > 14) {
+          u.cx = clamp(u.cx + pdx / pd * ps * dt, -HALF_TRENCH - 60, HALF_TRENCH + 60);
+          u.cz += pdz / pd * ps * dt;
+          u.spd = ps;
+          if (tgt) u.yaw = Math.atan2(tgt.cx - u.cx, tgt.cz - u.cz);
+          break;
+        }
+        /* 已站上制高点：敌进散兵射程（250 m）就俯瞰射击；否则占住高地不走
+           （key terrain —— 高地的价值是持续观察，不是路过）。 */
+        if (tgt && dist < 250) {
+          u.state = 'fire'; u.volleys = 0; u.volleyT = 0.4;
+          blog(u.name + ' 占据制高点，俯瞰射击', u.army.side.css);
+        } else u.spd = 0;
+        break;
+      }
+      /* 跃进掩护（bounding overwatch）：接近到敌火距离内，半部跃进、半部掩护，
+         相邻建制按名册奇偶错相 → 整条战线呈波浪式推进，而不是齐步走。 */
+      const bounding = !!tgt && u.kind !== 'cav' && dist < BOUND_START;
+      u.boundT -= dt;
+      if (u.boundT <= 0) { u.bounding = !u.bounding; u.boundT = u.bounding ? BOUND_MOVE : BOUND_WATCH; }
       /* 压制减速 + 步坦协同加速：两个"配合/反制"属性都进移动积分 */
       u.spd = 4.2 * trav * (1 - 0.40 * u.suppress) * (u.tankSup ? 0.85 : 1);
+      if (bounding && u.bounding) u.spd *= 1.45;         // 跃进段：短促快跑
+      if (u.pinned) u.spd = 0;                           // 卧倒
       if (tgt) u.yaw = Math.atan2(tgt.cx - u.cx, tgt.cz - u.cz);
       /* 齐头并进：谁突出战线平均位置 80 m 以上就停下来等齐（若已在射程内则原地继续射击） */
       const ahead = u.army.frontZ !== undefined ? toward * (u.cz - u.army.frontZ) : 0;
       const waiting = ahead > 80 && u.order !== 'flank';
-      if (waiting) u.spd = 0;
+      /* 掩护段不前进：这是 fire-and-movement 的"停"，也让相邻跃进那半部得到火力掩护 */
+      if (waiting || (bounding && !u.bounding)) u.spd = 0;
       if (u.order === 'flank' && u.army.ai) {   // 侧翼迂回：先横向靠拢，再压上
         u.cx += clamp(u.army.ai.flankX - u.cx, -1, 1) * 1.6 * trav * dt;
       }
-      if (!waiting) u.cz += toward * u.spd * dt;
+      if (u.spd > 0) u.cz += toward * u.spd * dt;
+      /* 逐次利用地形（cover discipline）：进入 45% 以上掩体且已到射程，就地停下射击，
+         而不是继续走到裸露的最近距离。 */
+      const stopR = u.kind === 'skirm' ? 200 : 175;
+      if (!u.pinned && u.cover > 0.45 && tgt && dist < stopR) {
+        u.state = 'fire'; u.volleys = 0; u.volleyT = 0.4;
+        blog(u.name + ' 进占有利地形，就地射击', u.army.side.css);
+        break;
+      }
       if (u.kind === 'cav') {
         if (dist < 96) u.state = 'hold';
       } else if (dist < (u.kind === 'skirm' ? 168 : (u.kind === 'inf' || u.kind === 'eng') ? 150 : 120) || u.cz * toward > 6) {
@@ -4652,6 +5014,7 @@ function unitUpdate(u, dt) {
         blog(u.name + ' 停止前进，列队齐射', u.army.side.css);
       }
       break;
+    }
     case 'hold':
       u.spd = 0;
       if (tgt) u.yaw = Math.atan2(tgt.cx - u.cx, tgt.cz - u.cz);
@@ -4673,28 +5036,36 @@ function unitUpdate(u, dt) {
       /* 散兵线：敌军逼近到 80 m 内就"且战且退"，边退边射——否则稀疏横队会被一次冲锋吃光，
          连"引导炮火"的价值都来不及发挥。步幅由 soldierUpdate 的 u.falling 分支放开。 */
       u.falling = false;
-      if (u.kind === 'skirm' && tgt && dist < 80) {
+      /* 站在制高点上的散兵不再"且战且退"——高地的价值就是守住它（低处才退） */
+      const onHigh = u.perch && tgt && terrainH(u.cx, u.cz) > terrainH(tgt.cx, tgt.cz) + 8;
+      if (u.kind === 'skirm' && tgt && dist < 80 && !onHigh) {
         const ax = (u.cx - tgt.cx) / (dist || 1), az = (u.cz - tgt.cz) / (dist || 1);
         u.cx += ax * 6.0 * dt; u.cz += az * 6.0 * dt;
         u.spd = 6.0; u.falling = true;
       }
+      /* 火箭筒（第 3 梯队）：见 infRocketUpdate —— 不绑定射击姿态（据壕/推进也能打装甲），
+         所以这里不再重复处理。 */
       u.volleyT -= dt;
       if (u.volleyT <= 0) {
         u.volleys++;
         volley(u);
-        /* 更倾向远程射击：打满 6 轮且敌军已动摇/被压制/减员严重，才上刺刀。
-           散兵线永不上刺刀（保持远距离对射），弹尽即脱离接触。 */
-        const broken = tgt && (tgt.morale < 0.5 || tgt.suppress > 0.4 || tgt.men / tgt.maxMen < 0.45);
+        /* 压制后突击（suppress-then-assault）：先以火力（机枪 base of fire + 齐射）把
+           目标压制/动摇，或己方已有局部兵力优势，或弹药打光（=必须上刺刀），
+           线列步兵才转入冲锋。散兵线永不上刺刀（保持远距离对射），弹尽即脱离接触。 */
+        const broken = tgt && (tgt.morale < 0.5 || tgt.suppress > 0.35 || tgt.men / tgt.maxMen < 0.45);
+        const localSup = tgt && u.men > tgt.men * 1.15;   // 局部兵力优势（非全局）
         /* 近距离反冲锋：守势下敌军贴到 70 m 内、己方仍稳住阵脚，就上刺刀把敌人赶回去 */
         const bayonet = u.order === 'hold' && tgt && tgt.state !== 'rout' && dist < 70 && u.morale > 0.55;
         /* 「以弹药量决定是否冲锋」：单兵 20 轮打光就必须压上去（不再单看齐射轮次） */
         const outOfAmmo = u.ammo <= 0;
-        if (u.kind !== 'skirm' && ((u.volleys >= 6 && broken) || bayonet || outOfAmmo)) startCharge(u);
+        if (u.kind !== 'skirm' && ((u.volleys >= 6 && (broken || localSup)) || bayonet || outOfAmmo)) startCharge(u);
         else if (u.kind === 'skirm' && outOfAmmo) {
           if (!u.ammoOut) { u.ammoOut = true; blog(u.name + ' 弹药耗尽，散兵线脱离接触', '#d9a05a'); }
           u.state = 'hold';
         } else if (u.order === 'hold') u.volleyT = 1.9;
         else if (u.kind === 'skirm') u.volleyT = 2.6;
+        /* 冲锋枪射速高：同一时间窗内打出更多轮 */
+        else if (u.weapon === 'smg' || u.weapon === 'rocket') u.volleyT = 1.0;
         else u.volleyT = 1.7;
       }
       break;
@@ -4748,9 +5119,11 @@ function volley(u) {
   if (u.ammo <= 0) { u.ammo = 0; return; }   // 弹药打光：放不出这一轮（由状态机转冲锋/后撤）
   u.ammo--;
   const d = Math.hypot(tgt.cx - u.cx, tgt.cz - u.cz);
-  /* 散兵线射程更远（250 m）、命中更少，但每一发都更动摇敌军（见下方 shock） */
-  const range = u.kind === 'skirm' ? 250 : 190;
-  const eff = clamp(1 - d / range, u.kind === 'skirm' ? 0.18 : 0.25, 1) * (1 - 0.35 * u.suppress);
+  /* 散兵线射程更远（250 m）、命中更少，但每一发都更动摇敌军（见下方 shock）；
+     冲锋枪/火箭筒梯队射程更短（145 m）但近距离火力与压制都更强。 */
+  const smg = u.weapon === 'smg' || u.weapon === 'rocket';
+  const range = u.kind === 'skirm' ? 250 : smg ? 145 : 190;
+  const eff = clamp(1 - d / range, u.kind === 'skirm' ? 0.18 : smg ? 0.34 : 0.25, 1) * (1 - 0.35 * u.suppress);
   let shots = 0;
   for (let i = 0; i < u.soldiers.length; i++) {
     const s = u.soldiers[i];
@@ -4765,13 +5138,28 @@ function volley(u) {
     s.recoil = 1;
     shots++;
   }
-  const base = u.kind === 'skirm' ? 0.3 + rnd() * 1.0 : 1 + rnd() * 2.4;
+  /* 齐射弹迹：抽 3 发曳光弹飞向目标（冲锋枪抽 5 发，读起来就是"泼弹雨"），
+     于是"这一轮打在哪个方向"一眼可见。选点/散布全走 vrnd，不动玩法 rnd 流。 */
+  if (shots > 0) {
+    for (let i = 0, tr = smg ? 5 : 3; i < tr; i++) {
+      const s = u.soldiers[Math.floor(vrnd() * u.soldiers.length) % u.soldiers.length];
+      const alive = s && s.alive;
+      emitTracerAimed(alive ? s.x : u.cx, (alive ? s.y : groundY(u.cx, u.cz)) + 1.3, alive ? s.z : u.cz,
+        tgt.cx + (vrnd() - 0.5) * 12, groundY(tgt.cx, tgt.cz) + 1.0, tgt.cz + (vrnd() - 0.5) * 8,
+        300, 2.2, 2.5);
+    }
+  }
+  const base = u.kind === 'skirm' ? 0.3 + rnd() * 1.0
+    : smg ? (1.4 + rnd() * 2.6) * (d < 90 ? 1.45 : 1)          // 冲锋枪：近距离最猛
+      : 1 + rnd() * 2.4;
   const kills = Math.max(0, Math.round(base * eff * (1 - 0.55 * coverAgainst(tgt, u.cz))));
   const pool = tgt.aliveSoldiers();
   const bdx = tgt.cx - u.cx, bdz = tgt.cz - u.cz;
   for (let i = 0; i < kills && pool.length; i++) {
     tgt.kill(pool.splice(Math.floor(rnd() * pool.length), 1)[0], bdx, bdz, 1);
   }
+  /* 冲锋枪按"弹雨"压制：即使没打死人，也能把敌军的头按下去（压制走 clamp，无随机数） */
+  if (smg) tgt.suppress = clamp(tgt.suppress + 0.05, 0, 1);
   /* 弹药冲击力：弹丸落点扬尘。即使这一轮没打中人，目标线前后也要被打出烟尘，
      否则"齐射"只看得见枪口火光、看不见打在哪儿。 */
   const ux = bdx, uz = bdz, ul = Math.hypot(ux, uz) || 1;
@@ -4934,23 +5322,31 @@ function endBattle(winner) {
 }
 
 /* ---------- 航空兵：飞行模型 + 武器 ---------- */
-const ALT_MIN = 26;
-function steerTo(a, tx, ty, tz, dt) {
-  const dx = tx - a.x, dy = ty - a.y, dz = tz - a.z;
+const ALT_MIN = 26, ALT_MAX = 150, FLY_CLEAR = 22;
+/* 地形跟随：把"转向目标点"的高度抬到目标点地形之上 FLY_CLEAR 米，飞机就以正常
+   爬升率自然越顶，而不是被硬钳在固定巡航高度里穿山。转弯俯仰上限放到 0.72 rad
+   （约 36°），保证轰炸机 44 m/s 也能爬上中央高地最陡的坡（坡度 ~0.76）。
+   clear=0 时不抬（俯冲撞机必须能贴地、进近必须能下滑到跑道）。 */
+function steerTo(a, tx, ty, tz, dt, clear) {
+  const dx = tx - a.x, dz = tz - a.z;
+  if (clear) {
+    const g = terrainH(tx, tz) + clear;
+    if (g > ty) ty = g;
+  }
+  const dy = ty - a.y;
   const dh = Math.max(1, Math.hypot(dx, dz));
   let want = Math.atan2(dx, dz) - a.yaw;
   while (want > Math.PI) want -= TAU;
   while (want < -Math.PI) want += TAU;
   /* 转弯半径 = 速度/角速率：轰炸机 50/0.52 ≈ 96 m，才跟得上 175 m 的航线 */
   const aR = CRAFT_SPEC[a.kind].turn, pR = CRAFT_SPEC[a.kind].pitchR;
-  const wantPitch = clamp(Math.atan2(dy, dh), -0.55, 0.55);
+  const wantPitch = clamp(Math.atan2(dy, dh), -0.72, 0.72);
   a.yaw += clamp(want, -aR * dt, aR * dt);
   a.pitch += clamp(wantPitch - a.pitch, -pR * dt, pR * dt);
   const bank = clamp(-want * 1.1, -0.9, 0.9);
   a.roll += (bank - a.roll) * Math.min(1, dt * 2.4);
   return want;
 }
-const ALT_MAX = 120;
 function moveCraft(a, dt, free) {
   const cp = Math.cos(a.pitch), sp = Math.sin(a.pitch);
   a.x += Math.sin(a.yaw) * cp * a.spd * dt;
@@ -4959,7 +5355,10 @@ function moveCraft(a, dt, free) {
   a.prop += (a.spd * 2.2 + 9) * dt;
   /* free = 起飞/着陆阶段，不受巡航高度限制 */
   if (free) return;
-  if (a.y < ALT_MIN) { a.y = ALT_MIN; a.pitch = Math.max(a.pitch, 0.1); }
+  /* 兜底防穿山：地形跟随没跟上时也不让机身落到地面里 */
+  const gnd = terrainH(a.x, a.z) + 8;
+  if (a.y < gnd) { a.y = gnd; if (a.pitch < 0.12) a.pitch = 0.12; }
+  else if (a.y < ALT_MIN) { a.y = ALT_MIN; a.pitch = Math.max(a.pitch, 0.1); }
   else if (a.y > ALT_MAX) { a.y = ALT_MAX; a.pitch = Math.min(a.pitch, -0.1); }
 }
 function craftLabel(a) { return (a.side === 'union' ? '联邦' : '邦联') + CRAFT_SPEC[a.kind].label; }
@@ -5007,6 +5406,45 @@ function damageCraft(a, dmg, by) {
    那正是"自杀式撞击"的主要来源；现在 46 m 内就脱离，只有 kamikaze 才主动撞。 */
 const FIGHTER_MIN_SEP = 46;
 function fighterUpdate(a, dt) {
+  /* 护航僚机：跟飞被护航的轰炸机。进入敌线上空（地面目标 320 m 内、且已对准）就打
+     一轮速射，然后立刻返航整备（轰炸机投完弹返航时僚机也一并返航）。 */
+  if (a.escort) {
+    const b = a.escort;
+    const home = !b || b.dead || b.state === 'rtb' || b.state === 'final' || b.state === 'flare' ||
+      b.state === 'rollout' || b.state === 'falling' || b.state === 'parked';
+    if (home) { a.escort = null; a.state = 'rtb'; return; }
+    const side = a.escortSide || 1;
+    const wx = b.x + Math.cos(b.yaw) * (side * 34) + Math.sin(b.yaw) * -38;
+    const wz = b.z - Math.sin(b.yaw) * (side * 34) + Math.cos(b.yaw) * -38;
+    steerTo(a, wx, b.y + 12, wz, dt, FLY_CLEAR);
+    const foe = armyOf(foeSideOf(a.side));
+    let gt = null, gd = 1e9;
+    for (const u of foe.units) {
+      if (u.kind === 'art' || u.men <= 0 || u.gone || u.state === 'rout') continue;
+      const d = Math.hypot(u.cx - a.x, u.cz - a.z);
+      if (d < gd) { gd = d; gt = u; }
+    }
+    if (gt && gd < 320 && !B.over) {
+      const A2 = groundAim(a, gt);
+      if (A2.dot > 0.80) {
+        const ox = a.x + A2.fx * 3.4, oy = a.y + A2.fy * 3.4, oz = a.z + A2.fz * 3.4;
+        for (let k = 0; k < 10; k++) {
+          emitTracerAimed(ox, oy, oz, gt.cx + (vrnd() - 0.5) * 10, groundY(gt.cx, gt.cz) + 1.0,
+            gt.cz + (vrnd() - 0.5) * 10, 330, 2.4, 14);
+        }
+        flashPool.emit(ox, oy, oz, 1.1, 0.15, 0.04, 1, 0, 0, 0, 0);
+        if (rnd() < 0.6) {
+          const pool = gt.aliveSoldiers();
+          if (pool.length) gt.kill(pool.splice(Math.floor(rnd() * pool.length), 1)[0], A2.dx, A2.dz, 1);
+        }
+        gt.suppress = clamp(gt.suppress + 0.10, 0, 1);
+        AIR.escortFired++;
+        a.escort = null; a.state = 'rtb';     // 速射一轮后返航修理
+        return;
+      }
+    }
+    return;                                    // 护航中不参与空战咬尾
+  }
   let tgt = null, bd = 520 * 2;
   for (const c of AIR.craft) {
     if (c === a || c.dead || c.side === a.side || c.state === 'falling') continue;
@@ -5020,7 +5458,7 @@ function fighterUpdate(a, dt) {
   if (tgt && Math.hypot(a.x, a.z) > 290 * 2) tgt = null;
   if (tgt && bd < FIGHTER_MIN_SEP) {
     const away = Math.atan2(a.x - tgt.x, a.z - tgt.z);
-    steerTo(a, a.x + Math.sin(away) * 170, a.y + 20, a.z + Math.cos(away) * 170, dt);
+    steerTo(a, a.x + Math.sin(away) * 170, a.y + 20, a.z + Math.cos(away) * 170, dt, FLY_CLEAR);
     return;
   }
   if (tgt) {
@@ -5030,7 +5468,7 @@ function fighterUpdate(a, dt) {
     steerTo(a,
       tgt.x + Math.sin(tgt.yaw) * cp * tgt.spd * tt,
       clamp(tgt.y + Math.sin(tgt.pitch) * tgt.spd * tt, a.y - 30, a.y + 30),
-      tgt.z + Math.cos(tgt.yaw) * cp * tgt.spd * tt, dt);
+      tgt.z + Math.cos(tgt.yaw) * cp * tgt.spd * tt, dt, FLY_CLEAR);
     const fx = Math.sin(a.yaw) * Math.cos(a.pitch), fy = Math.sin(a.pitch), fz = Math.cos(a.yaw) * Math.cos(a.pitch);
     const dx = tgt.x - a.x, dy = tgt.y - a.y, dz = tgt.z - a.z;
     const dd = Math.max(1, Math.hypot(dx, dy, dz));
@@ -5059,11 +5497,19 @@ function fighterUpdate(a, dt) {
 function dropBomb(a) {
   const b = bombs[bombIdx++ % BOMB_COUNT];
   const cp = Math.cos(a.pitch);
-  b.on = true; b.side = a.side;
+  const es = B.escal;
+  /* 集束弹：升级过 BOMB_CLUSTER_ES 后按概率混挂。这枚掷骰走 rnd —— 它改变战果 */
+  b.cluster = rnd() < clusterChance(es);
+  b.esc = es;
+  b.size = b.cluster ? 1.4 : 1;
+  if (b.cluster) AIR.clusterDropped++;
+  b.on = true; b.side = a.side; b.dist = 0;
   b.x = a.x; b.y = a.y - 1.7; b.z = a.z;
-  b.vx = Math.sin(a.yaw) * cp * a.spd * 0.98 + (rnd() - 0.5) * 1.4;
+  /* 横向散布随升级放大：晚期一轮投弹铺得更开（"散布更广"） */
+  const js = 1.4 * bombSpread(es);
+  b.vx = Math.sin(a.yaw) * cp * a.spd * 0.98 + (rnd() - 0.5) * js;
   b.vy = Math.sin(a.pitch) * a.spd * 0.98;
-  b.vz = Math.cos(a.yaw) * cp * a.spd * 0.98 + (rnd() - 0.5) * 1.4;
+  b.vz = Math.cos(a.yaw) * cp * a.spd * 0.98 + (rnd() - 0.5) * js;
   AIR.dropped++;
 }
 function bombFallTime(y, vy0, gY) {
@@ -5092,7 +5538,7 @@ function bomberUpdate(a, dt) {
   const sgn = a.side === 'union' ? 1 : -1;
   const dir = a.leg ? -1 : 1;
   const wx = a.lane + (a.leg ? sgn * a.lat : 0);
-  steerTo(a, wx, a.alt + Math.sin(a.orbit * 2.1) * 6, tz + dir * sgn * a.run, dt);
+  steerTo(a, wx, a.alt + Math.sin(a.orbit * 2.1) * 6, tz + dir * sgn * a.run, dt, FLY_CLEAR);
   a.orbit += dt * 0.11;
   if (!a.leg && sgn * (a.z - tz) > a.run - 40) a.leg = 1;
   else if (a.leg && sgn * (a.z - tz) < -(a.run - 40)) a.leg = 0;
@@ -5100,15 +5546,17 @@ function bomberUpdate(a, dt) {
   if (a.stick > 0) {
     a.dropT -= dt;
     if (a.dropT <= 0) {
-      a.dropT = 0.26; a.stick--;
+      a.dropT = 0.26 - 0.06 * B.escal; a.stick--;
       dropBomb(a);
-      if (a.stick === 0) a.dropT = 14;     // 重挂弹时间（"大量炸弹"= 单次 8 枚 + 更短周转）
+      /* 一轮投弹打完就立刻返航整备（一次出动 = 一轮轰炸），不再留在空域反复投弹 */
+      if (a.stick === 0) a.state = 'rtb';
     }
   } else {
     a.dropT -= dt;
     if (a.dropT <= 0) {
       const lead = bombLead(a);
-      if (Math.abs(lead.z - tz) < 26 && Math.abs(lead.x) < HALF_TRENCH) { a.stick = 8; a.dropT = 0; }
+      /* 挂弹数随战局升级 8 → 18（单轮炸弹更多） */
+      if (Math.abs(lead.z - tz) < 26 && Math.abs(lead.x) < HALF_TRENCH) { a.stick = bombStick(B.escal); a.dropT = 0; }
     }
   }
   /* 轰炸机也挂火箭弹：出航段对最近地面目标齐射（弹舱之外的第二重火力），返航段不发射 */
@@ -5145,7 +5593,7 @@ function attackerUpdate(a, dt) {
   const sgn = a.side === 'union' ? 1 : -1;
   const dir = a.leg ? -1 : 1;
   const wx = a.lane + (a.leg ? sgn * a.lat : 0);
-  steerTo(a, wx, a.alt + Math.sin(a.orbit * 2.1) * 4, tz + dir * sgn * a.run, dt);
+  steerTo(a, wx, a.alt + Math.sin(a.orbit * 2.1) * 4, tz + dir * sgn * a.run, dt, FLY_CLEAR);
   a.orbit += dt * 0.13;
   if (!a.leg && sgn * (a.z - tz) > a.run - 40) a.leg = 1;
   else if (a.leg && sgn * (a.z - tz) < -(a.run - 40)) a.leg = 0;
@@ -5187,7 +5635,7 @@ function attackerUpdate(a, dt) {
 /* 侦察机：高空大半径盘旋，无武装；标定交给 synergyUpdate */
 function reconUpdate(a, dt) {
   a.orbit += dt * (a.spd / a.rad);
-  steerTo(a, Math.cos(a.orbit) * a.rad, a.alt, Math.sin(a.orbit) * a.rad, dt);
+  steerTo(a, Math.cos(a.orbit) * a.rad, a.alt, Math.sin(a.orbit) * a.rad, dt, FLY_CLEAR);
 }
 
 /* ---------- 撞机（kamikaze）：把"自杀式撞击"收进一个明确的战术条件 ----------
@@ -5292,8 +5740,13 @@ function landingUpdate(a, dt) {
   if (a.state === 'rtb') {
     steerTo(a, IP[0], PY + 38, IP[1], dt);
     moveCraft(a, dt, true);
-    a.spd = Math.max(a.vr, a.spd - 5 * dt);
-    if (Math.hypot(a.x - IP[0], a.z - IP[1]) < 46 && a.y < PY + 46) a.state = 'final';
+    const dIP = Math.hypot(a.x - IP[0], a.z - IP[1]);
+    /* 轰炸机返航按 1.5× 巡航速度赶回机场；离进近点 300 m 内才减速进场，
+       否则高速冲到进近点上空会错过下滑道（速度不变的话会直接飞过头）。
+       非轰炸机保持原有减速行为，不连带改动。 */
+    if (a.kind === 'bomber' && dIP > 300) a.spd = Math.max(a.spd, a.cruise * BOMBER_RTB_SPEED);
+    else a.spd = Math.max(a.vr, a.spd - 5 * dt);
+    if (dIP < 46 && a.y < PY + 46) a.state = 'final';
     return;
   }
   if (a.state === 'final') {
@@ -5372,8 +5825,29 @@ function airReinforce(dt) {
       + ' — 累计补充 ' + AIR.produced[side] + ' 架', '#a8c86a');
   }
 }
+/* ---------- 护航编队：每架出航中的轰炸机自动配 1 架最近的己方战斗机当僚机 ----------
+   僚机跟飞在轰炸机侧后方；进入敌线上空后打一轮速射（见 fighterUpdate），然后返航整备。
+   分配是确定性最近邻（不用 PRNG），所以不会挪动 rnd 流。 */
+const ESCORT_PER_BOMBER = 1;
+function escortAssign() {
+  for (const b of AIR.craft) {
+    if (b.kind !== 'bomber' || b.dead || b.state !== 'bomb') continue;
+    let have = 0;
+    for (const f of AIR.craft) if (f.escort === b && !f.dead) have++;
+    if (have >= ESCORT_PER_BOMBER) continue;
+    let best = null, bd = 1e9;
+    for (const f of AIR.craft) {
+      if (f.kind !== 'fighter' || f.dead || f.side !== b.side) continue;
+      if (f.escort || f.state !== 'patrol') continue;      // 只在巡航待命时被征召
+      const d = Math.hypot(f.x - b.x, f.z - b.z);
+      if (d < bd) { bd = d; best = f; }
+    }
+    if (best && bd < 900) { best.escort = b; best.escortSide = (best.idx & 1) ? -1 : 1; }
+  }
+}
 function airUpdate(dt) {
   airReinforce(dt);
+  escortAssign();
   for (const a of AIR.craft) {
     if (a.dead) continue;
     a.fireT -= dt; a.rocketT -= dt;
@@ -5448,9 +5922,11 @@ function airUpdate(dt) {
     }
     /* 会战结束 → 全体返场着陆 */
     if (B.over) { a.state = 'rtb'; a.stick = 0; continue; }
-    /* 严重受损：优先把残机砸向高血量目标（高价值撞击），找不到才返场——避免在半路无谓坠毁 */
+    /* 严重受损：优先把残机砸向高血量目标（高价值撞击），找不到才返场——避免在半路无谓坠毁。
+       轰炸机除外：重轰炸机不搞自杀撞击，带伤一律返航整备——"返航 1.5× / 修理 3×"
+       的循环必须以"轰炸机能活着回到机场"为前提，否则这套修理机制永远是空转。 */
     if (a.hp < a.maxHp * 0.30) {
-      if (a.kind !== 'recon' && !a.ramTried) {
+      if (a.kind !== 'recon' && a.kind !== 'bomber' && !a.ramTried) {
         a.ramTried = true;
         const t = highValueTarget(a);
         if (t) {
@@ -5563,6 +6039,65 @@ function flakBurst(x, y, z, side) {
     if (d < FLAK_R && rnd() < 0.10) damageCraft(a, 12 + rnd() * 10, '高射炮');
   }
 }
+/* 步兵火箭筒（第 3 梯队）：不绑定射击姿态——据壕/推进中只要装甲或堡垒进 300 m
+   就抬手打一发；没有装甲目标时才打最近的步兵群（230 m）。发射的是 `rockets` 池
+   里的真实弹丸（尾烟 + 爆炸 + 反装甲结算），所以"火箭筒"有可见弹道。
+   瞄准偏差走 rnd（改变战果），曳光/烟迹走 vrnd。 */
+function infRocketUpdate(u, dt) {
+  if (u.weapon !== 'rocket' || B.over) return;
+  u.rocketT -= dt;
+  if (u.rocketT > 0 || u.rocketAmmo <= 0) return;
+  let rl = null, bd = 1e9;
+  for (const t of ARMOR.tanks) {
+    if (t.dead || t.side === u.army.key) continue;
+    const d = Math.hypot(t.x - u.cx, t.z - u.cz);
+    if (d < 300 && d < bd) { bd = d; rl = { x: t.x, z: t.z }; }
+  }
+  for (const F of FORT) {
+    if (F.dead || F.side === u.army.key) continue;
+    const d = Math.hypot(F.x - u.cx, F.z - u.cz);
+    if (d < 320 && d < bd) { bd = d; rl = { x: F.x, z: F.z }; }
+  }
+  if (!rl && u.target && u.target.men > 0) {
+    const d = Math.hypot(u.target.cx - u.cx, u.target.cz - u.cz);
+    if (d < 230) { bd = d; rl = { x: u.target.cx, z: u.target.cz }; }
+  }
+  if (!rl) { u.rocketT = 1.2; return; }
+  u.rocketT = 6.5; u.rocketAmmo--;
+  AIR.infantryRockets++;
+  const em = {
+    x: u.cx, y: groundY(u.cx, u.cz) + 1.25, z: u.cz,
+    yaw: u.yaw, pitch: 0.14, side: u.army.key, kind: 'inf', rockets: 1
+  };
+  fireRocket(em, rl.x + (rnd() - 0.5) * 7, groundY(rl.x, rl.z) + 1.0, rl.z + (rnd() - 0.5) * 7, '步兵火箭筒');
+}
+/* 步兵轻度防空（第 2/3 梯队）：对 260 m 内、72 m 以下的敌方飞机打两三发曳光，
+   低概率造成少量损伤。是"自卫火力"级别的轻防空，不取代高炮（aaUpdate）。
+   命中判定走 rnd（改变战果），曳光散布走 vrnd（纯视觉）。 */
+function infAAUpdate(dt) {
+  if (B.over) return;
+  for (const a of [U, C]) for (const u of a.units) {
+    if (!u.aa || u.kind !== 'inf' || u.gone || !u.onField || u.men <= 0) continue;
+    if (u.state === 'rout' || u.state === 'melee' || u.pinned) continue;
+    u.aaT -= dt;
+    if (u.aaT > 0) continue;
+    let best = null, bd = INF_AA_R;
+    for (const c of AIR.craft) {
+      if (c.dead || c.side === a.key) continue;
+      if (c.state === 'parked' || c.state === 'taxi' || c.state === 'roll' || c.state === 'rollout' || c.state === 'falling') continue;
+      if (c.y > INF_AA_ALT) continue;
+      const d = Math.hypot(c.x - u.cx, c.z - u.cz);
+      if (d < bd) { bd = d; best = c; }
+    }
+    if (!best) { u.aaT = 0.6; continue; }
+    u.aaT = INF_AA_EVERY;
+    AIR.infantryAA++;
+    const my = groundY(u.cx, u.cz) + 1.3;
+    for (let i = 0; i < 3; i++) emitTracerAimed(u.cx, my, u.cz, best.x, best.y, best.z, 310, 2.0, 9);
+    flashPool.emit(u.cx + 0.7, my, u.cz, 0.5, 0.12, 0.05, 1, 0, 0, 0, 0);
+    if (rnd() < INF_AA_HIT) { AIR.infantryAAHits++; damageCraft(best, 4 + rnd() * 7, '步兵轻防空'); }
+  }
+}
 function aaUpdate(dt) {
   for (const g of AIR.guns) {
     g.reload -= dt;
@@ -5607,19 +6142,60 @@ function aaUpdate(dt) {
 /* ---------- 航弹 / 曳光弹 / 引信 ---------- */
 const BOMB_R = 8.5;
 function bombImpact(b) {
-  explodeGround(b.x, b.z, 1.4);
+  const es = b.esc || 0;
   const foe = armyOf(foeSideOf(b.side));
-  const hits = blastCasualties(foe, b.x, b.z, BOMB_R, 3, 0.75)
-    + blastCasualties(foe, b.x, b.z, BOMB_R * 2, 3, 0.18);
+  if (b.cluster) { clusterImpact(b); return; }
+  /* 单发威力/半径随战局升级放大（"每轮炸弹威力更大"） */
+  explodeGround(b.x, b.z, bombPowerUp(es));
+  const R = BOMB_R * bombRadiusUp(es);
+  const hits = blastCasualties(foe, b.x, b.z, R, 3 + Math.floor(3 * es), 0.75)
+    + blastCasualties(foe, b.x, b.z, R * 2, 3 + Math.floor(2 * es), 0.18);
   if (hits > 0) blog('航空炸弹命中 ' + foe.side.label + ' 队列 — ' + hits + ' 人倒下（含破片）', '#e8a060');
   for (const t of ARMOR.tanks) {
     if (t.dead || t.side === b.side) continue;
-    if (Math.hypot(t.x - b.x, t.z - b.z) < BOMB_R * 2 && rnd() < 0.34) damageTank(t, 130 + rnd() * 150, '航弹');
+    if (Math.hypot(t.x - b.x, t.z - b.z) < R * 2 && rnd() < 0.34) damageTank(t, (130 + rnd() * 150) * (1 + 0.6 * es), '航弹');
   }
   for (const F of FORT) {
     if (F.dead || F.side === b.side) continue;
-    if (Math.hypot(F.x - b.x, F.z - b.z) < 28 && rnd() < 0.3) damageFort(F, 140 + rnd() * 140, '航弹');
+    if (Math.hypot(F.x - b.x, F.z - b.z) < 28 + 16 * es && rnd() < 0.3) damageFort(F, (140 + rnd() * 140) * (1 + 0.6 * es), '航弹');
   }
+}
+/* 集束炸弹：一枚母弹在低空开舱，撒出一片子弹药（确定性的不均匀散布）。
+   每个子弹药炸出一个小弹坑、造成小范围伤亡；整片区域只统一压制一次——
+   若每个子弹药各压一次，会把整条线一次钉死，会战再也推不动。 */
+function clusterImpact(b) {
+  const es = b.esc || 0;
+  const foe = armyOf(foeSideOf(b.side));
+  const n = CLUSTER_SUB + Math.floor(es * 5);
+  const R = CLUSTER_R * (1 + 0.5 * es);
+  const gY = terrainH(b.x, b.z);
+  flashPool.emit(b.x, gY + 7, b.z, 3.0, 0.42, 0.08, 1, 0, 0, 0, 0);   // 开舱闪光
+  let kills = 0;
+  for (let i = 0; i < n; i++) {
+    const a = i * (TAU / n) + 0.55;
+    const rr = R * (0.28 + 0.72 * (((i * 7) % 11) / 10));            // 不均匀但确定性的散布
+    const x = b.x + Math.cos(a) * rr, z = b.z + Math.sin(a) * rr, sy = groundY(x, z);
+    boomPool.emit(x, sy + 0.6, z, 0.9, 2.4, 0.13, 1, 0, 0.5, 0, 0);
+    for (let k = 0; k < 5; k++) {
+      const d = vrnd() * TAU, sp = 3 + vrnd() * 7;
+      dustPool.emit(x + Math.cos(d) * 0.8, sy + 0.25, z + Math.sin(d) * 0.8,
+        0.55, 2.0 + vrnd(), 0.5 + vrnd() * 0.4, 0.52, 0, 1.2 + vrnd(), Math.cos(d) * sp, Math.sin(d) * sp);
+    }
+    for (let k = 0; k < 4; k++) {
+      const d = vrnd() * TAU, sp = 6 + vrnd() * 10;
+      shardPool.emit(x, sy + 0.4, z, 0.16, 0.06, 0.5 + vrnd() * 0.5, 1, 0, 2.6 + vrnd() * 4, Math.cos(d) * sp, Math.sin(d) * sp);
+    }
+    addTerrainCrater(x, z, 0.5 + 0.35 * es);                          // 地形改造：一片小弹坑
+    kills += blastCasualties(foe, x, z, 8, 1, 0.34);
+  }
+  const sr = R * 1.5;
+  for (const u of foe.units) {
+    if (u.kind === 'art' || u.gone || u.men <= 0) continue;
+    const d = Math.hypot(u.cx - b.x, u.cz - b.z);
+    if (d < sr) u.suppress = clamp(u.suppress + 0.45 * (1 - d / sr), 0, 1);
+  }
+  impactFeedback(1.4, b.x, b.z);
+  blog('集束炸弹覆盖 ' + foe.side.label + ' 阵地 — ' + n + ' 枚子弹药散布 ' + Math.round(R) + ' m · ' + kills + ' 人倒下', '#e8a060');
 }
 function airProjectiles(dt) {
   for (const t of tracers) {
@@ -5646,6 +6222,13 @@ function airProjectiles(dt) {
     if (!b.on) continue;
     b.vy -= 9.8 * dt;
     b.x += b.vx * dt; b.y += b.vy * dt; b.z += b.vz * dt;
+    /* 航弹尾迹：按飞行距离发烟（不是按计时器），不同投弹速度下都连成一条线，
+       于是"高空落下的炸弹"也有可见轨迹，而不是一个看不见的暗点。 */
+    b.dist = (b.dist || 0) + Math.hypot(b.vx, b.vy, b.vz) * dt;
+    if (b.dist > 3.4) {
+      b.dist = 0;
+      smokePool.emit(b.x, b.y, b.z, 0.55, 2.5, 1.5, 0.36, 0, 0.16, b.vx * 0.03, b.vz * 0.03);
+    }
     if (b.y <= terrainH(b.x, b.z) + 0.25) { b.on = false; bombImpact(b); }
   }
   for (let i = AIR.flak.length - 1; i >= 0; i--) {
@@ -5691,7 +6274,8 @@ function airSync() {
     if (b.on) {
       const sp = Math.hypot(b.vx, b.vy, b.vz) || 1;
       _tq.setFromUnitVectors(PZ, _tv.set(b.vx / sp, b.vy / sp, b.vz / sp));
-      bombMesh.setMatrixAt(i, _pm.compose(_pp.set(b.x, b.y, b.z), _tq, _ps.set(1, 1, 1)));
+      const bs = b.size || 1;
+      bombMesh.setMatrixAt(i, _pm.compose(_pp.set(b.x, b.y, b.z), _tq, _ps.set(bs, bs, bs)));
       b.drawn = true; bTouched = true;
     } else if (b.drawn) {
       bombMesh.setMatrixAt(i, _pm.makeScale(0, 0, 0));
@@ -5788,19 +6372,21 @@ function fireTankShell(t, best, wmd) {
   const fwd = t.hero ? 7.2 : 4.5;
   const sx = t.x + Math.sin(t.yaw) * fwd, sz = t.z + Math.cos(t.yaw) * fwd;
   const sy = groundY(t.x, t.z) + (t.hero ? 4.4 : 2.2);
-  const tx = best.cx + (rnd() - 0.5) * 26, tz = best.cz + (rnd() - 0.5) * 26;
+  const es = wmd ? battleEscalation() : 0;
+  const spread = 26 * (wmd ? wmdSpreadMul(es) : 1);
+  const tx = best.cx + (rnd() - 0.5) * spread, tz = best.cz + (rnd() - 0.5) * spread;
   const ty = groundY(best.cx, best.cz) + 1.0;
   const b = ballisticVel(sx, sy, sz, tx, ty, tz, wmd ? 200 : 240);
   sh.x = sx; sh.y = sy; sh.z = sz;
   sh.vx = b.vx; sh.vy = b.vy; sh.vz = b.vz;
   sh.active = true; sh.dist = wmd ? 12 : 6; sh.trailStep = wmd ? 4 : 6;
   sh.mode = wmd ? 'wmd' : 'tank';
-  sh.side = t.side; sh.acc = 1;
+  sh.side = t.side; sh.acc = 1; sh.esc = es;
   if (wmd) {
-    /* 英雄重战车的"重炮"：低伤害 / 大范围 / 大范围地形改变 */
-    sh.power = WMD_POWER; sh.label = '重型战车·重炮';
+    /* 英雄重战车的"重炮"：低伤害 / 大范围 / 大范围地形改变（升级后口径与弹坑场更大） */
+    sh.power = wmdPower(es); sh.label = es > 0.6 ? '重型战车·饱和重炮' : '重型战车·重炮';
     SHELL_FIRED.wmd++;
-    t.reload = 13 + rnd() * 2;
+    t.reload = Math.max(3, (13 - 7 * es) + rnd() * 2);
   } else {
     sh.power = t.hero ? 1.5 : t.heavy ? 1.05 : 0.7;
     sh.killR = t.hero ? 13 : 7.5; sh.cap = t.hero ? 10 : 5; sh.chance = 0.8;
@@ -5869,9 +6455,15 @@ function armorUpdate(dt) {
     t.y = groundY(t.x, t.z);
     if (t.reload <= 0 && bd < t.range && B.t > 8) {
       t.shots = (t.shots || 0) + 1;
-      /* 英雄重战车每 WMD_TANK_EVERY 发打一发大规模杀伤弹（fireTankShell 内部设专属装填时间） */
-      const wmd = t.hero && t.shots % WMD_TANK_EVERY === 0;
-      if (!wmd) t.reload = (t.hero ? 7.2 : t.heavy ? 5.4 : 3.6) + rnd() * 1.4;
+      /* 英雄重战车的重炮齐射随战局升级：每 wmdEvery 发 1 次，一次连打 wmdSalvo 发 */
+      const es = t.hero ? battleEscalation() : 0;
+      let wmd = false;
+      if (t.hero) {
+        const every = wmdEvery(WMD_TANK_EVERY, es);
+        if (t.salvo > 0) { wmd = true; t.salvo--; }
+        else if (t.shots % every === 0) { wmd = true; t.salvo = wmdSalvo(es) - 1; }
+      }
+      if (!wmd) t.reload = (t.hero ? 7.2 : t.heavy ? 5.4 : 3.6) * (1 - 0.4 * es) + rnd() * 1.4;
       fireTankShell(t, best, wmd);
     }
   }
@@ -5971,6 +6563,79 @@ function mgSync() {
   MG.rig.flush();
 }
 
+/* ==================== 阶段判定：读双方实际状态，而不是读命令/单边事件 ====================
+   旧版阶段由"某个单位在做什么"直接决定：任一单位开火→FIRE、任一单位冲锋→CHARGE，
+   一个单边事件就能把全局阶段拉高，而且与 AI 下的命令（ai.mode）脱节。
+   现在每 tick 采样**双方**的实际状态：接敌距离、在射/在冲/在白刃的建制数、平均士气、
+   被压制度、在野建制数与兵员，用双边判据定阶段：
+     ADVANCE    双方都还没接触（最近接敌 > 320 m）
+     FIREPREP   只有一方在开火（对岸还没进交战距离）= 单方面火力准备
+     FIREFIGHT  双方都在交战距离内互相开火（对射）
+     ASSAULT    至少一方投入冲锋，另一方仍在据守/射击
+     MELEE      出现白刃
+     PURSUIT    一方在野兵力或士气崩溃，另一方仍在推进
+   FIREPREP/FIREFIGHT 之间带 2 s 迟滞，避免来回抖动；MELEE/ASSAULT/PURSUIT/END
+   是可立即升级的重大阶段。 */
+const PHASE_HOLD = 2.0;
+const PH = { id: 'DEPLOY', t: 0 };
+function sideFace(a, foe) {
+  let fire = 0, charge = 0, melee = 0, adv = 0, n = 0;
+  let mor = 0, sup = 0, men = 0, maxMen = 0, near = 1e9;
+  for (const u of a.units) {
+    if (u.kind === 'art' || !u.onField) continue;
+    n++; mor += u.morale; sup += u.suppress; men += u.men; maxMen += u.maxMen;
+    if (u.state === 'fire') fire++;
+    else if (u.state === 'charge') charge++;
+    else if (u.state === 'melee') melee++;
+    else if (u.state === 'advance') adv++;
+    for (const e of foe.units) {
+      if (e.kind === 'art' || !e.onField) continue;
+      const d = Math.hypot(e.cx - u.cx, e.cz - u.cz);
+      if (d < near) near = d;
+    }
+  }
+  return {
+    n, fire, charge, melee, adv, near,
+    morale: mor / Math.max(1, n), suppress: sup / Math.max(1, n), men, maxMen
+  };
+}
+/* 单方"现在处于什么战斗状态"的读数（兵牌与 HUD 用，取自上面的实测值） */
+function faceLabel(s) {
+  if (!s.n) return '离场';
+  if (s.melee) return '白刃';
+  if (s.charge) return '突击';
+  if (s.fire) return s.near < 320 ? '对射' : '火力准备';
+  if (s.adv) return s.near < 420 ? '接敌' : '推进';
+  return '据守';
+}
+function battlePhase(dt) {
+  const us = sideFace(U, C), cs = sideFace(C, U);
+  B.face = { union: faceLabel(us), confederate: faceLabel(cs) };
+  let id;
+  if (B.over) id = 'END';
+  else if (B.t < 2.5) id = 'DEPLOY';
+  else {
+    const near = Math.min(us.near, cs.near);
+    const firing = us.fire + cs.fire;
+    const mutual = us.fire > 0 && cs.fire > 0;
+    const charging = us.charge + cs.charge;
+    const melee = us.melee + cs.melee;
+    if (melee > 0) id = 'MELEE';
+    else if ((us.n <= 1 || us.morale < 0.22) && cs.adv > 0 && cs.morale > 0.35) id = 'PURSUIT';
+    else if ((cs.n <= 1 || cs.morale < 0.22) && us.adv > 0 && us.morale > 0.35) id = 'PURSUIT';
+    else if (charging > 0) id = 'ASSAULT';
+    else if (firing > 0 && (mutual || near < 320)) id = 'FIREFIGHT';
+    else if (firing > 0) id = 'FIREPREP';
+    else id = 'ADVANCE';
+  }
+  if (id !== PH.id) {
+    const major = id === 'MELEE' || id === 'ASSAULT' || id === 'PURSUIT' || id === 'END';
+    if (major || PH.t >= PHASE_HOLD) { PH.id = id; PH.t = 0; }
+  }
+  PH.t += dt;
+  return PH.id;
+}
+
 function simulate(dt) {
   windUpdate();
   for (const a of [U, C]) for (const u of a.units) if (u.kind !== 'art') u.cover = coverAt(u);
@@ -5982,12 +6647,14 @@ function simulate(dt) {
   }
   aiUpdate(U, dt); aiUpdate(C, dt);
   synergyUpdate(dt);
+  keyTerrainUpdate(dt);
   armorUpdate(dt);
   fortUpdate(dt);
   motorUpdate(dt);
   reinforceUpdate(dt);
   airUpdate(dt);
   aaUpdate(dt);
+  infAAUpdate(dt);
   airProjectiles(dt);
   rocketsUpdate(dt);
   directorUpdate(dt);
@@ -6007,13 +6674,8 @@ function simulate(dt) {
   let melee = 0;
   for (const a of [U, C]) for (const u of a.units) if (u.state === 'melee') melee++;
   if (melee > 0 && B.meleeStarted < 0) B.meleeStarted = B.t;
-  const firing = U.units.some(u => u.state === 'fire') || C.units.some(u => u.state === 'fire');
-  const charging = U.units.some(u => u.state === 'charge') || C.units.some(u => u.state === 'charge');
-  B.phase = B.over ? 'END'
-    : B.t < 2.5 ? 'DEPLOY'
-      : B.meleeStarted > 0 ? 'MELEE'
-        : charging ? 'CHARGE'
-          : firing ? 'FIRE' : 'ADVANCE';
+  B.phase = battlePhase(dt);
+  B.escal = battleEscalation();
 }
 
 function syncArmy(army) {
@@ -6056,7 +6718,7 @@ function updateHUD(dt) {
     h.mor.textContent = Math.round(mor * 100) + '%';
     h.mbar.style.width = (mor * 100).toFixed(0) + '%';
   }
-  HUD.phase.textContent = { DEPLOY: '部署中', ADVANCE: '推进', FIRE: '火力准备', CHARGE: '冲锋', MELEE: '白刃战', END: '战斗结束' }[B.phase] || B.phase;
+  HUD.phase.textContent = { DEPLOY: '部署展开', ADVANCE: '接敌推进', FIREPREP: '火力准备', FIREFIGHT: '对射', ASSAULT: '突击', MELEE: '白刃战', PURSUIT: '追击', END: '战斗结束' }[B.phase] || B.phase;
   if (B.phase !== lastPhase) { lastPhase = B.phase; phasePulse(); }   // 阶段切换给一次缩放脉冲
   HUD.clock.textContent = B.t.toFixed(1) + ' s' + (B.paused ? ' · 暂停' : '');
   HUD.speed.textContent = '速度 ×' + B.speed;
@@ -6089,7 +6751,10 @@ function updateHUD(dt) {
     h.types.textContent = '散兵 ' + liveU(a, 'skirm') + ' · 机枪 ' + liveU(a, 'mg') + ' · 工兵 ' + liveU(a, 'eng')
       + ' · 弹药 ' + ammoPct(a) + '%'
       + ' · 补充 余' + (a.reinfPool || 0) + '（已入 ' + (a.reinfIn || 0) + '）';
-    h.syn.textContent = '态势 ' + (a.ai ? (a.ai.mode === 'defend' ? '防守' : '进攻') : '—')
+    /* 态势取自实测（battlePhase 的 face），括号里是 AI 当前下的攻守命令——两者分开显示，
+       一眼能看出"命令说要攻"而"实测还在对射/被压制"这种脱节。 */
+    h.syn.textContent = '态势 ' + ((B.face && B.face[key]) || '—')
+      + '（' + (a.ai ? (a.ai.mode === 'defend' ? '守' : '攻') : '—') + '）'
       + ' · 压制 ' + sup(a) + ' · 引导 ' + spot(a) + ' · 步坦 ' + tan(a) + ' · 破障 ' + brc(a)
       + ' · 炮观 ' + gmode(a, 'direct') + '/' + gmode(a, 'cb') + '/' + gmode(a, 'blind')
       + ' · 情报 ' + INTEL[key].length + ' · 技能 ' + ABIL[key];
@@ -6314,7 +6979,7 @@ window.__battle = {
   },
   state() {
     return {
-      renderer: MODE, t: +B.t.toFixed(2), phase: B.phase, paused: B.paused, speed: B.speed,
+      renderer: MODE, t: +B.t.toFixed(2), phase: B.phase, face: B.face, escal: +B.escal.toFixed(3), paused: B.paused, speed: B.speed,
       over: B.over, winner: B.winner, fps: +fps.toFixed(1),
       shellsInFlight: shells.filter(s => s.active).length,
       union: packArmy(U), confederate: packArmy(C),
@@ -6468,27 +7133,70 @@ window.__battle = {
       craft: AIR.craft.map(c => ({
         side: c.side, kind: c.kind, state: c.state, dead: c.dead,
         x: +c.x.toFixed(1), y: +c.y.toFixed(1), z: +c.z.toFixed(1),
-        yaw: +c.yaw.toFixed(3), hp: Math.round(c.hp), severed: c.severed ? c.severed.length : 0,
+        yaw: +c.yaw.toFixed(3), spd: +c.spd.toFixed(1), hp: Math.round(c.hp), severed: c.severed ? c.severed.length : 0,
         rockets: c.rockets || 0
       })),
       guns: AIR.guns.map(g => ({ side: g.side, yaw: +g.yaw.toFixed(2), pitch: +g.pitch.toFixed(2), reload: +g.reload.toFixed(2) })),
       lost: AIR.lost, collisions: AIR.collisions, debris: debris.filter(d => d.on).length,
       falling: AIR.craft.filter(c => c.state === 'falling').length,
       kamikaze: AIR.craft.filter(c => c.state === 'kamikaze').length,
+      escorts: AIR.craft.filter(c => c.escort).length,
       rocketsInFlight: rockets.filter(r => r.on).length, rocketsFired: AIR.rocketFired,
       byKind: AIR.craft.reduce((o, c) => { o[c.kind] = (o[c.kind] || 0) + 1; return o; }, {}),
       /* 机场维修/重建验收面：produced=累计出厂，repairing=停在机场且未满血的架数 */
       produced: AIR.produced,
       reinfT: { union: +AIR.reinfT.union.toFixed(1), confederate: +AIR.reinfT.confederate.toFixed(1) },
       repairing: AIR.craft.filter(c => !c.dead && c.state === 'parked' && c.hp < c.maxHp).length,
+      repairRate: AIR_REPAIR_RATE, bomberRtbBoost: BOMBER_RTB_SPEED,
+      infantryRockets: AIR.infantryRockets, infantryAA: AIR.infantryAA, infantryAAHits: AIR.infantryAAHits,
       bombsDropped: AIR.dropped,
+      /* 轰炸机 vs 战局升级的验收面：单轮挂弹数、散布倍数、集束弹概率与已投数 */
+      bombing: {
+        escal: +B.escal.toFixed(3),
+        stickBase: BOMB_STICK_BASE, stickNow: bombStick(B.escal),
+        spreadMul: +bombSpread(B.escal).toFixed(2),
+        powerNow: +bombPowerUp(B.escal).toFixed(2),
+        radiusMul: +bombRadiusUp(B.escal).toFixed(2),
+        clusterChanceNow: +clusterChance(B.escal).toFixed(3),
+        clusterSub: CLUSTER_SUB + Math.floor(B.escal * 5),
+        clusterRadius: Math.round(CLUSTER_R * (1 + 0.5 * B.escal)),
+        clusterDropped: AIR.clusterDropped, escortsFired: AIR.escortFired
+      },
       tracers: tracers.filter(t => t.on).length,
       bombs: bombs.filter(b => b.on).length,
+      /* 在飞航弹坐标（含是否集束弹）：验收"轰炸机 vs 升级"时把机位对上去截图 */
+      bombLive: bombs.filter(b => b.on).slice(0, 10)
+        .map(b => ({ cluster: !!b.cluster, x: +b.x.toFixed(1), y: +b.y.toFixed(1), z: +b.z.toFixed(1) })),
       flakInFlight: AIR.flak.length,
       trenchZ: TRENCH_Z
     };
   },
   /* 可破坏地形自检：弹坑数、格点下沉/土环峰值；blast() 在指定点做一次爆炸后返回同一份读数 */
+  /* 地形采样：验收"最高的山在哪、河道/大路有没有被抬起来"。
+     peakScan 扫描全图找最高点（默认 20 m 网格，一次调用约 2.3 万次采样）。 */
+  terrainAt(x, z) {
+    return {
+      h: +terrainH(x, z).toFixed(3), base: +terrainBase(x, z).toFixed(3),
+      relief: +terrainRelief(x, z).toFixed(3), peak: +peakRelief(x, z).toFixed(3),
+      river: +riverDepth(x, z).toFixed(3)
+    };
+  },
+  peakScan(step) {
+    const st = Math.max(4, +step || 20);
+    let best = null, minH = 1e9, maxH = -1e9;
+    for (let x = -1500; x <= 1500; x += st) for (let z = -1500; z <= 1500; z += st) {
+      const h = terrainH(x, z);
+      if (!best || h > best.h) best = { x, z, h };
+      if (h < minH) minH = h;
+      if (h > maxH) maxH = h;
+    }
+    return {
+      max: { x: best.x, z: best.z, h: +best.h.toFixed(1) },
+      minH: +minH.toFixed(1), maxH: +maxH.toFixed(1),
+      fromCentre: Math.round(Math.hypot(best.x, best.z)), step: st,
+      peaks: PEAKS.map(p => ({ x: p.x, z: p.z, h: p.h, r: p.r, atSummit: +terrainH(p.x, p.z).toFixed(1) }))
+    };
+  },
   terrain() {
     let dipped = 0, maxDip = 0, maxRim = 0;
     for (let i = 0; i < dh.length; i++) {
@@ -6607,6 +7315,16 @@ window.__battle = {
     });
     return [one(U), one(C)];
   },
+  /* 阶段自检：阶段 id + 双方实测读数——阶段判定的输入是这些实测值，不是 AI 命令 */
+  phase() {
+    const us = sideFace(U, C), cs = sideFace(C, U);
+    const one = s => ({
+      n: s.n, fire: s.fire, charge: s.charge, melee: s.melee, adv: s.adv,
+      morale: +s.morale.toFixed(3), suppress: +s.suppress.toFixed(3),
+      near: s.near > 1e6 ? null : Math.round(s.near), label: faceLabel(s)
+    });
+    return { id: B.phase, hold: PHASE_HOLD, face: B.face, union: one(us), confederate: one(cs) };
+  },
   traverse() {
     const out = [];
     for (const a of [U, C]) for (const u of a.units) {
@@ -6620,6 +7338,9 @@ window.__battle = {
   ballistics() {
     let art = 0, tank = 0;
     for (const s of shells) if (s.active) (s.mode === 'tank' ? tank++ : art++);
+    /* 在飞弹丸坐标：验收"每发弹都有可见弹道"时把机位对上去截图 */
+    const live = shells.filter(s => s.active).slice(0, 8)
+      .map(s => ({ mode: s.mode, x: +s.x.toFixed(1), y: +s.y.toFixed(1), z: +s.z.toFixed(1) }));
     const pitches = AIR.guns.map(g => +g.pitch.toFixed(3));
     /* 炮兵观瞄自检：每个炮组当前是直瞄/反炮兵/盲射，以及两边的反推情报条数 */
     const gunModes = a => {
@@ -6636,7 +7357,7 @@ window.__battle = {
     };
     const observed = (a, foe) => foe.units.filter(e => e.kind !== 'art' && e.onField && e.spottedBy === a.key).length;
     return {
-      shells: { art, tank }, tracersInFlight: tracers.filter(t => t.on).length, tracerGrav: GRAV,
+      shells: { art, tank }, live, tracersInFlight: tracers.filter(t => t.on).length, tracerGrav: GRAV,
       aa: { perSide: AA_PER, count: AIR.guns.length, range: AA_RANGE, minPitch: AA_MIN_PITCH, minPitchNow: Math.min.apply(null, pitches), maxPitchNow: Math.max.apply(null, pitches) },
       observation: {
         union: gunModes(U), confederate: gunModes(C),
@@ -6667,6 +7388,17 @@ window.__battle = {
         radius: WMD_R, cap: WMD_CAP, chance: WMD_CHANCE, power: WMD_POWER,
         suppressRadius: WMD_SUPPRESS_R, satellites: WMD_SATELLITES,
         fortEvery: WMD_FORT_EVERY, tankEvery: WMD_TANK_EVERY,
+        /* 战局升级 → 重炮饱和：当前的升级量、齐射发数、触发间隔与散布倍数，
+           以及按升级量算出的实际口径/半径/弹坑数。 */
+        escal: +B.escal.toFixed(3),
+        fortEveryNow: wmdEvery(WMD_FORT_EVERY, B.escal),
+        tankEveryNow: wmdEvery(WMD_TANK_EVERY, B.escal),
+        salvo: wmdSalvo(B.escal),
+        spreadMul: +wmdSpreadMul(B.escal).toFixed(2),
+        radiusNow: Math.round(wmdRadius(B.escal)),
+        capNow: wmdCap(B.escal),
+        satellitesNow: wmdSats(B.escal),
+        powerNow: +wmdPower(B.escal).toFixed(2),
         inFlight: shells.filter(s => s.active && s.mode === 'wmd').length,
         fired: SHELL_FIRED.wmd
       }
@@ -6681,6 +7413,10 @@ window.__battle = {
       suppress: +u.suppress.toFixed(2), spottedBy: u.spottedBy,
       assault: !!u.assault, tankSup: !!u.tankSup, tankCover: +(u.tankCoverAmt || 0).toFixed(2),
       engBreach: !!u.engBreach, cover: +(u.cover || 0).toFixed(2),
+      pinned: !!u.pinned, bounding: !!u.bounding,
+      wave: u.wave, weapon: WEAPON_LABEL[u.weapon] || u.weapon, aa: !!u.aa, rockets: u.rocketAmmo,
+      perch: u.perch ? { x: Math.round(u.perch.x), z: Math.round(u.perch.z), h: +u.perch.h.toFixed(1) } : null,
+      elevBonus: +highGroundBonus(u.cx, u.cz).toFixed(1),
       ammo: u.ammo, ammoMax: u.ammoMax,
       ability: ABILITY_NAME[u.kind] || '—', cd: +u.abilityCd.toFixed(1)
     }));
@@ -6696,11 +7432,22 @@ window.__battle = {
       for (const u of a.units) if (u.kind !== 'art') o[u.kind] = (o[u.kind] || 0) + u.men;
       return o;
     };
+    /* 步兵梯队验收面：每批次的建制数 / 在场兵员 / 编制总数 */
+    const byWave = a => {
+      const o = { 1: { units: 0, men: 0, maxMen: 0 }, 2: { units: 0, men: 0, maxMen: 0 }, 3: { units: 0, men: 0, maxMen: 0 } };
+      for (const u of a.units) {
+        if (u.kind !== 'inf' || u.gone) continue;
+        const w = o[u.wave] || (o[u.wave] = { units: 0, men: 0, maxMen: 0 });
+        w.units++; w.men += u.men; w.maxMen += u.maxMen;
+      }
+      return o;
+    };
     return {
       unionFoot: U.foot.length, unionMount: U.mount.length,
       confFoot: C.foot.length, confMount: C.mount.length,
       unionGuns: U.guns.length, confGuns: C.guns.length,
       unionByKind: byKind(U), confByKind: byKind(C), mgUnits: MG.units.length,
+      unionWaves: byWave(U), confWaves: byWave(C), waveT: WAVE_T.slice(2),
       unionReinf: { pool: U.reinfPool, in: U.reinfIn }, confReinf: { pool: C.reinfPool, in: C.reinfIn },
       unionAmmo: U.units.filter(u => u.kind !== 'art').reduce((s, u) => s + u.ammo, 0),
       confAmmo: C.units.filter(u => u.kind !== 'art').reduce((s, u) => s + u.ammo, 0)
