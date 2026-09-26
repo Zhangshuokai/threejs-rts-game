@@ -4736,6 +4736,9 @@ function fighterUpdate(a, dt) {
   let tgt = null, bd = 520 * 2;
   for (const c of AIR.craft) {
     if (c === a || c.dead || c.side === a.side || c.state === 'falling') continue;
+    /* 机场地面上的飞机不做咬尾目标：否则 500 m 外会把对方停机坪上的飞机当空战目标扫射，
+       "返回己方机场维修"就永远修不完 */
+    if (c.state === 'parked' || c.state === 'taxi' || c.state === 'roll' || c.state === 'rollout') continue;
     const d = Math.hypot(c.x - a.x, c.y - a.y, c.z - a.z);
     if (d < bd) { bd = d; tgt = c; }
   }
@@ -5104,8 +5107,9 @@ function airUpdate(dt) {
       a.prop += dt * 1.2;
       /* 返回己方机场维修：停机时缓慢恢复 hp，修满再出动的空战才可持续 */
       if (a.hp < a.maxHp) a.hp = Math.min(a.maxHp, a.hp + AIR_REPAIR_RATE * dt);
-      /* 会战中落地整备后可再次出动（空中战线不会一次打光）；会战结束后就停飞 */
-      if (!B.over && B.t >= a.launchAt) {
+      /* 会战中落地整备后可再次出动（空中战线不会一次打光）；会战结束后就停飞。
+         修不满 60% 不出动——否则会在"几乎无血"时起飞，下一 tick 又触发返场。 */
+      if (!B.over && B.t >= a.launchAt && a.hp > a.maxHp * 0.6) {
         a.state = 'taxi'; a.spd = 2; a.pitch = 0;
         a.x = a.parkX; a.z = a.parkZ;
       }
@@ -6178,6 +6182,10 @@ window.__battle = {
       kamikaze: AIR.craft.filter(c => c.state === 'kamikaze').length,
       rocketsInFlight: rockets.filter(r => r.on).length, rocketsFired: AIR.rocketFired,
       byKind: AIR.craft.reduce((o, c) => { o[c.kind] = (o[c.kind] || 0) + 1; return o; }, {}),
+      /* 机场维修/重建验收面：produced=累计出厂，repairing=停在机场且未满血的架数 */
+      produced: AIR.produced,
+      reinfT: { union: +AIR.reinfT.union.toFixed(1), confederate: +AIR.reinfT.confederate.toFixed(1) },
+      repairing: AIR.craft.filter(c => !c.dead && c.state === 'parked' && c.hp < c.maxHp).length,
       bombsDropped: AIR.dropped,
       tracers: tracers.filter(t => t.on).length,
       bombs: bombs.filter(b => b.on).length,
