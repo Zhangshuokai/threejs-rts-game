@@ -60,6 +60,24 @@
     font-size:14px;letter-spacing:4px;color:#b9a06a}
   #debug{position:absolute;left:10px;top:10px;font-size:11px;font-family:Consolas,monospace;
     max-width:46vw;white-space:pre-wrap;display:none;padding:8px;z-index:20;color:#ffb0a0}
+  /* 点选单位后的兵牌属性面板（右侧，实时刷新） */
+  #unitcard{position:absolute;right:14px;top:170px;width:262px;padding:11px 13px 9px;
+    display:none;pointer-events:auto;font-size:12px;line-height:1.5;z-index:15;
+    border-color:var(--gold)}
+  #unitcard .uc-close{position:absolute;right:6px;top:3px;cursor:pointer;opacity:.6;
+    font-size:15px;line-height:1;padding:2px 6px;color:#efe8da}
+  #unitcard .uc-close:hover{opacity:1;color:var(--gold)}
+  #unitcard .uc-title{font-size:15px;letter-spacing:1px;font-weight:700;padding-right:16px}
+  #unitcard.union .uc-title{color:var(--union2)}
+  #unitcard.conf .uc-title{color:var(--conf2)}
+  #unitcard .uc-kind{font-size:11px;opacity:.74;letter-spacing:1px;margin:1px 0 5px}
+  #unitcard .uc-big{font-size:20px;font-weight:700;color:#f2ead8;letter-spacing:1px}
+  #unitcard .uc-bar{height:6px;background:rgba(255,255,255,.12);border-radius:3px;overflow:hidden;margin:5px 0 7px}
+  #unitcard .uc-bar i{display:block;height:100%;background:#e0c070}
+  #unitcard .uc-row{display:flex;justify-content:space-between;gap:10px;
+    border-top:1px solid rgba(255,255,255,.07);padding:2px 0}
+  #unitcard .uc-row b{font-weight:400;opacity:.64}
+  #unitcard .uc-row span{text-align:right;color:#f0e8d6}
 </style>
 </head>
 <body>
@@ -98,10 +116,12 @@
     <div><b>1-9</b> 切换机位 &nbsp; <b>空格</b> 暂停</div>
     <div><b>[ ]</b> 战斗速度 &nbsp; <b>R</b> 重开</div>
     <div><b>鼠标</b> 拖拽旋转 / 滚轮缩放</div>
+    <div><b>左键点选</b> 单位查看兵牌属性 · <b>Esc</b> 取消</div>
   </div>
   <div id="views"></div>
   <div class="panel" id="paused">已暂停 · 空格继续</div>
   <div class="panel" id="result"><h1></h1><p></p></div>
+  <div class="panel" id="unitcard"></div>
   <div class="panel" id="debug"></div>
 </div>
 <div id="loading">正在展开战场…</div>
@@ -1578,6 +1598,7 @@ class Unit {
     this.impact = false;
     this.meleeT = 0;
     this.gone = false;
+    this.airborne = false;      // 空投中：临时 gone，但 onField 仍为真（见 get onField）
     this.guns = null;
     /* —— 兵种/配合/技能状态（全部由 simulate 步进，不用墙钟）—— */
     this.suppress = 0;        // 被压制度 0..1：减速、减射、掉士气
@@ -1647,7 +1668,9 @@ class Unit {
       }
     }
   }
-  get onField() { return this.kind !== 'art' && !this.gone && this.men > 0 && this.state !== 'rout'; }
+  /* 空投中的建制临时 gone=true（从瞄准/指挥过滤里摘掉），但仍算"在场"，
+     否则全员还在伞上时可能被判定成一方无人而提前结束会战 */
+  get onField() { return this.kind !== 'art' && (!this.gone || this.airborne) && this.men > 0 && this.state !== 'rout'; }
 }
 
 const KIND_LABEL = { inf: '线列步兵', cav: '骑兵', skirm: '散兵线', mg: '机枪队', eng: '工兵连', art: '炮兵连' };
@@ -1666,6 +1689,7 @@ function makeBanner(unit) {
 }
 /* 兵牌上的攻防姿态：让"推进/射击/据守/冲锋/白刃/预备/迂回/溃退"一眼可读 */
 function unitStance(u) {
+  if (u.state === 'airborne') return '空降中';
   if (u.state === 'rout') return '溃退';
   if (u.state === 'charge') return '冲锋';
   if (u.state === 'melee') return '白刃';
@@ -1681,8 +1705,9 @@ function drawBanner(unit) {
   const isU = unit.army.key === 'union';
   g.clearRect(0, 0, W, H);
   g.fillStyle = 'rgba(16,14,11,.84)';
-  g.strokeStyle = isU ? '#6f8fc9' : '#c2ae86';
-  g.lineWidth = 3;
+  const isSel = unit === SEL;
+  g.strokeStyle = isSel ? '#ffd36a' : isU ? '#6f8fc9' : '#c2ae86';
+  g.lineWidth = isSel ? 5 : 3;
   g.beginPath(); g.roundRect(3, 3, W - 6, H - 6, 8); g.fill(); g.stroke();
   g.fillStyle = 'rgba(0,0,0,.4)';
   g.beginPath(); g.roundRect(3, 3, W - 6, 26, 8); g.fill();
@@ -2878,29 +2903,40 @@ function obstacleCover(x, z) {
 /* 阵容：每方 8 个步兵团沿放大后的正面展开（间距 97 m），两翼各 1 个骑兵团，
    后方 2 个炮兵连；双方步兵互相错开 24 m（对着对方的间隙），接触更有咬合感。
    步兵的 z 只需名义值——makeArmyUnits 会用 trenchDitchZ 把整队放进壕沟。 */
+/* 三波步兵各 8 个建制（与第一波人数一致）。第 2、3 波不再从后方走上来，
+   而是在 WAVE_T 由运输机空投进场（见 §空投）。 */
 const INF_WAVES = {
   union: [
     ['第 20 缅因团', '第 69 纽约团', '第 1 明尼苏达团', '爱尔兰旅', '第 2 威斯康星团', '第 19 印第安纳团', '第 5 新罕布什尔团', '第 8 俄亥俄团'],
-    ['第 3 佛蒙特团', '第 12 新泽西团'],
-    ['铁旅', '第 7 密歇根团']
+    ['第 3 佛蒙特团', '第 12 新泽西团', '第 4 佛蒙特团', '第 9 纽约团', '第 11 康涅狄格团', '第 2 马萨诸塞团', '第 6 缅因团', '第 11 宾夕法尼亚团'],
+    ['铁旅', '第 7 密歇根团', '第 1 马萨诸塞团', '第 5 密歇根团', '第 13 伊利诺伊团', '第 9 印第安纳团', '第 3 肯塔基团', '第 2 明尼苏达团']
   ],
   confederate: [
     ['第 1 弗吉尼亚团', '第 4 阿拉巴马团', '第 2 密西西比团', '石墙旅', '第 3 田纳西团', '第 6 北卡罗来纳团', '第 7 佐治亚团', '第 5 德克萨斯团'],
-    ['第 8 阿拉巴马团', '第 4 佐治亚团'],
-    ['德克萨斯旅', '第 12 弗吉尼亚团']
+    ['第 8 阿拉巴马团', '第 4 佐治亚团', '第 5 阿拉巴马团', '第 6 阿拉巴马团', '第 3 佐治亚团', '第 15 南卡罗来纳团', '第 2 田纳西团', '第 1 路易斯安那团'],
+    ['德克萨斯旅', '第 12 弗吉尼亚团', '第 9 弗吉尼亚团', '第 14 北卡罗来纳团', '第 4 德克萨斯团', '第 3 阿肯色团', '第 2 佛罗里达团', '第 8 田纳西团']
   ]
 };
 /* 三个步兵梯队（批次）的编制与装备，强度逐批上升：42 → 48 → 54 人，
    士气加成 +0 / +0.05 / +0.10，装备 步枪 → 冲锋枪 → 火箭筒+冲锋枪，
-   后两批带轻度防空（对低空敌机有少量火力）。back = 该批起始位置在己方战线
-   之后再退多少米（作为战役预备队，按 WAVE_T 逐批投入）。 */
+   后两批带轻度防空（对低空敌机有少量火力）。
+   back = 空投前的集结位置（在己方战线之后再退多少米，停在炮兵与机场之间的
+   空地上待机）；spacing/xoff = 8 个建制的正面间距与整体侧偏（xoff 乘朝向）。
+   dropBack = 空投着陆线在己方战线之前多少米（落在两军之间的空档）。 */
 const WAVE_CFG = [
-  { files: 14, ranks: 3, add: 0.00, weapon: 'rifle',  aa: false, back: 0,   x0: 0 },
-  { files: 16, ranks: 3, add: 0.05, weapon: 'smg',    aa: true,  back: 95,  x0: 150 },
-  { files: 18, ranks: 3, add: 0.10, weapon: 'rocket', aa: true,  back: 205, x0: 150 }
+  { files: 14, ranks: 3, add: 0.00, weapon: 'rifle',  aa: false, back: 0,   spacing: 97,  xoff: 12, dropBack: 0 },
+  { files: 16, ranks: 3, add: 0.05, weapon: 'smg',    aa: true,  back: 340, spacing: 105, xoff: 0,  dropBack: 170 },
+  { files: 18, ranks: 3, add: 0.10, weapon: 'rocket', aa: true,  back: 400, spacing: 118, xoff: 0,  dropBack: 130 }
 ];
 const WAVE_T = [0, 0, 52, 104];                  // 各梯队投入时刻（s）；第 1 梯队 0 = 开战即在位
 const WEAPON_LABEL = { rifle: '步枪', smg: '冲锋枪', rocket: '火箭筒' };
+/* —— 空投（第 2/3 波）参数：运输机沿 x 通场，飞到某建制正上方时才把它撒出去 —— */
+const DROP_ALT = 150;          // 伞兵出舱高度（m）；运输机航线在其上 26 m
+const DROP_VY = 9;             // 伞降垂直速度（m/s）≈ 17 s 落地
+const DROP_SCATTER = 9;        // 出舱横向散布半径（m）
+const DROP_RUN = 860;          // 运输机通场航程（±x）
+const TRANSPORT_SPD = 92;      // 运输机通场速度（m/s）
+const PARA_CAP = 960;          // 同时在空的伞盖实例上限（两波不重叠，峰值≈864）
 /* 步兵"轻度防空"（第 2/3 梯队）：只打低空、射程近、命中低——是自卫火力，不是高炮 */
 const INF_AA_R = 260, INF_AA_ALT = 72, INF_AA_EVERY = 3.0, INF_AA_HIT = 0.10;
 const ROSTER = {
@@ -2917,7 +2953,7 @@ for (const key of ['union', 'confederate']) {
     const W = WAVE_CFG[w];
     names.forEach((n, i) => ROSTER[key].infantry.push({
       resolve: res + W.add, name: n, title: n.replace(/\s/g, ''),
-      x: W.x0 ? (i === 0 ? -W.x0 : W.x0) : (i - 3.5) * 97 + f * 12,
+      x: (i - (names.length - 1) / 2) * W.spacing + W.xoff * f,
       z: -(FRONT * S + W.back) * f,
       files: W.files, ranks: W.ranks, yaw,
       wave: w + 1, weapon: W.weapon, aa: W.aa
@@ -4048,6 +4084,177 @@ const attackerRig = new RigPool(ATTACKER_PARTS, ATTACKERS_PER * 2, airMat);
 const bomberRig = new RigPool(BOMBER_PARTS, BOMBERS_PER * 2, airMat);
 const reconRig = new RigPool(RECON_PARTS, RECONS_PER * 2, airMat);
 const aaRig = new RigPool(AA_PARTS, AA_PER * 2, airMat);
+
+/* ==================== 空投（第 2/3 波） ====================
+   第 1 波踩着自己壕沟开打，第 2/3 波则空降进场：运输机沿 x 通场，飞到某个建制
+   的正上方时才把它整队撒出去，伞兵各自飘落、落地后自动编入战线。
+   确定性：通场航线/出舱散布用 rnd（落点决定战果），伞盖摆动与落地扬尘用 vrnd（纯视觉）。
+   空中单位临时 gone=true：从所有"可被瞄准"的过滤（aiUpdate/orderAdvance/unitUpdate…）
+   里自动摘出去，敌我不打伞兵；同时 onField 对 airborne 放行，避免全在空中的瞬间
+   被判定成"一方无人"而提前结束会战。 */
+const TRANSPORT_PARTS = [
+  {
+    id: 'body', mat: 'skin', paint: 'body', pos: [0, 0, 0], geo: mergeGeometries([
+      at(zc(cyl(0.88, 1.0, 14, 12)), 0, 0, 0),
+      at(new THREE.SphereGeometry(1.02, 12, 8), 0, 0.08, 7.0),
+      at(box(9.4, 0.4, 3.1), 0, -0.2, 0.4),
+      at(box(3.6, 0.28, 1.4), 0, 0.5, -6.2),
+      at(box(0.24, 2.1, 1.5), 0, 1.3, -6.4)
+    ])
+  },
+  { id: 'propL', mat: 'blade', dyn: 'prop', pos: [-2.9, -0.2, 2.5], geo: mergeGeometries([box(0.2, 3.4, 0.08), box(3.4, 0.2, 0.08)]) },
+  { id: 'propR', mat: 'blade', dyn: 'prop', pos: [2.9, -0.2, 2.5], geo: mergeGeometries([box(0.2, 3.4, 0.08), box(3.4, 0.2, 0.08)]) },
+  { id: 'blurL', mat: 'blur', dyn: 'prop', pos: [-2.9, -0.2, 2.54], geo: zc(cyl(1.7, 1.7, 0.02, 18)) },
+  { id: 'blurR', mat: 'blur', dyn: 'prop', pos: [2.9, -0.2, 2.54], geo: zc(cyl(1.7, 1.7, 0.02, 18)) }
+];
+const transportRig = new RigPool(TRANSPORT_PARTS, 4, airMat);
+const TRANSPORT = [];
+for (const side of ['union', 'confederate']) {
+  for (let i = 0; i < 2; i++) {
+    const idx = (side === 'union' ? 0 : 2) + i;
+    transportRig.paint(idx, AIR_PAINT[side]);
+    transportRig.hide(idx);
+    TRANSPORT.push({ side, idx, on: false, drawn: false, x: 0, y: 0, z: 0, yaw: 0, dir: 1, x1: 0, prop: 0 });
+  }
+}
+/* 伞盖：一个 InstancedMesh（逐实例按阵营着色），与粒子池同思路，上千只在空也只要 1 个 draw call */
+const paraMesh = new THREE.InstancedMesh(
+  new THREE.SphereGeometry(3.3, 10, 6, 0, TAU, 0, Math.PI / 2),
+  new THREE.MeshStandardMaterial({ roughness: 0.88, side: THREE.DoubleSide }),
+  PARA_CAP
+);
+paraMesh.frustumCulled = false;
+paraMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+for (let i = 0; i < PARA_CAP; i++) paraMesh.setMatrixAt(i, _dummy.matrix.makeScale(0, 0, 0));
+paraMesh.instanceMatrix.needsUpdate = true;
+scene.add(paraMesh);
+const _paraCol = new THREE.Color();
+let paraDrawn = 0;
+
+function activateTransport(side, w, dz) {
+  const slot = (side === 'union' ? 0 : 2) + (w - 2);
+  const p = TRANSPORT[slot];
+  if (!p || p.on) return null;
+  const dir = side === 'union' ? 1 : -1;
+  p.on = true; p.dir = dir; p.prop = 0; p.z = dz;
+  p.x = -dir * DROP_RUN; p.x1 = -p.x;
+  p.yaw = dir > 0 ? Math.PI / 2 : -Math.PI / 2;
+  return p;
+}
+/* 一个梯队整体空投：着陆线 = 己方战线前 dropBack 米的空档，正面按 spacing 铺开 */
+function startWaveDrop(army, w) {
+  const f = army.key === 'union' ? 1 : -1;
+  const W = WAVE_CFG[w - 1];
+  /* 着陆线在己方战线「之前」dropBack 米（仍在本方一侧、两军之间的空档） */
+  const dz = -(FRONT * S - W.dropBack) * f;
+  activateTransport(army.key, w, dz);
+  const xStart = -f * DROP_RUN;                   // 通场起点（union 从 -x 飞向 +x）
+  const list = army.units.filter(u => u.wave === w);
+  for (let i = 0; i < list.length; i++) {
+    const u = list[i];
+    u.cx = (i - (list.length - 1) / 2) * W.spacing + W.xoff * f;
+    u.cz = dz;
+    u.airborne = true; u.gone = true; u.banner.visible = false;
+    u.state = 'airborne';
+    /* 运输机飞到本建制正上方时才开始投：出舱延迟由航线反推，机与人同步 */
+    const delay0 = clamp((u.cx - xStart) / (f * TRANSPORT_SPD), 0, 60);
+    let maxT = 0;
+    for (const s of u.soldiers) {
+      if (!s.alive) continue;
+      u.slotWorld(u.soldierSlot[s.si], _v);
+      const tx = _v.x, tz = _v.z, y1 = groundY(tx, tz);
+      const y0 = DROP_ALT + rnd() * 22;
+      const dur = (y0 - y1) / DROP_VY + rnd() * 0.8;
+      const d = delay0 + rnd() * 0.55;
+      s.chute = {
+        t: -d, dur, y0, y1,
+        x0: tx + (rnd() - 0.5) * DROP_SCATTER, z0: tz + (rnd() - 0.5) * DROP_SCATTER,
+        x1: tx, z1: tz, sway: 0.5 + rnd() * 1.1, ph: rnd() * TAU
+      };
+      s.x = s.chute.x0; s.z = s.chute.z0; s.y = y0; s.state = 'chute';
+      if (d + dur > maxT) maxT = d + dur;
+    }
+    u.dropT = maxT + 0.3;
+  }
+}
+/* 伞降步进：出舱前原地等待，出舱后按各自时长飘落，落地扬尘并恢复地面态 */
+function chuteUpdate(s, dt) {
+  const c = s.chute;
+  c.t += dt;
+  s.spd = 0;
+  if (c.t < 0) { s.state = 'chute'; return; }
+  const k = clamp(c.t / c.dur, 0, 1);
+  s.x = lerp(c.x0, c.x1, k) + Math.sin(c.t * 0.85 + c.ph) * c.sway * (1 - k * 0.45);
+  s.z = lerp(c.z0, c.z1, k) + Math.cos(c.t * 0.66 + c.ph * 1.3) * c.sway * (1 - k * 0.45);
+  s.y = lerp(c.y0, c.y1, k);
+  s.tilt = 0.11 * Math.sin(c.t * 1.25 + c.ph);
+  s.roll = 0.09 * Math.sin(c.t * 1.05 + c.ph * 0.7);
+  s.yaw = Math.atan2(c.x1 - s.x, c.z1 - s.z) || s.yaw;
+  s.state = 'chute';
+  if (k >= 1) {
+    s.chute = null;
+    s.x = c.x1; s.z = c.z1; s.y = groundY(s.x, s.z);
+    s.tilt = 0; s.roll = 0; s.spd = 0; s.state = 'idle';
+    for (let i = 0; i < 3; i++) {
+      dustPool.emit(s.x + (vrnd() - 0.5) * 1.8, s.y + 0.2, s.z + (vrnd() - 0.5) * 1.8,
+        0.34, 1.1 + vrnd() * 0.7, 0.5, 0.4, 0, 0.9 + vrnd() * 0.6,
+        (vrnd() - 0.5) * 1.4, (vrnd() - 0.5) * 1.4);
+    }
+  }
+}
+function airdropUpdate(dt) {
+  for (const army of [U, C]) {
+    for (const u of army.units) {
+      if (!u.airborne) continue;
+      u.dropT -= dt;
+      if (u.dropT <= 0) {
+        u.airborne = false; u.gone = false; u.state = 'advance';
+        blog(u.name + ' 空降着陆 — 投入战斗', army.side.css);
+      }
+    }
+  }
+  for (const p of TRANSPORT) {
+    if (!p.on) continue;
+    p.x += p.dir * TRANSPORT_SPD * dt;
+    p.prop += dt * 24;
+    if ((p.dir > 0 && p.x >= p.x1) || (p.dir < 0 && p.x <= p.x1)) p.on = false;
+  }
+}
+function transportSync() {
+  let touched = false;
+  for (const p of TRANSPORT) {
+    if (p.on) {
+      transportRig.write(p.idx, p.x, DROP_ALT + 26, p.z, p.yaw, 0, 0, { prop: p.prop });
+      p.drawn = true; touched = true;
+    } else if (p.drawn) {
+      transportRig.hide(p.idx);
+      p.drawn = false; touched = true;
+    }
+  }
+  if (touched) transportRig.flush();
+}
+/* 伞盖跟随伞兵：一个实例池、按需写入，落地的伞自动缩成 0 */
+function paraSync() {
+  let n = 0;
+  for (const army of [U, C]) {
+    const col = army.key === 'union' ? [0.56, 0.64, 0.8] : [0.74, 0.68, 0.5];
+    for (const s of army.foot) {
+      if (!s.chute || !s.alive) continue;
+      if (n >= PARA_CAP) break;
+      _dummy.position.set(s.x, s.y + 2.7, s.z);
+      _dummy.rotation.set(s.tilt * 0.8, s.yaw, s.roll + 0.05 * Math.sin((s.chute.t + s.chute.ph) * 0.9));
+      _dummy.scale.set(1, 1, 1);
+      _dummy.updateMatrix();
+      paraMesh.setMatrixAt(n, _dummy.matrix);
+      paraMesh.setColorAt(n, _paraCol.setRGB(col[0], col[1], col[2]));
+      n++;
+    }
+  }
+  for (let i = n; i < paraDrawn; i++) paraMesh.setMatrixAt(i, _dummy.matrix.makeScale(0, 0, 0));
+  paraDrawn = n;
+  paraMesh.instanceMatrix.needsUpdate = true;
+  if (paraMesh.instanceColor) paraMesh.instanceColor.needsUpdate = true;
+}
 const AIR = {
   craft: [], guns: [], flak: [], lost: { union: 0, confederate: 0 }, dropped: 0, collisions: 0, rocketFired: 0,
   clusterDropped: 0, escortFired: 0,      // 集束弹投掷数 / 护航僚机速射轮数
@@ -4067,7 +4274,8 @@ function foeSideOf(side) { return side === 'union' ? 'confederate' : 'union'; }
 function lineZ(side) {
   const foe = armyOf(foeSideOf(side));
   let s = 0, n = 0;
-  for (const u of foe.units) if (u.kind !== 'art' && u.men > 0 && !u.gone) { s += u.cz; n++; }
+  for (const u of foe.units) if (u.kind !== 'art' && u.men > 0 && !u.gone
+    && !(u.wave > 1 && B.t < WAVE_T[u.wave])) { s += u.cz; n++; }
   return n ? s / n : (side === 'union' ? FRONT * S : -FRONT * S);
 }
 
@@ -4471,12 +4679,15 @@ function aiUpdate(army, dt) {
         到点后一次性放行并记一条战报——这才是"两个梯队逐批增援"的开关。 */
   army.waveDone = army.waveDone || {};
   for (const u of mine) {
-    const held = u.wave > 1 && B.t < WAVE_T[u.wave];
-    if (!held && u.wave > 1 && !army.waveDone[u.wave]) {
+    const waiting = u.wave > 1 && B.t < WAVE_T[u.wave];
+    /* 到点：整批空投（每波只触发一次）。空投期间该建制由 airborne 压住，落地后自动归建。 */
+    if (!waiting && u.wave > 1 && !army.waveDone[u.wave]) {
       army.waveDone[u.wave] = true;
       const n = mine.filter(x => x.wave === u.wave).length;
-      blog(army.side.label + ' 第 ' + u.wave + ' 梯队投入战场 — ' + n + ' 个团加入战线', army.side.css);
+      startWaveDrop(army, u.wave);
+      blog(army.side.label + ' 第 ' + u.wave + ' 梯队空投进场 — ' + n + ' 个团伞降', army.side.css);
     }
+    const held = waiting || u.airborne;
     u.order = held ? 'reserve'
       : ai.mode === 'defend' ? 'hold'
         : ai.reserve === u ? 'reserve'
@@ -5209,6 +5420,7 @@ function soldierUpdate(s, dt) {
     s.spd = 0;
     return;
   }
+  if (s.chute) { chuteUpdate(s, dt); return; }   // 空投中：由伞降步进接管位置
   const u = s.unit;
   if (s.recoil > 0) s.recoil = Math.max(0, s.recoil - dt * 3.4);
   let desX, desZ, cap;
@@ -6317,7 +6529,7 @@ const isFootUnit = u => FOOT_KINDS[u.kind] === 1;
 function weakestUnit(army, maxRatio, skipContact) {
   let best = null, bs = maxRatio;
   for (const u of army.units) {
-    if (!isFootUnit(u) || !u.onField) continue;
+    if (!isFootUnit(u) || !u.onField || u.airborne) continue;
     if (skipContact && (u.state === 'melee' || u.state === 'charge')) continue;
     const r = u.men / u.maxMen;
     if (r < bs) { bs = r; best = u; }
@@ -6329,7 +6541,7 @@ function weakestUnit(army, maxRatio, skipContact) {
 function supplyTarget(army) {
   let best = null, bs = 0.95;
   for (const u of army.units) {
-    if (!isFootUnit(u) || !u.onField) continue;
+    if (!isFootUnit(u) || !u.onField || u.airborne) continue;
     const need = Math.min(u.men / u.maxMen, u.ammo / u.ammoMax);
     if (need < bs) { bs = need; best = u; }
   }
@@ -6495,7 +6707,7 @@ function motorUpdate(dt) {
       continue;
     }
     /* 途中目标被打崩/撤离就换一个，换不到再返场 */
-    if (v.state === 'march' && (!v.target || !v.target.onField)) {
+    if (v.state === 'march' && (!v.target || !v.target.onField || v.target.airborne)) {
       v.target = supplyTarget(army);
       if (!v.target) { v.state = 'return'; }
     }
@@ -6642,7 +6854,8 @@ function simulate(dt) {
   /* 战线平均位置：给"齐头并进"用——突出太多的单位要停下来等齐 */
   for (const a of [U, C]) {
     let fs = 0, fn = 0;
-    for (const u of a.units) if (u.kind !== 'art' && u.onField) { fs += u.cz; fn++; }
+    for (const u of a.units) if (u.kind !== 'art' && u.onField && !u.airborne
+      && !(u.wave > 1 && B.t < WAVE_T[u.wave])) { fs += u.cz; fn++; }
     a.frontZ = fn ? fs / fn : 0;
   }
   aiUpdate(U, dt); aiUpdate(C, dt);
@@ -6652,6 +6865,7 @@ function simulate(dt) {
   fortUpdate(dt);
   motorUpdate(dt);
   reinforceUpdate(dt);
+  airdropUpdate(dt);               // 第 2/3 波空投：运输机通场 + 伞降 + 落地归建
   airUpdate(dt);
   aaUpdate(dt);
   infAAUpdate(dt);
@@ -6706,6 +6920,7 @@ function updateHUD(dt) {
   hudT -= dt;
   if (hudT > 0) return;
   hudT = 0.22;
+  if (SEL) updateUnitCard();     // 兵牌属性实时刷新（选中被击溃/离场会自动清掉）
   const men = a => a.units.filter(u => u.kind !== 'art').reduce((x, u) => x + u.men, 0);
   const max = a => a.units.filter(u => u.kind !== 'art').reduce((x, u) => x + u.maxMen, 0);
   for (const [a, h] of [[U, HUD.u], [C, HUD.c]]) {
@@ -6841,6 +7056,289 @@ controls.addEventListener('start', () => cancelCamTween());
 setView(VIEWS[0], true);
 introIn();
 
+/* ==================== 点选单位 · 兵牌属性 ====================
+   左键点击战场选中一个单位（建制/载具/飞机/堡垒），右侧弹出它的兵牌属性并实时刷新，
+   地面画一圈金色高亮环；点空处 / Esc 取消。
+   拾取顺序：① 射线打真实实例（士兵 / 火炮 / 载具 / 飞机 / 堡垒的 mesh，拿到 instanceId
+   反查实体，最精确、重叠也不误选）；② 打不到再退化为"屏幕最近建制"（小目标更好点）。
+   整层是纯 UI：不读 rnd/vrnd、不改战局，只在渲染循环里跟随位置。 */
+const UNITCARD = document.getElementById('unitcard');
+const SEL_SIDE = { union: '联邦军', confederate: '邦联军' };
+const ORDER_LABEL = { advance: '推进', focusFire: '集火', hold: '据守', reserve: '预备', flank: '迂回' };
+let SEL = null;
+
+/* ---------- 拾取注册表：mesh -> (instanceId, object) => 实体 ---------- */
+const PICK_FN = new Map();
+function registerPick(mesh, fn) {
+  PICK_FN.set(mesh, fn);
+  /* 动态 InstancedMesh 的 boundingSphere 只在首次 raycast 时算一次，之后矩阵一直变、
+     包围球不再更新 → 老位置之外的单位点不中。置为无穷球，让 raycast 直接逐实例判定 */
+  if (mesh.isInstancedMesh) mesh.boundingSphere = new THREE.Sphere(new THREE.Vector3(), Infinity);
+}
+function registerSoldierPool(pool, list) {
+  for (const P of pool.parts) registerPick(P.mesh, id => {
+    const s = list[id];
+    return s ? (s.pickUnit || s.unit || null) : null;
+  });
+}
+registerSoldierPool(U.footPool, U.foot);
+registerSoldierPool(U.mountPool, U.mount);
+registerSoldierPool(U.riderPool, U.mount);
+registerSoldierPool(C.footPool, C.foot);
+registerSoldierPool(C.mountPool, C.mount);
+registerSoldierPool(C.riderPool, C.mount);
+for (const P of mgRig.parts) registerPick(P.mesh, id => MG.units[id] || null);
+/* 载具/飞机：同一个 rig 的实例按 idx 反查实体（多实例共池，必须查表） */
+function registerRig(rig, list) {
+  const m = new Map();
+  for (const e of list) if (e.rig === rig && !m.has(e.idx)) m.set(e.idx, e);
+  for (const P of rig.parts) registerPick(P.mesh, id => m.get(id) || null);
+}
+registerRig(tankHRig, ARMOR.tanks);
+registerRig(tankLRig, ARMOR.tanks);
+registerRig(tankHeroRig, ARMOR.tanks);
+registerRig(truckRig, ARMOR.trucks);
+registerRig(motoRig, ARMOR.motos);
+registerRig(fighterRig, AIR.craft);
+registerRig(attackerRig, AIR.craft);
+registerRig(bomberRig, AIR.craft);
+registerRig(reconRig, AIR.craft);
+registerRig(aaRig, AIR.guns);
+for (const F of FORT) registerPick(F.mesh, () => F);
+for (const a of [U, C]) {
+  for (const u of a.units) {
+    if (u.guns) {
+      for (const g of u.guns) {
+        /* 炮组是从 army.foot 直接征用的，不在 Unit.soldiers 里，用 pickUnit 挂回建制 */
+        for (const s of g.crew) s.pickUnit = u;
+        g.group.traverse(o => { if (o.isMesh) registerPick(o, () => u); });
+      }
+    }
+    registerPick(u.banner, () => (u.gone || !u.banner.visible ? null : u));
+  }
+}
+
+/* ---------- 实体分类（用于选兵牌版式） ---------- */
+function selType(e) {
+  if (e instanceof Unit) return 'unit';
+  if (CRAFT_SPEC[e.kind]) return 'air';
+  if (e.guns && e.maxHp !== undefined && !e.rig) return 'fort';
+  if (e.maxHp !== undefined) return 'tank';
+  if (e.depotX !== undefined) return 'truck';
+  if (e.p1 !== undefined) return 'moto';
+  if (e.pitch !== undefined && e.rig) return 'aa';
+  return 'other';
+}
+function selTag(e) {
+  switch (selType(e)) {
+    case 'unit': return KIND_LABEL[e.kind] || e.kind;
+    case 'air': return CRAFT_SPEC[e.kind].label;
+    case 'fort': return '重型堡垒';
+    case 'tank': return e.hero ? '重型战车（英雄）' : e.heavy ? '重型坦克' : '轻型坦克';
+    case 'truck': return '补给卡车';
+    case 'moto': return '摩托传令兵';
+    case 'aa': return '高射炮';
+    default: return '单位';
+  }
+}
+/* ---------- 兵牌属性（模型；面板与 __battle.selected() 共用同一份） ---------- */
+function cardModel(e) {
+  const t = selType(e);
+  const side = t === 'unit' ? e.army.key : e.side;
+  const m = { type: t, side, tag: selTag(e), rows: [] };
+  if (t === 'unit') {
+    const u = e;
+    m.title = u.title || u.name;
+    m.big = u.kind === 'art' ? (u.guns.filter(g => !g.dead).length + ' / ' + u.guns.length + ' 门') : (u.men + ' / ' + u.maxMen);
+    m.bar = { value: u.morale, color: u.morale > 0.55 ? '#dfc36e' : u.morale > 0.3 ? '#d99a4a' : '#c05a3c' };
+    const cr = u.maxMen ? Math.round(100 * u.casualties / u.maxMen) : 0;
+    m.rows.push(['姿态', unitStance(u) + (u.state === 'airborne' ? '' : ' · ' + u.state)]);
+    m.rows.push(['命令', ORDER_LABEL[u.order] || '—']);
+    m.rows.push(['士气', Math.round(u.morale * 100) + '%']);
+    m.rows.push(['累计阵亡', u.casualties + ' / ' + u.maxMen + '（' + cr + '%）']);
+    if (u.ammoMax && u.kind !== 'art') m.rows.push(['弹药', u.ammo + ' / ' + u.ammoMax + (u.ammoOut ? '（弹尽）' : '')]);
+    m.rows.push(['被压制', Math.round(u.suppress * 100) + '%']);
+    m.rows.push(['被标定', u.spottedBy ? SEL_SIDE[u.spottedBy] + '观察' : '无']);
+    m.rows.push(['掩体', Math.round((u.cover || 0) * 100) + '%']);
+    m.rows.push(['步坦协同', u.tankSup ? '有（正面掩护）' : '无']);
+    m.rows.push(['工兵破障', u.engBreach ? '已开路' : '无']);
+    if (u.assault) m.rows.push(['突击加成', '是']);
+    if (u.pinned) m.rows.push(['状态', '被钉住 · 卧倒']);
+    m.rows.push(['技能', (ABILITY_NAME[u.kind] || '—') + (u.abilityCd > 0 ? ' · CD ' + u.abilityCd.toFixed(1) + 's' : ' · 就绪')]);
+    if (u.kind === 'art') {
+      const md = { direct: 0, cb: 0, blind: 0 };
+      for (const g of u.guns) if (!g.dead) md[g.mode] = (md[g.mode] || 0) + 1;
+      m.rows.push(['炮观', '直瞄 ' + md.direct + ' · 反推 ' + md.cb + ' · 盲射 ' + md.blind]);
+    } else if (u.wave) {
+      m.rows.push(['梯队', '第 ' + u.wave + ' 梯队' + (u.weapon === 'rocket' ? ' · 火箭筒' : u.weapon === 'smg' ? ' · 冲锋枪' : '')]);
+    }
+    m.rows.push(['锁定目标', u.target ? u.target.title : '—']);
+    m.pos = [u.cx, u.cz];
+  } else if (t === 'air') {
+    m.title = CRAFT_SPEC[e.kind].label + (e.dead ? '（已损失）' : '');
+    m.big = Math.round(e.hp) + ' / ' + e.maxHp + ' HP';
+    m.bar = { value: e.dead ? 0 : clamp(e.hp / e.maxHp, 0, 1), color: e.hp / e.maxHp > 0.5 ? '#7ea2e0' : '#c05a3c' };
+    m.rows.push(['状态', e.dead ? '已损失' : e.state]);
+    m.rows.push(['速度', Math.round(e.spd) + ' m/s · 高度 ' + Math.round(e.y) + ' m']);
+    m.rows.push(['巡航', e.cruise + ' m/s']);
+    if (e.rockets !== undefined) m.rows.push(['火箭弹', e.rockets + ' 枚']);
+    if (e.severed && e.severed.length) m.rows.push(['结构', '断翼 ' + e.severed.length]);
+    if (e.kamikaze || e.state === 'kamikaze') m.rows.push(['任务', '自杀撞击']);
+    m.pos = [e.x, e.z];
+  } else if (t === 'tank') {
+    m.title = (e.hero ? '重型战车 · ' : '') + (e.heavy ? '重坦' : '轻坦');
+    m.big = Math.round(e.hp) + ' / ' + e.maxHp + ' HP';
+    m.bar = { value: e.dead ? 0 : clamp(e.hp / e.maxHp, 0, 1), color: e.dead ? '#666' : '#c98a4a' };
+    m.rows.push(['状态', e.dead ? '已击毁（残骸）' : e.state]);
+    m.rows.push(['火炮', '射程 ' + e.range + ' m · 装填 ' + e.reload.toFixed(1) + 's']);
+    m.rows.push(['速度', e.spd + ' m/s']);
+    if (e.hero) m.rows.push(['装甲恐惧', '半径 132 m']);
+    m.pos = [e.x, e.z];
+  } else if (t === 'truck') {
+    m.title = '补给卡车';
+    m.big = e.state;
+    m.rows.push(['状态', e.state]);
+    m.rows.push(['搭载兵员', e.cargo || 0]);
+    m.rows.push(['补给目标', e.target ? e.target.title : '—']);
+    m.pos = [e.x, e.z];
+  } else if (t === 'moto') {
+    m.title = '摩托传令兵';
+    m.rows.push(['任务', '两点巡逻']);
+    m.rows.push(['坐标', e.x.toFixed(0) + ', ' + e.z.toFixed(0)]);
+    m.pos = [e.x, e.z];
+  } else if (t === 'fort') {
+    m.title = '重型堡垒';
+    m.big = Math.round(e.hp) + ' / ' + e.maxHp + ' HP';
+    m.bar = { value: e.dead ? 0 : clamp(e.hp / e.maxHp, 0, 1), color: e.dead ? '#666' : '#b8a684' };
+    m.rows.push(['状态', e.dead ? '已摧毁' : '据守']);
+    m.rows.push(['要塞炮', e.guns.filter(g => !g.dead).length + ' / ' + e.guns.length + ' 门（射程 ' + e.range + ' m）']);
+    m.rows.push(['友军掩护', '48 m 内方向性掩护']);
+    m.pos = [e.x, e.z];
+  } else if (t === 'aa') {
+    m.title = '高射炮';
+    m.rows.push(['装填', e.reload.toFixed(1) + 's']);
+    m.rows.push(['仰角', (e.pitch * 180 / Math.PI).toFixed(0) + '°']);
+    m.pos = [e.x, e.z];
+  }
+  if (m.pos) m.rows.push(['坐标', m.pos[0].toFixed(0) + ', ' + m.pos[1].toFixed(0)]);
+  return m;
+}
+function escHtml(s) {
+  return String(s).replace(/[&<>]/g, c => c === '&' ? '&amp;' : c === '<' ? '&lt;' : '&gt;');
+}
+function renderCard(m) {
+  UNITCARD.className = 'panel ' + (m.side === 'confederate' ? 'conf' : 'union');
+  let h = '<div class="uc-close" id="uc-x">×</div>';
+  h += '<div class="uc-title">' + escHtml(m.title || '—') + '</div>';
+  h += '<div class="uc-kind">' + escHtml(m.tag) + (m.side ? ' · ' + SEL_SIDE[m.side] : '') + '</div>';
+  if (m.big !== undefined) h += '<div class="uc-big">' + escHtml(m.big) + '</div>';
+  if (m.bar) h += '<div class="uc-bar"><i style="width:' + (100 * clamp(m.bar.value, 0, 1)).toFixed(1) + '%;background:' + m.bar.color + '"></i></div>';
+  for (const r of m.rows) h += '<div class="uc-row"><b>' + escHtml(r[0]) + '</b><span>' + escHtml(r[1]) + '</span></div>';
+  UNITCARD.innerHTML = h;
+  UNITCARD.style.display = 'block';
+}
+function updateUnitCard() {
+  if (!SEL) return;
+  const t = selType(SEL);
+  if ((SEL.gone && !SEL.airborne) || (t === 'unit' && SEL.men <= 0)) { clearSelect(); return; }
+  renderCard(cardModel(SEL));
+}
+UNITCARD.addEventListener('click', ev => { if (ev.target && ev.target.id === 'uc-x') clearSelect(); });
+
+/* ---------- 地面高亮环（跟随选中单位，1 个 draw call） ---------- */
+const selRing = new THREE.Mesh(
+  new THREE.RingGeometry(0.82, 1.0, 48),
+  new THREE.MeshBasicMaterial({
+    color: 0xffd36a, transparent: true, opacity: 0.9, side: THREE.DoubleSide,
+    depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4
+  })
+);
+selRing.rotation.x = -Math.PI / 2;
+selRing.renderOrder = 3;
+selRing.frustumCulled = false;
+selRing.visible = false;
+scene.add(selRing);
+
+function selRingRadius(e) {
+  switch (selType(e)) {
+    case 'unit': return e.kind === 'cav' ? 8 : e.kind === 'art' ? 22 : clamp(3.5 + e.files * e.sx * 0.5, 4.5, 15);
+    case 'tank': return e.hero ? 10 : e.heavy ? 7 : 5.5;
+    case 'truck': return 5;
+    case 'moto': return 3.5;
+    case 'air': return e.kind === 'bomber' ? 10 : e.kind === 'recon' ? 6 : 5;
+    case 'fort': return 32;
+    case 'aa': return 4;
+    default: return 0;
+  }
+}
+function updateSelection() {
+  if (!SEL) { selRing.visible = false; return; }
+  const e = SEL, t = selType(e);
+  const x = t === 'unit' ? e.cx : e.x, z = t === 'unit' ? e.cz : e.z;
+  const r = selRingRadius(e);
+  if (!r) { selRing.visible = false; return; }
+  const k = 1 + 0.05 * Math.sin(B.t * 4.5);
+  selRing.visible = true;
+  selRing.position.set(x, groundY(x, z) + 0.09, z);
+  selRing.scale.set(r * k, r * k, 1);
+}
+function selectEntity(e) {
+  SEL = e && e.gone && !e.airborne ? null : e;
+  if (!SEL) { UNITCARD.style.display = 'none'; selRing.visible = false; return; }
+  updateUnitCard();
+  updateSelection();
+}
+function clearSelect() { selectEntity(null); }
+
+/* ---------- 点击拾取 ---------- */
+const _ray = new THREE.Raycaster();
+_ray.camera = camera;
+const _pickNdc = new THREE.Vector2();
+const _selProj = new THREE.Vector3();
+function pickAt(px, py) {
+  const rc = renderer.domElement.getBoundingClientRect();
+  _pickNdc.x = ((px - rc.left) / rc.width) * 2 - 1;
+  _pickNdc.y = -((py - rc.top) / rc.height) * 2 + 1;
+  _ray.setFromCamera(_pickNdc, camera);
+  const hits = _ray.intersectObjects([...PICK_FN.keys()], false);
+  for (const h of hits) {
+    const fn = PICK_FN.get(h.object);
+    if (!fn) continue;
+    const e = fn(h.instanceId, h.object);
+    if (e) { selectEntity(e); return e; }
+  }
+  /* 退化路径：小目标（稀疏横队里的一两个人）点不中时取屏幕最近的建制 */
+  const best = nearestUnitAt(px, py, 46);
+  selectEntity(best);
+  return best;
+}
+function nearestUnitAt(px, py, maxPx) {
+  const rc = renderer.domElement.getBoundingClientRect();
+  let best = null, bd = maxPx;
+  for (const a of [U, C]) for (const u of a.units) {
+    if (u.gone || u.men <= 0) continue;
+    _selProj.set(u.cx, 3, u.cz).project(camera);
+    if (_selProj.z > 1) continue;
+    const sx = (_selProj.x * 0.5 + 0.5) * rc.width + rc.left;
+    const sy = (-_selProj.y * 0.5 + 0.5) * rc.height + rc.top;
+    const d = Math.hypot(sx - px, sy - py);
+    if (d < bd) { bd = d; best = u; }
+  }
+  return best;
+}
+/* 左键"点击"（按下与抬起之间几乎没移动）才算点选，避免和 OrbitControls 拖拽抢 */
+let _dnX = 0, _dnY = 0, _dnT = 0, _dnId = -1;
+renderer.domElement.addEventListener('pointerdown', e => {
+  if (e.button !== 0) return;
+  _dnX = e.clientX; _dnY = e.clientY; _dnT = performance.now(); _dnId = e.pointerId;
+});
+renderer.domElement.addEventListener('pointerup', e => {
+  if (e.button !== 0 || e.pointerId !== _dnId) return;
+  if (Math.hypot(e.clientX - _dnX, e.clientY - _dnY) > 6) return;
+  if (performance.now() - _dnT > 420) return;
+  pickAt(e.clientX, e.clientY);
+});
+
 const _cam = new THREE.Vector3();
 const _tgt = new THREE.Vector3();
 function camUpdate(dt) {
@@ -6912,6 +7410,9 @@ function loop() {
   vehSync();
   mgSync();
   fieldworksSync();
+  transportSync();       // 空投运输机（纯视觉，位置由 airdropUpdate 步进）
+  paraSync();            // 伞盖实例池
+  updateSelection();       // 高亮环跟随选中单位（纯 UI，暂停时也要跟）
   flashPool.sync(); smokePool.sync(); burstPool.sync();
   dustPool.sync(); boomPool.sync(); motePool.sync(); shardPool.sync();
   shrapPool.sync();
@@ -6960,11 +7461,13 @@ window.addEventListener('keydown', e => {
     B.speed = SPEEDS[i];
   }
   if (e.key === 'r' || e.key === 'R') location.reload();
+  if (e.key === 'Escape') clearSelect();
 });
 
 function packArmy(a) {
   return a.units.filter(u => u.kind !== 'art').map(u => ({
     name: u.name, type: u.kind, men: u.men, max: u.maxMen, state: u.state,
+    wave: u.wave, airborne: !!u.airborne, chutes: u.soldiers.reduce((n, s) => n + (s.chute ? 1 : 0), 0),
     morale: +u.morale.toFixed(3), x: +u.cx.toFixed(1), z: +u.cz.toFixed(1)
   }));
 }
@@ -7020,6 +7523,26 @@ window.__battle = {
       return { state: u.state, men: u.men, morale: +u.morale.toFixed(3), x: +u.cx.toFixed(2), z: +u.cz.toFixed(2), target: u.target ? u.target.name : null };
     }
     return null;
+  },
+  /* 点选验收面：程序化选中 / 读取当前兵牌 / 按屏幕像素点选（Playwright 用） */
+  select(name) {
+    for (const a of [U, C]) for (const u of a.units) if (u.name === name || u.title === name) { selectEntity(u); return this.selected(); }
+    return null;
+  },
+  selected() { return SEL ? cardModel(SEL) : null; },
+  clearSelect() { clearSelect(); return true; },
+  pick(px, py) { const e = pickAt(px, py); return e ? this.selected() : null; },
+  /* 某建制的屏幕像素坐标（点选验收 / 自动化点击用） */
+  screenOf(name) {
+    for (const a of [U, C]) for (const u of a.units) if (u.name === name || u.title === name) {
+      return this.project(u.cx, 3, u.cz);
+    }
+    return null;
+  },
+  project(x, y, z) {
+    const v = new THREE.Vector3(x, y, z).project(camera);
+    const rc = renderer.domElement.getBoundingClientRect();
+    return { x: (v.x * 0.5 + 0.5) * rc.width + rc.left, y: (-v.y * 0.5 + 0.5) * rc.height + rc.top, z: v.z };
   },
   camera: id => setView(VIEWS.find(v => v.id === id) || VIEWS[0], true),
   freecam(px, py, pz, tx, ty, tz, fov) {
@@ -7296,6 +7819,27 @@ window.__battle = {
       trucks: ARMOR.trucks.map(v => ({ side: v.side, state: v.state, x: Math.round(v.x), z: Math.round(v.z), cargo: v.cargo })),
       motos: ARMOR.motos.map(m => ({ side: m.side, x: Math.round(m.x), z: Math.round(m.z) })),
       lost: ARMOR.lost
+    };
+  },
+  /* 空投自检：每波建制数 / 在空中数 / 已落地数 / 在空伞盖数 + 运输机位置 */
+  airdrop() {
+    const one = a => {
+      const w = {};
+      for (const u of a.units) {
+        if (!u.wave) continue;
+        const o = w[u.wave] || (w[u.wave] = { units: 0, airborne: 0, landed: 0, reserve: 0, chutes: 0 });
+        o.units++;
+        if (u.airborne) o.airborne++;
+        else if (u.wave > 1 && B.t < WAVE_T[u.wave]) o.reserve++;
+        else o.landed++;
+        o.chutes += u.soldiers.reduce((n, s) => n + (s.chute ? 1 : 0), 0);
+      }
+      return w;
+    };
+    return {
+      union: one(U), confederate: one(C), waveT: WAVE_T.slice(2),
+      parachutes: paraDrawn,
+      transport: TRANSPORT.map(p => ({ side: p.side, on: p.on, x: Math.round(p.x), z: Math.round(p.z) }))
     };
   },
   fort() {
